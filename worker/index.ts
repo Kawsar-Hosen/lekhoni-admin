@@ -179,6 +179,8 @@ export default {
 
       // ==================== PUBLIC MOBILE APP ROUTES ====================
 
+      if (url.pathname === '/api/public/categories' && request.method === 'GET')
+        return json(await sql`SELECT id,name,icon,color FROM categories WHERE is_active=true ORDER BY position`);
       if (url.pathname === '/api/public/books' && request.method === 'GET')
         return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
       if (url.pathname === '/api/public/chapters' && request.method === 'GET')
