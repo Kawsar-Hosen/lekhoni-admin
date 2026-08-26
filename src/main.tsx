@@ -45,7 +45,9 @@ interface Category {
   name: string;
   icon: string;
   color: string;
+  cover_url: string | null;
   position: number;
+  is_active: boolean;
   books_count: number;
   created_at: string;
   updated_at: string;
@@ -622,15 +624,14 @@ function CategoriesPage({ onEdit, onToast }: { onEdit: (c: Category) => void; on
             {categories.map(cat => (
               <div className="tr" key={cat.id}>
                 <span className="book-cell">
-                  <i style={{ background: cat.color || '#18342d' }}>{cat.icon || '📁'}</i>
+                  <i style={{ background: cat.color || '#18342d' }}>{cat.cover_url ? <img src={cat.cover_url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 'inherit' }} /> : ''}</i>
                   <em>
                     <b>{cat.name}</b>
                     <small>Position: {cat.position}</small>
                   </em>
                 </span>
                 <span>{cat.books_count ?? 0} books</span>
-                <span><u>{cat.color || '#4ccaa7'}</u></span>
-                <span>{cat.icon || '📁'}</span>
+                <span><u>{cat.color || '#DDF5EC'}</u></span>
                 <span style={{ display: 'flex', gap: 4 }}>
                   <button style={{ background: 'none', border: 'none', color: '#8fa19c', cursor: 'pointer', padding: 2 }} onClick={() => onEdit(cat)} title="Edit">
                     <Edit3 size={14} />
@@ -1448,38 +1449,55 @@ function ChapterModal({ close, onToast }: { close: () => void; onToast: (m: stri
 
 function CategoryModal({ editItem, close, onToast }: { editItem: Category | null; close: () => void; onToast: (m: string) => void }) {
   const [name, setName] = useState(editItem?.name || '');
-  const [icon, setIcon] = useState(editItem?.icon || '📁');
-  const [color, setColor] = useState(editItem?.color || '#4ccaa7');
+  const [color, setColor] = useState(editItem?.color || '#DDF5EC');
   const [position, setPosition] = useState(editItem?.position || 0);
+  const [imageMethod, setImageMethod] = useState<'url' | 'upload'>(editItem?.cover_url ? 'url' : 'url');
+  const [coverUrl, setCoverUrl] = useState(editItem?.cover_url || '');
+  const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [coverPreview, setCoverPreview] = useState(editItem?.cover_url || '');
   const [submitting, setSubmitting] = useState(false);
+
+  const handleCoverChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setCoverFile(file);
+    const reader = new FileReader();
+    reader.onload = () => setCoverPreview(reader.result as string);
+    reader.readAsDataURL(file);
+  };
+
+  const handleUrlChange = (url: string) => {
+    setCoverUrl(url);
+    setCoverPreview(url);
+    setCoverFile(null);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) {
-      onToast('Category name is required');
-      return;
-    }
+    if (!name.trim()) { onToast('Category name is required'); return; }
     setSubmitting(true);
     try {
+      let finalCoverUrl = '';
+      if (imageMethod === 'upload' && coverFile) {
+        const fd = new FormData();
+        fd.append('file', coverFile);
+        const uploadRes = await fetch(`${API_BASE}/api/media`, { method: 'POST', body: fd });
+        if (!uploadRes.ok) throw new Error('Cover upload failed');
+        const uploadData = await uploadRes.json();
+        finalCoverUrl = uploadData.url || uploadData.path || uploadData.location || '';
+      } else if (imageMethod === 'url' && coverUrl.trim()) {
+        finalCoverUrl = coverUrl.trim();
+      }
+      const payload: Record<string, unknown> = { name: name.trim(), color, cover_url: finalCoverUrl || null, position: Number(position) };
       if (editItem) {
-        await api(`/api/admin/categories/${editItem.id}`, {
-          method: 'PUT',
-          body: JSON.stringify({ name: name.trim(), icon, color, position: Number(position) }),
-        });
+        await api(`/api/admin/categories/${editItem.id}`, { method: 'PUT', body: JSON.stringify(payload) });
         onToast('Category updated');
       } else {
-        await api('/api/admin/categories', {
-          method: 'POST',
-          body: JSON.stringify({ name: name.trim(), icon, color, position: Number(position) }),
-        });
+        await api('/api/admin/categories', { method: 'POST', body: JSON.stringify({ ...payload, icon: '' }) });
         onToast('Category created');
       }
       close();
-    } catch {
-      onToast('Failed to save category');
-    } finally {
-      setSubmitting(false);
-    }
+    } catch { onToast('Failed to save category'); } finally { setSubmitting(false); }
   };
 
   return (
@@ -1494,50 +1512,39 @@ function CategoryModal({ editItem, close, onToast }: { editItem: Category | null
         </div>
         <label>
           Category name
-          <input
-            required
-            placeholder="e.g. উপন্যাস, রোমান্টিক, থ্রিলার"
-            value={name}
-            onChange={e => setName(e.target.value)}
-          />
+          <input required placeholder="e.g. উপন্যাস, রোমান্টিক, থ্রিলার" value={name} onChange={e => setName(e.target.value)} />
         </label>
         <div className="form-grid">
           <label>
-            Icon (emoji or text)
-            <input
-              placeholder="📁"
-              value={icon}
-              onChange={e => setIcon(e.target.value)}
-              maxLength={4}
-            />
-          </label>
-          <label>
             Color
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <input
-                type="color"
-                value={color}
-                onChange={e => setColor(e.target.value)}
-                style={{ width: 40, height: 38, padding: 2, cursor: 'pointer' }}
-              />
-              <input
-                placeholder="#4ccaa7"
-                value={color}
-                onChange={e => setColor(e.target.value)}
-                style={{ flex: 1 }}
-              />
+              <input type="color" value={color} onChange={e => setColor(e.target.value)} style={{ width: 40, height: 38, padding: 2, cursor: 'pointer' }} />
+              <input placeholder="#DDF5EC" value={color} onChange={e => setColor(e.target.value)} style={{ flex: 1 }} />
             </div>
           </label>
+          <label>
+            Position
+            <input type="number" min={0} value={position} onChange={e => setPosition(Number(e.target.value))} />
+          </label>
         </div>
-        <label>
-          Position
-          <input
-            type="number"
-            min={0}
-            value={position}
-            onChange={e => setPosition(Number(e.target.value))}
-          />
-        </label>
+        <div style={{ marginBottom: 6, fontWeight: 700, fontSize: 13 }}>Cover Image</div>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+          <button type="button" onClick={() => setImageMethod('url')} style={{ flex: 1, padding: '8px 12px', borderRadius: 10, border: `2px solid ${imageMethod === 'url' ? '#4dca9f' : '#2a3a44'}`, background: imageMethod === 'url' ? 'rgba(77,202,159,0.12)' : 'transparent', color: '#b5c4cf', cursor: 'pointer', fontWeight: 700, fontSize: 13 }}>Paste URL</button>
+          <button type="button" onClick={() => setImageMethod('upload')} style={{ flex: 1, padding: '8px 12px', borderRadius: 10, border: `2px solid ${imageMethod === 'upload' ? '#4dca9f' : '#2a3a44'}`, background: imageMethod === 'upload' ? 'rgba(77,202,159,0.12)' : 'transparent', color: '#b5c4cf', cursor: 'pointer', fontWeight: 700, fontSize: 13 }}>Upload Image</button>
+        </div>
+        {imageMethod === 'url' ? (
+          <label>
+            Image URL
+            <input placeholder="https://example.com/image.jpg" value={coverUrl} onChange={e => handleUrlChange(e.target.value)} />
+          </label>
+        ) : (
+          <label className="upload" style={coverPreview ? { borderStyle: 'solid', borderColor: '#4dca9f' } : {}}>
+            <input type="file" accept="image/*" onChange={handleCoverChange} style={{ display: 'none' }} />
+            <CloudUpload size={19} />
+            <span>{coverPreview ? 'Image selected - click to change' : 'Choose image file'}</span>
+          </label>
+        )}
+        {coverPreview && <img src={coverPreview} alt="Preview" style={{ maxWidth: '100%', borderRadius: 8, marginTop: 8, maxHeight: 140, objectFit: 'cover' }} />}
         <div className="modal-actions">
           <button type="button" onClick={close} disabled={submitting}>Cancel</button>
           <button className="primary" type="submit" disabled={submitting}>

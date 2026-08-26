@@ -13,6 +13,15 @@ export default {
     if (url.pathname === '/api/health') return json({ ok: true, service: 'lekhoni-admin-api', database: Boolean(env.DATABASE_URL) }, 200, env.ALLOWED_ORIGIN);
 
     try {
+      // --- DB Migration (run once) ---
+      if (url.pathname === '/api/admin/migrate' && request.method === 'POST') {
+        if (!env.DATABASE_URL) return json({ error: 'No DB' }, 503);
+        const sql = neon(env.DATABASE_URL);
+        await sql`ALTER TABLE categories ADD COLUMN IF NOT EXISTS cover_url TEXT`;
+        await sql`ALTER TABLE chapters ADD COLUMN IF NOT EXISTS minutes INT NOT NULL DEFAULT 5`;
+        return json({ ok: true, message: 'Migration applied' });
+      }
+
       // --- R2 Media Upload ---
       if (url.pathname === '/api/media' && request.method === 'POST') {
         const form = await request.formData(); const file = form.get('file');
@@ -31,21 +40,24 @@ export default {
 
       // --- Categories CRUD ---
       if (url.pathname === '/api/admin/categories' && request.method === 'GET')
-        return json(await sql`SELECT id,name,icon,color,position,is_active,created_at FROM categories ORDER BY position,created_at DESC`);
+        return json(await sql`SELECT id,name,icon,color,cover_url,position,is_active,created_at FROM categories ORDER BY position,created_at DESC`);
       if (url.pathname === '/api/admin/categories' && request.method === 'POST') {
-        const b = await request.json() as { name?: string; icon?: string; color?: string; position?: number };
+        const b = await request.json() as { name?: string; icon?: string; color?: string; cover_url?: string; position?: number };
         if (!b.name) return json({ error: 'name required' }, 400);
-        const r = await sql`INSERT INTO categories (name,icon,color,position) VALUES (${b.name},${b.icon||'book-open'},${b.color||'#DDF5EC'},${b.position||0}) RETURNING id,name,icon,color,position,is_active,created_at`;
+        const r = await sql`INSERT INTO categories (name,icon,color,cover_url,position) VALUES (${b.name},${b.icon||'book-open'},${b.color||'#DDF5EC'},${b.cover_url||null},${b.position||0}) RETURNING id,name,icon,color,cover_url,position,is_active,created_at`;
         return json(r[0], 201);
       }
       const catMatch = url.pathname.match(/^\/api\/admin\/categories\/([^/]+)$/);
       if (catMatch && request.method === 'PUT') {
         if (!uuid(catMatch[1])) return json({ error: 'Invalid ID' }, 400);
-        const b = await request.json() as Record<string, unknown>;
-        const fields: string[] = []; const vals: unknown[] = [];
-        for (const k of ['name','icon','color','position','is_active'] as const) { if (b[k] !== undefined) { fields.push(`${k}=${typeof b[k]==='string'?`'${b[k]}'`:b[k]}`); vals.push(b[k]); } }
-        if (!fields.length) return json({ error: 'No fields to update' }, 400);
-        const r = await sql`UPDATE categories SET ${sql(fields.join(','))} WHERE id=${catMatch[1]} RETURNING id,name,icon,color,position,is_active,created_at`;
+        const b = await request.json() as { name?: string; icon?: string; color?: string; cover_url?: string | null; position?: number; is_active?: boolean };
+        if (!Object.keys(b).length) return json({ error: 'No fields to update' }, 400);
+        let r;
+        if ('cover_url' in b) {
+          r = await sql`UPDATE categories SET name=COALESCE(${b.name},name), icon=COALESCE(${b.icon},icon), color=COALESCE(${b.color},color), cover_url=${b.cover_url}, position=COALESCE(${b.position},position), is_active=COALESCE(${b.is_active},is_active) WHERE id=${catMatch[1]} RETURNING id,name,icon,color,cover_url,position,is_active,created_at`;
+        } else {
+          r = await sql`UPDATE categories SET name=COALESCE(${b.name},name), icon=COALESCE(${b.icon},icon), color=COALESCE(${b.color},color), position=COALESCE(${b.position},position), is_active=COALESCE(${b.is_active},is_active) WHERE id=${catMatch[1]} RETURNING id,name,icon,color,cover_url,position,is_active,created_at`;
+        }
         return json(r[0] || { error: 'Not found' }, r.length ? 200 : 404);
       }
       if (catMatch && request.method === 'DELETE') {
@@ -180,7 +192,7 @@ export default {
       // ==================== PUBLIC MOBILE APP ROUTES ====================
 
       if (url.pathname === '/api/public/categories' && request.method === 'GET')
-        return json(await sql`SELECT id,name,icon,color FROM categories WHERE is_active=true ORDER BY position`);
+        return json(await sql`SELECT id,name,icon,color,cover_url FROM categories WHERE is_active=true ORDER BY position`);
       if (url.pathname === '/api/public/books' && request.method === 'GET')
         return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
       if (url.pathname === '/api/public/chapters' && request.method === 'GET')
