@@ -1,0 +1,13 @@
+name = "lekhoni-admin-api"
+main = "worker/index.ts"
+compatibility_date = "2026-08-26"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "lekhoni-media"
+
+[vars]
+ALLOWED_ORIGIN = "https://admin.xyteee.com"
+
+# Keep the Neon URL in a Worker secret:
+# wrangler secret put DATABASE_URL
