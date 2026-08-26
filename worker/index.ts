@@ -9,7 +9,7 @@ function uuid(id: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === 'OPTIONS') return json({}, 204, env.ALLOWED_ORIGIN);
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(env.ALLOWED_ORIGIN || '*') });
     if (url.pathname === '/api/health') return json({ ok: true, service: 'lekhoni-admin-api', database: Boolean(env.DATABASE_URL) }, 200, env.ALLOWED_ORIGIN);
 
     try {
@@ -19,6 +19,7 @@ export default {
         const sql = neon(env.DATABASE_URL);
         await sql`ALTER TABLE categories ADD COLUMN IF NOT EXISTS cover_url TEXT`;
         await sql`ALTER TABLE chapters ADD COLUMN IF NOT EXISTS minutes INT NOT NULL DEFAULT 5`;
+        await sql`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS url TEXT NOT NULL DEFAULT ''`;
         return json({ ok: true, message: 'Migration applied' });
       }
 
@@ -148,11 +149,11 @@ export default {
 
       // --- Notifications CRUD ---
       if (url.pathname === '/api/admin/notifications' && request.method === 'GET')
-        return json(await sql`SELECT id,title,body,icon,status,created_at FROM notifications ORDER BY created_at DESC`);
+        return json(await sql`SELECT id,title,body,icon,url,status,created_at FROM notifications ORDER BY created_at DESC`);
       if (url.pathname === '/api/admin/notifications' && request.method === 'POST') {
-        const b = await request.json() as { title?: string; body?: string; icon?: string };
+        const b = await request.json() as { title?: string; body?: string; icon?: string; url?: string };
         if (!b.title || !b.body) return json({ error: 'title and body required' }, 400);
-        const r = await sql`INSERT INTO notifications (title,body,icon,status) VALUES (${b.title},${b.body},${b.icon||'bell'},'sent') RETURNING id,title,body,icon,status,created_at`;
+        const r = await sql`INSERT INTO notifications (title,body,icon,url,status) VALUES (${b.title},${b.body},${b.icon||'bell'},${b.url||''},'sent') RETURNING id,title,body,icon,url,status,created_at`;
         return json(r[0], 201);
       }
       const notifMatch = url.pathname.match(/^\/api\/admin\/notifications\/([^/]+)$/);
@@ -194,16 +195,16 @@ export default {
       if (url.pathname === '/api/public/categories' && request.method === 'GET')
         return json(await sql`SELECT id,name,icon,color,cover_url FROM categories WHERE is_active=true ORDER BY position`);
       if (url.pathname === '/api/public/books' && request.method === 'GET')
-        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
+        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
       if (url.pathname === '/api/public/chapters' && request.method === 'GET')
-        return json(await sql`SELECT id,book_id,title,body,position FROM chapters WHERE status='published' ORDER BY position`);
+        return json(await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE status='published' ORDER BY position`);
 
       const pubBookMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)$/);
       if (pubBookMatch && request.method === 'GET') {
         const bookId = pubBookMatch[1];
-        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookId} AND b.status='published'`;
+        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookId} AND b.status='published'`;
         if (!rows.length) return json({ error: 'Not found' }, 404);
-        const chs = await sql`SELECT id,book_id,title,body,position FROM chapters WHERE book_id=${bookId} AND status='published' ORDER BY position`;
+        const chs = await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE book_id=${bookId} AND status='published' ORDER BY position`;
         return json({ ...rows[0], chapters: chs });
       }
 
@@ -217,12 +218,19 @@ export default {
         if (b.event_type === 'view') {
           await sql`INSERT INTO view_events (device_id, book_id, created_at) VALUES (${dId},${b.book_id},NOW())`;
           await sql`UPDATE books SET views = views + 1 WHERE id = ${b.book_id}`;
-        } else if (b.event_type === 'like') {
-          await sql`INSERT INTO reactions (device_id, book_id, value, created_at) VALUES (${dId},${b.book_id},'like',NOW()) ON CONFLICT (device_id, book_id) DO UPDATE SET value='like'`;
-          await sql`UPDATE books SET likes = likes + 1 WHERE id = ${b.book_id}`;
-        } else if (b.event_type === 'dislike') {
-          await sql`INSERT INTO reactions (device_id, book_id, value, created_at) VALUES (${dId},${b.book_id},'dislike',NOW()) ON CONFLICT (device_id, book_id) DO UPDATE SET value='dislike'`;
-          await sql`UPDATE books SET dislikes = dislikes + 1 WHERE id = ${b.book_id}`;
+        } else if (b.event_type === 'like' || b.event_type === 'dislike') {
+          const existing = await sql`SELECT value FROM reactions WHERE device_id=${dId} AND book_id=${b.book_id} LIMIT 1`;
+          const newVal = b.event_type === 'like' ? 'like' : 'dislike';
+          const oldVal = existing.length ? existing[0].value : null;
+          if (oldVal === newVal) {
+            await sql`UPDATE reactions SET value=${newVal}, created_at=NOW() WHERE device_id=${dId} AND book_id=${b.book_id}`;
+          } else {
+            await sql`INSERT INTO reactions (device_id, book_id, value, created_at) VALUES (${dId},${b.book_id},${newVal},NOW()) ON CONFLICT (device_id, book_id) DO UPDATE SET value=${newVal}, created_at=NOW()`;
+            if (oldVal === 'like') await sql`UPDATE books SET likes = GREATEST(likes - 1, 0), dislikes = dislikes + 1 WHERE id = ${b.book_id}`;
+            else if (oldVal === 'dislike') await sql`UPDATE books SET dislikes = GREATEST(dislikes - 1, 0), likes = likes + 1 WHERE id = ${b.book_id}`;
+            else if (b.event_type === 'like') await sql`UPDATE books SET likes = likes + 1 WHERE id = ${b.book_id}`;
+            else await sql`UPDATE books SET dislikes = dislikes + 1 WHERE id = ${b.book_id}`;
+          }
         }
         return json({ ok: true }, 201);
       }
@@ -242,7 +250,7 @@ export default {
       }
 
       if (url.pathname === '/api/public/notifications' && request.method === 'GET')
-        return json(await sql`SELECT id,title,body,COALESCE(icon,'bell') AS icon,created_at FROM notifications WHERE status='sent' ORDER BY created_at DESC LIMIT 20`);
+        return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,created_at FROM notifications WHERE status='sent' ORDER BY created_at DESC LIMIT 20`);
 
       return json({ error: 'Not found' }, 404);
     } catch (error) { return json({ error: error instanceof Error ? error.message : 'Request failed' }, 500); }

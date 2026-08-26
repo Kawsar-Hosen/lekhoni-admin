@@ -7,7 +7,8 @@ import {
   Check, Ban, Send, Loader2, AlertTriangle, Shield, Filter,
   Edit3, ExternalLink, TrendingUp, Globe, Calendar, Clock,
   Heart, Bookmark, Share2, RefreshCw, Download, ToggleLeft, ToggleRight,
-  Hash, Type, Palette, AlignLeft, ListOrdered, Upload
+  Hash, Type, Palette, AlignLeft, ListOrdered, Upload,
+  Zap, Gift, Megaphone, Sparkles, Award, Coffee, Info, Star
 } from 'lucide-react';
 import './styles.css';
 
@@ -83,6 +84,7 @@ interface Notification {
   title: string;
   body: string;
   icon: string;
+  url: string;
   read: boolean;
   created_at: string;
 }
@@ -775,7 +777,6 @@ function CommentsPage({ onToast, onRefreshPending }: { onToast: (m: string) => v
                     <Trash2 size={14} />
                   </button>
                 </span>
-                <span><small style={{ color: '#5f716c', fontSize: 9 }}>{timeAgo(c.created_at)}</small></span>
               </div>
             ))}
           </div>
@@ -922,6 +923,13 @@ function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [loading, setLoading] = useState(true);
 
+  const iconMap: Record<string, React.ElementType> = {
+    'bell': Bell, 'book-open': BookOpen, 'heart': Heart, 'star': Star, 'zap': Zap,
+    'gift': Gift, 'message-circle': MessageSquare, 'megaphone': Megaphone, 'sparkles': Sparkles,
+    'alert-circle': AlertTriangle, 'check-circle': Check, 'info': Info, 'trending-up': TrendingUp,
+    'award': Award, 'download': Download,
+  };
+
   const load = useCallback(() => {
     setLoading(true);
     api('/api/admin/notifications')
@@ -968,20 +976,23 @@ function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
           </div>
         ) : (
           <div className="table">
-            {notifications.map(n => (
-              <div className="tr" key={n.id} style={{ gridTemplateColumns: '1fr 80px 80px 30px' }}>
-                <span className="book-cell">
-                  <div className="mini-cover" style={{ background: '#18342d', fontSize: 14, width: 30, height: 30, borderRadius: '50%' }}>
-                    {n.icon || '🔔'}
-                  </div>
-                  <em>
-                    <b>{n.title}</b>
-                    <small>{n.body?.slice(0, 70)}{n.body && n.body.length > 70 ? '...' : ''}</small>
-                  </em>
-                </span>
-                <span><small style={{ color: '#6f827d', fontSize: 9 }}>{n.icon || '🔔'}</small></span>
-                <span><small style={{ color: '#5f716c', fontSize: 9 }}>{timeAgo(n.created_at)}</small></span>
-                <span>
+            {notifications.map(n => {
+              const IconComp = iconMap[n.icon] || Bell;
+              return (
+                <div className="tr" key={n.id} style={{ gridTemplateColumns: '1fr 80px 80px 30px' }}>
+                  <span className="book-cell">
+                    <div className="mini-cover" style={{ background: '#18342d', color: '#4dca9f', width: 30, height: 30, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <IconComp size={16} />
+                    </div>
+                    <em>
+                      <b>{n.title}</b>
+                      <small>{n.body?.slice(0, 70)}{n.body && n.body.length > 70 ? '...' : ''}</small>
+                      {n.url && <small style={{ color: '#4dca9f' }}>🔗 {n.url}</small>}
+                    </em>
+                  </span>
+                  <span><small style={{ color: '#6f827d', fontSize: 9 }}>{n.icon}</small></span>
+                  <span><small style={{ color: '#5f716c', fontSize: 9 }}>{timeAgo(n.created_at)}</small></span>
+                  <span>
                   <button
                     style={{ background: 'none', border: 'none', color: '#e15e4e', cursor: 'pointer', padding: 2 }}
                     onClick={() => deleteNotification(n)}
@@ -991,7 +1002,8 @@ function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
                   </button>
                 </span>
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -1455,6 +1467,10 @@ function CategoryModal({ editItem, close, onToast }: { editItem: Category | null
   const [coverUrl, setCoverUrl] = useState(editItem?.cover_url || '');
   const [coverFile, setCoverFile] = useState<File | null>(null);
   const [coverPreview, setCoverPreview] = useState(editItem?.cover_url || '');
+  const [resizeWidth, setResizeWidth] = useState(600);
+  const [resizeHeight, setResizeHeight] = useState(340);
+  const [lockRatio, setLockRatio] = useState(true);
+  const [originalImg, setOriginalImg] = useState<HTMLImageElement | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const handleCoverChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1462,7 +1478,18 @@ function CategoryModal({ editItem, close, onToast }: { editItem: Category | null
     if (!file) return;
     setCoverFile(file);
     const reader = new FileReader();
-    reader.onload = () => setCoverPreview(reader.result as string);
+    reader.onload = () => {
+      const result = reader.result as string;
+      setCoverPreview(result);
+      const img = new window.Image();
+      img.onload = () => {
+        setOriginalImg(img);
+        setResizeWidth(img.naturalWidth);
+        setResizeHeight(img.naturalHeight);
+        setLockRatio(true);
+      };
+      img.src = result;
+    };
     reader.readAsDataURL(file);
   };
 
@@ -1470,6 +1497,32 @@ function CategoryModal({ editItem, close, onToast }: { editItem: Category | null
     setCoverUrl(url);
     setCoverPreview(url);
     setCoverFile(null);
+    setOriginalImg(null);
+  };
+
+  const handleWidthChange = (w: number) => {
+    setResizeWidth(w);
+    if (lockRatio && originalImg) {
+      setResizeHeight(Math.round(w * originalImg.naturalHeight / originalImg.naturalWidth));
+    }
+  };
+
+  const handleHeightChange = (h: number) => {
+    setResizeHeight(h);
+    if (lockRatio && originalImg) {
+      setResizeWidth(Math.round(h * originalImg.naturalWidth / originalImg.naturalHeight));
+    }
+  };
+
+  const resizeImage = (img: HTMLImageElement, w: number, h: number): Promise<Blob> => {
+    return new Promise(resolve => {
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0, w, h);
+      canvas.toBlob(b => resolve(b!), 'image/jpeg', 0.85);
+    });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -1479,8 +1532,13 @@ function CategoryModal({ editItem, close, onToast }: { editItem: Category | null
     try {
       let finalCoverUrl = '';
       if (imageMethod === 'upload' && coverFile) {
+        let fileToUpload: File | Blob = coverFile;
+        if (originalImg && (resizeWidth !== originalImg.naturalWidth || resizeHeight !== originalImg.naturalHeight)) {
+          const resized = await resizeImage(originalImg, resizeWidth, resizeHeight);
+          fileToUpload = new File([resized], coverFile.name, { type: 'image/jpeg' });
+        }
         const fd = new FormData();
-        fd.append('file', coverFile);
+        fd.append('file', fileToUpload);
         const uploadRes = await fetch(`${API_BASE}/api/media`, { method: 'POST', body: fd });
         if (!uploadRes.ok) throw new Error('Cover upload failed');
         const uploadData = await uploadRes.json();
@@ -1545,6 +1603,31 @@ function CategoryModal({ editItem, close, onToast }: { editItem: Category | null
           </label>
         )}
         {coverPreview && <img src={coverPreview} alt="Preview" style={{ maxWidth: '100%', borderRadius: 8, marginTop: 8, maxHeight: 140, objectFit: 'cover' }} />}
+        {originalImg && imageMethod === 'upload' && (
+          <div style={{ marginTop: 10, padding: '12px 14px', borderRadius: 10, background: '#0d1b2a', border: '1px solid #2a3a44' }}>
+            <div style={{ fontWeight: 700, fontSize: 12, color: '#8fa19c', marginBottom: 8 }}>RESIZE IMAGE</div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <label style={{ flex: 1, minWidth: 80 }}>
+                Width
+                <input type="number" min={50} max={3000} value={resizeWidth} onChange={e => handleWidthChange(Number(e.target.value))} style={{ width: '100%' }} />
+              </label>
+              <span style={{ color: '#556', fontSize: 18, marginTop: 14 }}>×</span>
+              <label style={{ flex: 1, minWidth: 80 }}>
+                Height
+                <input type="number" min={50} max={3000} value={resizeHeight} onChange={e => handleHeightChange(Number(e.target.value))} style={{ width: '100%' }} />
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 14, cursor: 'pointer', color: '#b5c4cf', fontSize: 12 }}>
+                <input type="checkbox" checked={lockRatio} onChange={e => setLockRatio(e.target.checked)} style={{ accentColor: '#4dca9f' }} />
+                Lock ratio
+              </label>
+            </div>
+            <div style={{ display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' }}>
+              {[{w:600,h:340,l:'600×340'},{w:800,h:450,l:'800×450'},{w:1080,h:608,l:'1080×608'},{w:1200,h:675,l:'1200×675'}].map(({w,h,l})=>(
+                <button key={l} type="button" onClick={()=>{setResizeWidth(w);setResizeHeight(h);setLockRatio(false)}} style={{ padding:'4px 10px', borderRadius:6, border:'1px solid #2a3a44', background: resizeWidth===w&&resizeHeight===h?'#4dca9f22':'transparent', color:'#8fa19c', cursor:'pointer', fontSize:11, fontWeight:600 }}>{l}</button>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="modal-actions">
           <button type="button" onClick={close} disabled={submitting}>Cancel</button>
           <button className="primary" type="submit" disabled={submitting}>
@@ -1561,8 +1644,27 @@ function CategoryModal({ editItem, close, onToast }: { editItem: Category | null
 function NotificationModal({ close, onToast }: { close: () => void; onToast: (m: string) => void }) {
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
-  const [icon, setIcon] = useState('🔔');
+  const [icon, setIcon] = useState('bell');
+  const [url, setUrl] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  const notifIcons = [
+    { name: 'bell', Icon: Bell, label: 'Bell' },
+    { name: 'book-open', Icon: BookOpen, label: 'Book' },
+    { name: 'heart', Icon: Heart, label: 'Heart' },
+    { name: 'star', Icon: Star, label: 'Star' },
+    { name: 'zap', Icon: Zap, label: 'Zap' },
+    { name: 'gift', Icon: Gift, label: 'Gift' },
+    { name: 'message-circle', Icon: MessageSquare, label: 'Chat' },
+    { name: 'megaphone', Icon: Megaphone, label: 'Alert' },
+    { name: 'sparkles', Icon: Sparkles, label: 'New' },
+    { name: 'alert-circle', Icon: AlertTriangle, label: 'Warning' },
+    { name: 'check-circle', Icon: Check, label: 'Done' },
+    { name: 'info', Icon: Info, label: 'Info' },
+    { name: 'trending-up', Icon: TrendingUp, label: 'Trending' },
+    { name: 'award', Icon: Award, label: 'Award' },
+    { name: 'download', Icon: Download, label: 'Download' },
+  ];
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1574,7 +1676,7 @@ function NotificationModal({ close, onToast }: { close: () => void; onToast: (m:
     try {
       await api('/api/admin/notifications', {
         method: 'POST',
-        body: JSON.stringify({ title: title.trim(), body: body.trim(), icon }),
+        body: JSON.stringify({ title: title.trim(), body: body.trim(), icon, url: url.trim() }),
       });
       onToast('Notification sent');
       close();
@@ -1599,29 +1701,38 @@ function NotificationModal({ close, onToast }: { close: () => void; onToast: (m:
           Title
           <input
             required
-            placeholder="Notification title"
+            placeholder="e.g. New chapter available!"
             value={title}
             onChange={e => setTitle(e.target.value)}
           />
         </label>
         <label>
-          Body
+          Message
           <textarea
             rows={4}
-            placeholder="Notification message..."
+            placeholder="Write your notification message..."
             value={body}
             onChange={e => setBody(e.target.value)}
           />
         </label>
         <label>
-          Icon (emoji)
+          Link (optional)
           <input
-            placeholder="🔔"
-            value={icon}
-            onChange={e => setIcon(e.target.value)}
-            maxLength={4}
+            placeholder="https://example.com or book ID"
+            value={url}
+            onChange={e => setUrl(e.target.value)}
           />
+          <small style={{ color: '#6b7c85', fontSize: 11, marginTop: 4, display: 'block' }}>Add a URL — users will open it when they tap the notification</small>
         </label>
+        <div style={{ marginBottom: 6, fontWeight: 700, fontSize: 13 }}>Notification Icon</div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 16 }}>
+          {notifIcons.map(({ name, Icon, label }) => (
+            <button key={name} type="button" onClick={() => setIcon(name)} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: '10px 4px', borderRadius: 10, border: `2px solid ${icon === name ? '#4dca9f' : '#2a3a44'}`, background: icon === name ? 'rgba(77,202,159,0.15)' : 'transparent', color: icon === name ? '#4dca9f' : '#8fa19c', cursor: 'pointer', fontSize: 10, fontWeight: 600 }}>
+              <Icon size={22} />
+              <span>{label}</span>
+            </button>
+          ))}
+        </div>
         <div className="modal-actions">
           <button type="button" onClick={close} disabled={submitting}>Cancel</button>
           <button className="primary" type="submit" disabled={submitting}>
