@@ -31,6 +31,31 @@ export default {
         await sql`CREATE TABLE IF NOT EXISTS writer_notifications (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), writer_id UUID REFERENCES writers(id) ON DELETE CASCADE, title TEXT NOT NULL, body TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'info', story_id UUID, is_read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`ALTER TABLE stories ADD COLUMN IF NOT EXISTS review_note TEXT DEFAULT ''`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS url TEXT DEFAULT ''`;
+        await sql`CREATE TABLE IF NOT EXISTS home_settings (id INT PRIMARY KEY DEFAULT 1, sections JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        await sql`INSERT INTO home_settings (id, sections) VALUES (1, '[]') ON CONFLICT (id) DO NOTHING`;
+        await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
+        await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS home_section TEXT`;
+        await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
+        await sql`CREATE TABLE IF NOT EXISTS user_state (device_key TEXT PRIMARY KEY, settings JSONB NOT NULL DEFAULT '{}', favorites JSONB NOT NULL DEFAULT '[]', downloads JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]', positions JSONB NOT NULL DEFAULT '{}', bookmarks JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        // Backfill: sync chapters from published writer stories into their books (fix: books with missing chapters)
+        try {
+          const pubStories = await sql`SELECT s.id,s.title,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.status='published'`;
+          for (const st of pubStories) {
+            const bookRows = await sql`SELECT id FROM books WHERE title=${st.title as string} AND author=${st.writer_name as string} LIMIT 1`;
+            if (!bookRows.length) continue;
+            const bId = bookRows[0].id;
+            const storyChs = await sql`SELECT title,body,position,minutes FROM story_chapters WHERE story_id=${st.id} ORDER BY position`;
+            const existing = await sql`SELECT title FROM chapters WHERE book_id=${bId}`;
+            const have = new Set(existing.map((e: any) => (e.title || '').trim()));
+            let added = 0;
+            for (const c of storyChs) {
+              if (have.has((c.title || '').trim())) continue;
+              await sql`INSERT INTO chapters (book_id,title,body,position,status,minutes) VALUES (${bId},${c.title},${c.body||''},${c.position},'published',${c.minutes||5})`;
+              added++;
+            }
+            if (added > 0) { console.log('backfilled', added, 'chapters for', st.title); }
+          }
+        } catch (e) { console.error('backfill error', e); }
         return json({ ok: true, message: 'Migration applied' });
       }
 
@@ -83,17 +108,17 @@ export default {
 
       // --- Books CRUD ---
       if (url.pathname === '/api/admin/books' && request.method === 'GET')
-        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.category_id,b.created_at,b.updated_at,COALESCE(c.name,'') AS category_name FROM books b LEFT JOIN categories c ON b.category_id=c.id ORDER BY b.updated_at DESC`);
+        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.home_section,b.views_visible,b.category_id,b.created_at,b.updated_at,COALESCE(c.name,'') AS category_name FROM books b LEFT JOIN categories c ON b.category_id=c.id ORDER BY b.updated_at DESC`);
       if (url.pathname === '/api/admin/books' && request.method === 'POST') {
-        const b = await request.json() as Record<string, unknown>;
-        if (!b.title || !b.author) return json({ error: 'title and author required' }, 400);
-        const r = await sql`INSERT INTO books (title,author,category_id,cover_url,color,accent,description,status,is_new,featured) VALUES (${b.title as string},${b.author as string},${b.category_id||null},${b.cover_url||null},${b.color||'#123E39'},${b.accent||'#F5C660'},${b.description||''},${b.status||'draft'},${Boolean(b.is_new)},${Boolean(b.featured)}) RETURNING id,title,author,status,created_at`;
+        const b = await request.json() as { title?: string; author?: string; category_id?: string; cover_url?: string; color?: string; accent?: string; description?: string; status?: string; is_new?: boolean; featured?: boolean; home_section?: string };
+        if (!b.title) return json({ error: 'title required' }, 400);
+        const r = await sql`INSERT INTO books (title,author,category_id,cover_url,color,accent,description,status,is_new,featured,home_section) VALUES (${b.title as string},${b.author as string},${b.category_id||null},${b.cover_url||null},${b.color||'#123E39'},${b.accent||'#F5C660'},${b.description||''},${b.status||'draft'},${Boolean(b.is_new)},${Boolean(b.featured)},${(b.home_section||null) as string|null}) RETURNING id,title,author,status,created_at`;
         return json(r[0], 201);
       }
       const bookMatch = url.pathname.match(/^\/api\/admin\/books\/([^/]+)$/);
       if (bookMatch && request.method === 'GET') {
         if (!uuid(bookMatch[1])) return json({ error: 'Invalid ID' }, 400);
-        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.category_id,b.created_at,b.updated_at,COALESCE(c.name,'') AS category_name FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookMatch[1]}`;
+        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.home_section,b.views_visible,b.category_id,b.created_at,b.updated_at,COALESCE(c.name,'') AS category_name FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookMatch[1]}`;
         if (!rows.length) return json({ error: 'Not found' }, 404);
         const chs = await sql`SELECT id,title,body,position,status,views,created_at FROM chapters WHERE book_id=${bookMatch[1]} ORDER BY position`;
         return json({ ...rows[0], chapters: chs });
@@ -101,10 +126,10 @@ export default {
       if (bookMatch && request.method === 'PUT') {
         if (!uuid(bookMatch[1])) return json({ error: 'Invalid ID' }, 400);
         const b = await request.json() as Record<string, unknown>;
-        if (b.title !== undefined || b.author !== undefined || b.description !== undefined || b.category_id !== undefined || b.cover_url !== undefined || b.color !== undefined || b.accent !== undefined || b.status !== undefined || b.is_new !== undefined || b.featured !== undefined) {
-          await sql`UPDATE books SET title=COALESCE(${b.title as string||null},title),author=COALESCE(${b.author as string||null},author),description=COALESCE(${b.description as string||null},description),category_id=COALESCE(${b.category_id as string||null},category_id),cover_url=COALESCE(${b.cover_url as string||null},cover_url),color=COALESCE(${b.color as string||null},color),accent=COALESCE(${b.accent as string||null},accent),status=COALESCE(${b.status as string||null},status),is_new=COALESCE(${b.is_new as boolean||null},is_new),featured=COALESCE(${b.featured as boolean||null},featured),updated_at=NOW() WHERE id=${bookMatch[1]}`;
+        if (b.title !== undefined || b.author !== undefined || b.description !== undefined || b.category_id !== undefined || b.cover_url !== undefined || b.color !== undefined || b.accent !== undefined || b.status !== undefined || b.is_new !== undefined || b.featured !== undefined || b.home_section !== undefined || b.views_visible !== undefined) {
+          await sql`UPDATE books SET title=COALESCE(${b.title as string||null},title),author=COALESCE(${b.author as string||null},author),description=COALESCE(${b.description as string||null},description),category_id=COALESCE(${b.category_id as string||null},category_id),cover_url=COALESCE(${b.cover_url as string||null},cover_url),color=COALESCE(${b.color as string||null},color),accent=COALESCE(${b.accent as string||null},accent),status=COALESCE(${b.status as string||null},status),is_new=COALESCE(${b.is_new as boolean||null},is_new),featured=COALESCE(${b.featured as boolean||null},featured),home_section=COALESCE(${b.home_section as string||null},home_section),views_visible=COALESCE(${b.views_visible as boolean||null},views_visible),updated_at=NOW() WHERE id=${bookMatch[1]}`;
         }
-        const r = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.category_id,b.updated_at,COALESCE(c.name,'') AS category_name FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookMatch[1]}`;
+        const r = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.home_section,b.views_visible,b.category_id,b.updated_at,COALESCE(c.name,'') AS category_name FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookMatch[1]}`;
         return json(r[0] || { error: 'Not found' }, r.length ? 200 : 404);
       }
       if (bookMatch && request.method === 'DELETE') {
@@ -155,6 +180,23 @@ export default {
         (SELECT COUNT(*)::int FROM story_chapters sc WHERE sc.story_id=s.id) AS chapter_count
         FROM stories s JOIN writers w ON s.writer_id=w.id
         ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END,s.updated_at DESC`);
+      // --- Admin: Writer user profiles (stats + detail) ---
+      if (url.pathname === '/api/admin/writer-users' && request.method === 'GET') {
+        return json(await sql`SELECT w.id,w.username,w.writer_name,w.email,w.avatar_url,w.bio,w.follower_count,w.is_active,w.created_at,
+          (SELECT COUNT(*)::int FROM stories s WHERE s.writer_id=w.id) AS total_stories,
+          (SELECT COUNT(*)::int FROM stories s WHERE s.writer_id=w.id AND s.status='published') AS published_stories,
+          (SELECT COALESCE(SUM(s.views),0)::int FROM stories s WHERE s.writer_id=w.id) AS total_views,
+          (SELECT COUNT(*)::int FROM follows f WHERE f.writer_id=w.id) AS followers
+          FROM writers w ORDER BY w.created_at DESC`);
+      }
+      const writerUserMatch = url.pathname.match(/^\/api\/admin\/writer-users\/([^/]+)$/);
+      if (writerUserMatch && request.method === 'GET') {
+        if (!uuid(writerUserMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        const prof = await sql`SELECT w.id,w.username,w.writer_name,w.email,w.avatar_url,w.bio,w.follower_count,w.is_active,w.created_at,(SELECT COUNT(*)::int FROM follows f WHERE f.writer_id=w.id) AS followers FROM writers w WHERE w.id=${writerUserMatch[1]} LIMIT 1`;
+        if (!prof.length) return json({ error: 'Not found' }, 404);
+        const stories = await sql`SELECT s.id,s.title,s.description,s.status,s.category,s.views,s.likes,s.chapters_count,s.review_note,s.created_at,s.updated_at,(SELECT COUNT(*)::int FROM story_chapters sc WHERE sc.story_id=s.id) AS chapter_count FROM stories s WHERE s.writer_id=${writerUserMatch[1]} ORDER BY s.updated_at DESC`;
+        return json({ profile: prof[0], stories });
+      }
       const writerMatch = url.pathname.match(/^\/api\/admin\/writers\/([^/]+)$/);
       if (writerMatch && request.method === 'PUT') {
         if (!uuid(writerMatch[1])) return json({ error: 'Invalid ID' }, 400);
@@ -174,10 +216,21 @@ export default {
             catId = cat[0].id;
           }
           const chapters = await sql`SELECT title,body,position FROM story_chapters WHERE story_id=${s.id} ORDER BY position`;
-          const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status) VALUES (${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published') RETURNING id`;
-          const bookId = bk[0]?.id;
-          for (const c of chapters) {
-            if (bookId) await sql`INSERT INTO chapters (book_id,title,body,position,status) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published')`;
+          let bookId: string | null = null;
+          const existingBook = await sql`SELECT id FROM books WHERE title=${s.title} AND author=${s.writer_name} LIMIT 1`;
+          if (existingBook.length) {
+            bookId = existingBook[0].id;
+          } else {
+            const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status) VALUES (${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published') RETURNING id`;
+            bookId = bk[0]?.id || null;
+          }
+          if (bookId) {
+            const existingChs = await sql`SELECT title FROM chapters WHERE book_id=${bookId}`;
+            const have = new Set(existingChs.map((e: any) => (e.title || '').trim()));
+            for (const c of chapters) {
+              if (have.has((c.title || '').trim())) continue;
+              try { await sql`INSERT INTO chapters (book_id,title,body,position,status) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published')`; } catch (e) { console.error('chapter insert failed', e); }
+            }
           }
           const actData = JSON.stringify({ story_id: s.id, title: s.title });
           const approveTitle = 'Story Approved';
@@ -252,6 +305,29 @@ export default {
       if (url.pathname === '/api/admin/live' && request.method === 'GET')
         return json(await sql`SELECT ve.device_id,d.device_key,d.display_name,ve.book_id,b.title AS book_title,ve.created_at FROM view_events ve LEFT JOIN devices d ON ve.device_id=d.id LEFT JOIN books b ON ve.book_id=b.id WHERE ve.created_at>NOW()-INTERVAL '5 minutes' ORDER BY ve.created_at DESC LIMIT 20`);
 
+      // --- Admin: Home sections config ---
+      if (url.pathname === '/api/admin/home-config' && request.method === 'GET') {
+        const row = await sql`SELECT sections FROM home_settings WHERE id=1 LIMIT 1`;
+        if (!row[0]) return json([]);
+        const raw = row[0].sections;
+        return json(JSON.parse(typeof raw === 'string' ? raw : JSON.stringify(raw)));
+      }
+      if (url.pathname === '/api/admin/home-config' && request.method === 'PUT') {
+        const b = await request.json() as { sections: { key: string; enabled: boolean; title?: string }[] };
+        const sections = (b.sections || []).filter((s) => s && s.key).map((s) => ({ key: s.key, enabled: s.enabled !== false, title: s.title || '' }));
+        await sql`UPDATE home_settings SET sections=${JSON.stringify(sections) as any}, updated_at=NOW() WHERE id=1`;
+        return json({ ok: true });
+      }
+      // --- Admin: App config (global settings) ---
+      if (url.pathname === '/api/admin/app-config' && request.method === 'GET') {
+        const row = await sql`SELECT views_visible FROM home_settings WHERE id=1 LIMIT 1`;
+        return json({ views_visible: row[0]?.views_visible !== false });
+      }
+      if (url.pathname === '/api/admin/app-config' && request.method === 'PUT') {
+        const b = await request.json() as { views_visible?: boolean };
+        await sql`UPDATE home_settings SET views_visible=${b.views_visible === true}, updated_at=NOW() WHERE id=1`;
+        return json({ ok: true, views_visible: b.views_visible === true });
+      }
       // --- Admin: Writer Stories (all writers' stories for approval) ---
       if (url.pathname === '/api/admin/stories' && request.method === 'GET')
         return json(await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,s.chapters_count,s.review_note,s.created_at,s.updated_at,w.writer_name,w.username FROM stories s LEFT JOIN writers w ON s.writer_id=w.id ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 ELSE 2 END,s.updated_at DESC`);
@@ -261,7 +337,25 @@ export default {
         const b = await request.json() as { status?: string; review_note?: string };
         if (b.status && !['draft','pending','published','rejected'].includes(b.status)) return json({ error: 'Invalid status' }, 400);
         await sql`UPDATE stories SET status=COALESCE(${b.status},status),review_note=COALESCE(${b.review_note},review_note),updated_at=NOW() WHERE id=${adminStoryMatch[1]}`;
-        const s = await sql`SELECT writer_id,title FROM stories WHERE id=${adminStoryMatch[1]}`;
+        const s = await sql`SELECT s.id,s.title,s.description,s.category,s.cover_url,s.writer_id,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${adminStoryMatch[1]}`;
+        if (b.status === 'published' && s.length) {
+          try {
+            const st = s[0];
+            let catId: string | null = null;
+            if (st.category) { const cat = await sql`SELECT id FROM categories WHERE LOWER(name)=${st.category.toLowerCase()} LIMIT 1`; if (cat.length) catId = cat[0].id; }
+            if (!catId) { const cat = await sql`INSERT INTO categories (name,icon,color) VALUES (${st.category||'গল্প'},'book-open','#DDF5EC') RETURNING id`; catId = cat[0].id; }
+            const chapters = await sql`SELECT title,body,position FROM story_chapters WHERE story_id=${st.id} ORDER BY position`;
+            let bookId: string | null = null;
+            const existingBook = await sql`SELECT id FROM books WHERE title=${st.title} AND author=${st.writer_name} LIMIT 1`;
+            if (existingBook.length) { bookId = existingBook[0].id; }
+            else { const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status) VALUES (${st.title},${st.writer_name},${catId},${st.cover_url||null},${st.description||''},'published') RETURNING id`; bookId = bk[0]?.id || null; }
+            if (bookId) {
+              const existingChs = await sql`SELECT title FROM chapters WHERE book_id=${bookId}`;
+              const have = new Set(existingChs.map((e: any) => (e.title || '').trim()));
+              for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published')`; } catch (e) { console.error('chapter insert failed', e); } }
+            }
+          } catch (e) { console.error('stories publish sync failed', e); }
+        }
         if (s.length) {
           const notifTitle = b.status === 'published' ? 'Story Approved!' : b.status === 'rejected' ? 'Story Rejected' : 'Story Updated';
           const notifBody = b.status === 'published' ? `"${s[0].title}" has been published.` : b.status === 'rejected' ? `"${s[0].title}" was rejected.${b.review_note ? ' Reason: ' + b.review_note : ''}` : `Your story "${s[0].title}" status updated.`;
@@ -305,14 +399,59 @@ export default {
       if (url.pathname === '/api/public/categories' && request.method === 'GET')
         return json(await sql`SELECT id,name,icon,color,cover_url FROM categories WHERE is_active=true ORDER BY position`);
       if (url.pathname === '/api/public/books' && request.method === 'GET')
-        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
+        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
       if (url.pathname === '/api/public/chapters' && request.method === 'GET')
         return json(await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE status='published' ORDER BY position`);
+
+      // --- Public: Home sections config ---
+      if (url.pathname === '/api/home-config' && request.method === 'GET') {
+        const row = await sql`SELECT sections FROM home_settings WHERE id=1 LIMIT 1`;
+        const raw = row[0]?.sections;
+        const known = ['featured', 'newEpisodes', 'mostPopular', 'weeklyPopular', 'monthlyPopular', 'popularAuthors'];
+        const saved = raw ? (JSON.parse(typeof raw === 'string' ? raw : JSON.stringify(raw)) as { key: string; enabled: boolean; title?: string }[]).filter((s) => s && known.includes(s.key)) : [];
+        const seen = new Set(saved.map((s) => s.key));
+        for (const k of known) if (!seen.has(k)) { saved.push({ key: k, enabled: true, title: '' }); seen.add(k); }
+        return json(saved.map((s) => ({ key: s.key, enabled: s.enabled !== false, title: s.title || '' })));
+      }
+
+      // --- Public: Home section book lists (time-based auto + manual override) ---
+      if (url.pathname === '/api/home-sections' && request.method === 'GET') {
+        const cfgRow = await sql`SELECT sections, views_visible FROM home_settings WHERE id=1 LIMIT 1`;
+        const cfgRaw = cfgRow[0]?.sections;
+        const savedCfg = cfgRaw ? (JSON.parse(typeof cfgRaw === 'string' ? cfgRaw : JSON.stringify(cfgRaw)) as { key: string; enabled: boolean; title?: string }[]) : [];
+        const titleOf = (k: string) => { const s = savedCfg.find((x) => x.key === k); return (s && s.title) ? s.title : ''; };
+        const now = Date.now();
+        const books = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.created_at,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published'`;
+        const eff = (b: any) => {
+          if (b.home_section) return b.home_section;
+          const ageDays = (now - new Date(b.created_at).getTime()) / 86400000;
+          if (ageDays < 7) return 'ongoing';
+          if (ageDays <= 30) return 'weekly';
+          return 'monthly';
+        };
+        const byViews = (a: any, b: any) => +b.views - +a.views;
+        const byNewest = (a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+        const fn = (id: string | null) => (id ? `${id}` : '');
+        const fmt = (b: any) => ({ id: fn(b.id), title: b.title, author: b.author, cover_url: b.cover_url, views: `${b.views}`, likes: b.likes, description: b.description, category: b.category, color: b.color, accent: b.accent, is_new: b.is_new, featured: b.featured, home_section: b.home_section || eff(b), views_visible: b.views_visible !== false });
+        const ongoing = books.filter((b: any) => eff(b) === 'ongoing');
+        const weekly = books.filter((b: any) => eff(b) === 'weekly');
+        const monthly = books.filter((b: any) => eff(b) === 'monthly');
+        const featured = books.filter((b: any) => eff(b) === 'featured' || b.featured);
+        const sections = [
+          { key: 'featured', title: titleOf('featured'), books: [...featured].sort(byViews) },
+          { key: 'newEpisodes', title: titleOf('newEpisodes'), books: [...ongoing].sort(byNewest) },
+          { key: 'weeklyPopular', title: titleOf('weeklyPopular'), books: [...weekly].sort(byViews) },
+          { key: 'monthlyPopular', title: titleOf('monthlyPopular'), books: [...monthly].sort(byViews) },
+          { key: 'mostPopular', title: titleOf('mostPopular'), books: [...books].sort(byViews).slice(0, 12) },
+        ].map((s) => ({ key: s.key, title: s.title, books: s.books.slice(0, 12).map(fmt) }));
+        const writers = await sql`SELECT id,writer_name,bio,avatar_url,follower_count FROM writers WHERE is_active=true ORDER BY follower_count DESC LIMIT 12`;
+        return json({ viewsVisible: cfgRow?.[0]?.views_visible !== false, sections, writers: writers.map((w: any) => ({ id: `${w.id}`, writer_name: w.writer_name, bio: w.bio, avatar_url: w.avatar_url, follower_count: w.follower_count })) });
+      }
 
       const pubBookMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)$/);
       if (pubBookMatch && request.method === 'GET') {
         const bookId = pubBookMatch[1];
-        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookId} AND b.status='published'`;
+        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookId} AND b.status='published'`;
         if (!rows.length) return json({ error: 'Not found' }, 404);
         const chs = await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE book_id=${bookId} AND status='published' ORDER BY position`;
         return json({ ...rows[0], chapters: chs });
@@ -481,6 +620,35 @@ export default {
         if (!dRow.length) return json({ ok: true });
         await sql`DELETE FROM follows WHERE device_id=${dRow[0].id} AND writer_id=${writerId}`;
         await sql`UPDATE writers SET follower_count = GREATEST(follower_count - 1, 0) WHERE id=${writerId}`;
+        return json({ ok: true });
+      }
+
+      // --- Online user settings sync (keyed by device_key) ---
+      if (url.pathname === '/api/public/user-state' && request.method === 'GET') {
+        const deviceKey = url.searchParams.get('device_key');
+        if (!deviceKey) return json({ error: 'device_key required' }, 400);
+        const uptime = await sql`SELECT settings,favorites,downloads,history,positions,bookmarks,updated_at FROM user_state WHERE device_key=${deviceKey} LIMIT 1`;
+        if (!uptime.length) return json({ synced: false });
+        return json({ synced: true, state: uptime[0] });
+      }
+      if (url.pathname === '/api/public/user-state' && request.method === 'PUT') {
+        const b = await request.json() as { device_key?: string; settings?: unknown; favorites?: string[]; downloads?: string[]; history?: string[]; positions?: Record<string, number>; bookmarks?: unknown[] };
+        if (!b.device_key) return json({ error: 'device_key required' }, 400);
+        const cur = await sql`SELECT settings,favorites,downloads,history,positions,bookmarks FROM user_state WHERE device_key=${b.device_key} LIMIT 1`;
+        const s = cur[0] || {};
+        const merge = (curVal: unknown, newVal: unknown) => (newVal === undefined ? curVal ?? null : newVal);
+        await sql`INSERT INTO user_state (device_key,settings,favorites,downloads,history,positions,bookmarks,updated_at) VALUES (${b.device_key},
+                ${JSON.stringify(merge(s.settings, b.settings))},
+                ${JSON.stringify(merge(s.favorites, b.favorites))},
+                ${JSON.stringify(merge(s.downloads, b.downloads))},
+                ${JSON.stringify(merge(s.history, b.history))},
+                ${JSON.stringify(merge(s.positions, b.positions))},
+                ${JSON.stringify(merge(s.bookmarks, b.bookmarks))},
+                NOW())
+           ON CONFLICT (device_key) DO UPDATE SET
+                settings=EXCLUDED.settings, favorites=EXCLUDED.favorites, downloads=EXCLUDED.downloads,
+                history=EXCLUDED.history, positions=EXCLUDED.positions, bookmarks=EXCLUDED.bookmarks,
+                updated_at=NOW()`;
         return json({ ok: true });
       }
 
