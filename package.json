@@ -10,8 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
     "@neondatabase/serverless": "latest",
+    "@vitejs/plugin-react": "latest",
     "lucide-react": "latest",
     "pg": "^8.23.0",
     "react": "latest",
@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "@types/react": "latest",
-    "@types/react-dom": "latest"
+    "@types/react-dom": "latest",
+    "wrangler": "^4.127.0"
   }
 }

@@ -69,12 +69,16 @@ interface Comment {
 
 interface Writer {
   id: string;
-  name: string;
-  email: string;
-  bio: string;
-  status: 'pending' | 'approved' | 'rejected';
-  note: string;
-  submitted_at: string;
+  title: string;
+  description: string;
+  status: 'pending' | 'published' | 'rejected' | 'draft';
+  cover_url: string | null;
+  category: string;
+  writer_name: string;
+  review_note: string;
+  chapter_count: number;
+  views: number;
+  likes: number;
   created_at: string;
   updated_at: string;
 }
@@ -85,6 +89,7 @@ interface Notification {
   body: string;
   icon: string;
   url: string;
+  target?: string;
   read: boolean;
   created_at: string;
 }
@@ -227,8 +232,8 @@ function App() {
         {page === 'Chapters' && <ChaptersPage onToast={showToast} />}
         {page === 'Categories' && <CategoriesPage onEdit={(c: Category) => openEdit('category', c)} onToast={showToast} />}
         {page === 'Comments' && <CommentsPage onToast={showToast} onRefreshPending={setPendingComments} />}
-        {page === 'Writers' && <WritersPage onToast={showToast} onRefreshPending={setPendingWriters} />}
-        {page === 'Notifications' && <NotificationsPage onToast={showToast} />}
+            {page === 'Writers' && <WritersPage onToast={showToast} onRefreshPending={setPendingWriters} />}
+            {page === 'Notifications' && <NotificationsPage onToast={showToast} />}
         {page === 'Analytics' && <AnalyticsPage />}
         {page === 'Settings' && <SettingsPage />}
       </main>
@@ -271,7 +276,7 @@ function Dashboard({ onCreate, onToast }: { onCreate: () => void; onToast: (m: s
         <Metric icon={BookOpen} label="Published books" value={loading ? '...' : String(d?.published_books ?? 0)} delta={loading ? '' : `${d?.total_books ?? 0} total`} />
         <Metric icon={Eye} label="Total reads" value={loading ? '...' : formatNumber(d?.total_views ?? 0)} delta={loading ? '' : `${formatNumber(d?.views_today ?? 0)} today`} />
         <Metric icon={MessageSquare} label="Pending comments" value={loading ? '...' : String(d?.pending_comments ?? 0)} delta="Needs review" warn={!!d?.pending_comments} />
-        <Metric icon={Users} label="Writer submissions" value={loading ? '...' : String(d?.pending_writers ?? 0)} delta="Pending approval" warn={!!d?.pending_writers} />
+        <Metric icon={Users} label="Pending writer stories" value={loading ? '...' : String(d?.pending_writers ?? 0)} delta="Awaiting review" warn={!!d?.pending_writers} />
       </div>
       <div className="dashboard-grid">
         <section className="panel chart">
@@ -808,7 +813,7 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
 
   useEffect(() => { load(); }, [load]);
 
-  const updateStatus = async (writer: Writer, status: 'approved' | 'rejected') => {
+  const updateStatus = async (writer: any, status: 'published' | 'rejected') => {
     const note = actionNote[writer.id] || '';
     try {
       await api(`/api/admin/writers/${writer.id}`, {
@@ -816,10 +821,10 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
         body: JSON.stringify({ status, note }),
       });
       setWriters(prev => prev.map(w => w.id === writer.id ? { ...w, status, note } : w));
-      onToast(`Writer ${status}`);
+      onToast(status === 'published' ? 'Story published to app' : 'Story rejected');
       api('/api/admin/analytics').then((d: any) => onRefreshPending?.(d.pending_writers || 0)).catch(() => {});
     } catch {
-      onToast('Failed to update writer');
+      onToast('Failed to update story');
     }
   };
 
@@ -833,17 +838,17 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
       <div className="resource-head">
         <div>
           <h2>Manage writers</h2>
-          <p>Review writer applications and submissions.</p>
+          <p>Review writer story submissions. Approved stories are published to the app.</p>
         </div>
       </div>
       <div className="panel resource">
         <div className="resource-toolbar">
           <label className="search">
             <Search size={17} />
-            <input placeholder="Search writers..." />
+            <input placeholder="Search writer stories..." />
           </label>
           <div style={{ display: 'flex', gap: 6 }}>
-            {['all', 'pending', 'approved', 'rejected'].map(f => (
+            {['all', 'pending', 'published', 'rejected'].map(f => (
               <button
                 key={f}
                 style={filter === f ? { background: '#1b2926', color: '#56d5b1', borderColor: '#56d5b1' } : {}}
@@ -855,28 +860,29 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
           </div>
         </div>
         {loading ? (
-          <div className="empty"><Loader2 size={35} className="spin" /><h3>Loading writers...</h3></div>
+          <div className="empty"><Loader2 size={35} className="spin" /><h3>Loading writer stories...</h3></div>
         ) : filtered.length === 0 ? (
           <div className="empty">
             <Users size={35} />
-            <h3>No writers found</h3>
-            <p>Writer applications will appear here.</p>
+            <h3>No writer stories found</h3>
+            <p>Writer story submissions will appear here.</p>
           </div>
         ) : (
           <div className="table">
             {filtered.map(w => (
-              <div className="tr" key={w.id} style={{ gridTemplateColumns: '1fr 100px 120px 60px' }}>
+              <div className="tr" key={w.id} style={{ gridTemplateColumns: '44px 1fr 100px 140px 60px' }}>
                 <span className="book-cell">
-                  <div className="mini-cover" style={{ background: statusColor(w.status), fontSize: 11, width: 30, height: 30, borderRadius: '50%' }}>
-                    {w.name?.charAt(0)?.toUpperCase() || '?'}
-                  </div>
+                  {w.cover_url ? <img src={w.cover_url} alt="" style={{ width: 36, height: 46, borderRadius: 4, objectFit: 'cover' }} />
+                    : <div className="mini-cover" style={{ background: statusColor(w.status), width: 30, height: 30, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 11 }}><BookOpen size={14} /></div>}
+                </span>
+                <span className="book-cell">
                   <em>
-                    <b>{w.name}</b>
-                    <small>{w.bio?.slice(0, 60) || w.email} {w.bio && w.bio.length > 60 ? '...' : ''}</small>
+                    <b>{w.title}</b>
+                    <small>{w.writer_name} • {w.category || 'No category'} • {w.chapter_count || 0} chapters</small>
                   </em>
                 </span>
                 <span><u className={w.status === 'pending' ? 'draft' : ''}>{w.status}</u></span>
-                <span style={{ display: 'flex', gap: 4 }}>
+                <span style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
                   {w.status === 'pending' ? (
                     <>
                       <input
@@ -890,8 +896,8 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
                       />
                       <button
                         style={{ background: 'none', border: 'none', color: '#4dca9f', cursor: 'pointer', padding: 2 }}
-                        onClick={() => updateStatus(w, 'approved')}
-                        title="Approve"
+                        onClick={() => updateStatus(w, 'published')}
+                        title="Approve / Publish"
                       >
                         <Check size={14} />
                       </button>
@@ -904,10 +910,10 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
                       </button>
                     </>
                   ) : (
-                    <span style={{ fontSize: 9, color: '#6f827d' }}>{w.note || 'No note'}</span>
+                    <span style={{ fontSize: 9, color: '#6f827d' }}>{w.review_note || 'No note'}</span>
                   )}
                 </span>
-                <span><small style={{ color: '#5f716c', fontSize: 9 }}>{timeAgo(w.submitted_at || w.created_at)}</small></span>
+                <span><small style={{ color: '#5f716c', fontSize: 9 }}>{timeAgo(w.created_at)}</small></span>
               </div>
             ))}
           </div>
@@ -979,7 +985,7 @@ function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
             {notifications.map(n => {
               const IconComp = iconMap[n.icon] || Bell;
               return (
-                <div className="tr" key={n.id} style={{ gridTemplateColumns: '1fr 80px 80px 30px' }}>
+                <div className="tr" key={n.id} style={{ gridTemplateColumns: '1fr 80px 80px 70px 30px' }}>
                   <span className="book-cell">
                     <div className="mini-cover" style={{ background: '#18342d', color: '#4dca9f', width: 30, height: 30, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                       <IconComp size={16} />
@@ -991,6 +997,7 @@ function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
                     </em>
                   </span>
                   <span><small style={{ color: '#6f827d', fontSize: 9 }}>{n.icon}</small></span>
+                  <span>{n.target && <small style={{ padding: '2px 8px', borderRadius: 6, fontSize: 9, fontWeight: 700, background: n.target === 'writer' ? '#6366F1' : '#18342d', color: n.target === 'writer' ? '#c4b5fd' : '#4dca9f' }}>{n.target === 'writer' ? `Writer${(n as any).writer_count > 1 ? ` (${(n as any).writer_count})` : ''}` : 'Reader'}</small>}</span>
                   <span><small style={{ color: '#5f716c', fontSize: 9 }}>{timeAgo(n.created_at)}</small></span>
                   <span>
                   <button
@@ -1646,7 +1653,12 @@ function NotificationModal({ close, onToast }: { close: () => void; onToast: (m:
   const [body, setBody] = useState('');
   const [icon, setIcon] = useState('bell');
   const [url, setUrl] = useState('');
+  const [target, setTarget] = useState<'all' | 'writers'>('all');
   const [submitting, setSubmitting] = useState(false);
+  const [writers, setWriters] = useState<any[]>([]);
+  const [selectedWriter, setSelectedWriter] = useState('');
+
+  useEffect(() => { if (target === 'writers') api('/api/admin/writers').then(d => setWriters(d as any[])).catch(() => {}); }, [target]);
 
   const notifIcons = [
     { name: 'bell', Icon: Bell, label: 'Bell' },
@@ -1674,10 +1686,17 @@ function NotificationModal({ close, onToast }: { close: () => void; onToast: (m:
     }
     setSubmitting(true);
     try {
-      await api('/api/admin/notifications', {
-        method: 'POST',
-        body: JSON.stringify({ title: title.trim(), body: body.trim(), icon, url: url.trim() }),
-      });
+      if (target === 'writers') {
+        await api('/api/admin/writer-notifications/send', {
+          method: 'POST',
+          body: JSON.stringify({ title: title.trim(), body: body.trim(), type: 'info', writer_id: selectedWriter || undefined, url: url.trim() }),
+        });
+      } else {
+        await api('/api/admin/notifications', {
+          method: 'POST',
+          body: JSON.stringify({ title: title.trim(), body: body.trim(), icon, url: url.trim() }),
+        });
+      }
       onToast('Notification sent');
       close();
     } catch {
@@ -1724,6 +1743,22 @@ function NotificationModal({ close, onToast }: { close: () => void; onToast: (m:
           />
           <small style={{ color: '#6b7c85', fontSize: 11, marginTop: 4, display: 'block' }}>Add a URL — users will open it when they tap the notification</small>
         </label>
+        <label>
+          Send to
+          <select value={target} onChange={e => { setTarget(e.target.value as any); setSelectedWriter(''); }}>
+            <option value="all">All users</option>
+            <option value="writers">Writers only</option>
+          </select>
+        </label>
+        {target === 'writers' && (
+          <label>
+            Specific writer (optional)
+            <select value={selectedWriter} onChange={e => setSelectedWriter(e.target.value)}>
+              <option value="">All writers</option>
+              {writers.map((w: any) => <option key={w.id} value={w.id}>{w.writer_name} (@{w.username})</option>)}
+            </select>
+          </label>
+        )}
         <div style={{ marginBottom: 6, fontWeight: 700, fontSize: 13 }}>Notification Icon</div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 16 }}>
           {notifIcons.map(({ name, Icon, label }) => (
