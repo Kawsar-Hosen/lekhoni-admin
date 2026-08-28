@@ -1,7 +1,7 @@
 import { neon } from '@neondatabase/serverless';
 
 export interface Env { DATABASE_URL: string; MEDIA: R2Bucket; ALLOWED_ORIGIN: string; MEDIA_PUBLIC_URL: string }
-const corsHeaders = (origin: string) => ({ 'content-type': 'application/json', 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type', 'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS' });
+const corsHeaders = (origin: string) => ({ 'content-type': 'application/json', 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type', 'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS' });
 const json = (data: unknown, status = 200, origin = '*') => new Response(JSON.stringify(data), { status, headers: corsHeaders(origin) });
 
 function uuid(id: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id); }
@@ -31,6 +31,7 @@ export default {
         await sql`CREATE TABLE IF NOT EXISTS writer_notifications (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), writer_id UUID REFERENCES writers(id) ON DELETE CASCADE, title TEXT NOT NULL, body TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'info', story_id UUID, is_read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`ALTER TABLE stories ADD COLUMN IF NOT EXISTS review_note TEXT DEFAULT ''`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS url TEXT DEFAULT ''`;
+        await sql`ALTER TABLE writers ADD COLUMN IF NOT EXISTS badge TEXT NOT NULL DEFAULT 'none'`;
         await sql`CREATE TABLE IF NOT EXISTS home_settings (id INT PRIMARY KEY DEFAULT 1, sections JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`INSERT INTO home_settings (id, sections) VALUES (1, '[]') ON CONFLICT (id) DO NOTHING`;
         await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
@@ -182,7 +183,7 @@ export default {
         ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END,s.updated_at DESC`);
       // --- Admin: Writer user profiles (stats + detail) ---
       if (url.pathname === '/api/admin/writer-users' && request.method === 'GET') {
-        return json(await sql`SELECT w.id,w.username,w.writer_name,w.email,w.avatar_url,w.bio,w.follower_count,w.is_active,w.created_at,
+        return json(await sql`SELECT w.id,w.username,w.writer_name,w.email,w.avatar_url,w.bio,w.follower_count,w.badge,w.is_active,w.created_at,
           (SELECT COUNT(*)::int FROM stories s WHERE s.writer_id=w.id) AS total_stories,
           (SELECT COUNT(*)::int FROM stories s WHERE s.writer_id=w.id AND s.status='published') AS published_stories,
           (SELECT COALESCE(SUM(s.views),0)::int FROM stories s WHERE s.writer_id=w.id) AS total_views,
@@ -192,10 +193,17 @@ export default {
       const writerUserMatch = url.pathname.match(/^\/api\/admin\/writer-users\/([^/]+)$/);
       if (writerUserMatch && request.method === 'GET') {
         if (!uuid(writerUserMatch[1])) return json({ error: 'Invalid ID' }, 400);
-        const prof = await sql`SELECT w.id,w.username,w.writer_name,w.email,w.avatar_url,w.bio,w.follower_count,w.is_active,w.created_at,(SELECT COUNT(*)::int FROM follows f WHERE f.writer_id=w.id) AS followers FROM writers w WHERE w.id=${writerUserMatch[1]} LIMIT 1`;
+        const prof = await sql`SELECT w.id,w.username,w.writer_name,w.email,w.avatar_url,w.bio,w.follower_count,w.badge,w.is_active,w.created_at,(SELECT COUNT(*)::int FROM follows f WHERE f.writer_id=w.id) AS followers FROM writers w WHERE w.id=${writerUserMatch[1]} LIMIT 1`;
         if (!prof.length) return json({ error: 'Not found' }, 404);
         const stories = await sql`SELECT s.id,s.title,s.description,s.status,s.category,s.views,s.likes,s.chapters_count,s.review_note,s.created_at,s.updated_at,(SELECT COUNT(*)::int FROM story_chapters sc WHERE sc.story_id=s.id) AS chapter_count FROM stories s WHERE s.writer_id=${writerUserMatch[1]} ORDER BY s.updated_at DESC`;
         return json({ profile: prof[0], stories });
+      }
+      if (writerUserMatch && request.method === 'PATCH') {
+        if (!uuid(writerUserMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        const b = await request.json() as { badge?: string };
+        if (!b.badge || !['none','verified','popular','top'].includes(b.badge)) return json({ error: 'Valid badge required: none,verified,popular,top' }, 400);
+        await sql`UPDATE writers SET badge=${b.badge} WHERE id=${writerUserMatch[1]}`;
+        return json({ ok: true });
       }
       const writerMatch = url.pathname.match(/^\/api\/admin\/writers\/([^/]+)$/);
       if (writerMatch && request.method === 'PUT') {
@@ -444,8 +452,8 @@ export default {
           { key: 'monthlyPopular', title: titleOf('monthlyPopular'), books: [...monthly].sort(byViews) },
           { key: 'mostPopular', title: titleOf('mostPopular'), books: [...books].sort(byViews).slice(0, 12) },
         ].map((s) => ({ key: s.key, title: s.title, books: s.books.slice(0, 12).map(fmt) }));
-        const writers = await sql`SELECT id,writer_name,bio,avatar_url,follower_count FROM writers WHERE is_active=true ORDER BY follower_count DESC LIMIT 12`;
-        return json({ viewsVisible: cfgRow?.[0]?.views_visible !== false, sections, writers: writers.map((w: any) => ({ id: `${w.id}`, writer_name: w.writer_name, bio: w.bio, avatar_url: w.avatar_url, follower_count: w.follower_count })) });
+        const writers = await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge FROM writers WHERE is_active=true ORDER BY follower_count DESC LIMIT 12`;
+        return json({ viewsVisible: cfgRow?.[0]?.views_visible !== false, sections, writers: writers.map((w: any) => ({ id: `${w.id}`, username: w.username, writer_name: w.writer_name, bio: w.bio, avatar_url: w.avatar_url, follower_count: w.follower_count, badge: w.badge || 'none' })) });
       }
 
       const pubBookMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)$/);
@@ -603,12 +611,12 @@ export default {
 
       // --- Public Writers List ---
       if (url.pathname === '/api/public/writers' && request.method === 'GET')
-        return json(await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,created_at FROM writers WHERE is_active=true ORDER BY follower_count DESC,created_at DESC`);
+        return json(await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE is_active=true ORDER BY follower_count DESC,created_at DESC`);
 
       const writerPubMatch = url.pathname.match(/^\/api\/public\/writers\/([^/]+)$/);
       if (writerPubMatch && request.method === 'GET') {
         if (!uuid(writerPubMatch[1])) return json({ error: 'Invalid ID' }, 400);
-        const r = await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,created_at FROM writers WHERE id=${writerPubMatch[1]} AND is_active=true`;
+        const r = await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE id=${writerPubMatch[1]} AND is_active=true`;
         if (!r.length) return json({ error: 'Not found' }, 404);
         return json(r[0]);
       }
@@ -620,7 +628,7 @@ export default {
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${deviceId},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
         const dRow = await sql`SELECT id FROM devices WHERE device_key=${deviceId} LIMIT 1`;
         if (!dRow.length) return json({ error: 'Device not found' }, 500);
-        const followed = await sql`SELECT w.id,w.username,w.writer_name,w.bio,w.avatar_url,w.follower_count,f.created_at AS followed_at FROM follows f JOIN writers w ON f.writer_id=w.id WHERE f.device_id=${dRow[0].id} AND w.is_active=true ORDER BY f.created_at DESC`;
+        const followed = await sql`SELECT w.id,w.username,w.writer_name,w.bio,w.avatar_url,w.follower_count,w.badge,f.created_at AS followed_at FROM follows f JOIN writers w ON f.writer_id=w.id WHERE f.device_id=${dRow[0].id} AND w.is_active=true ORDER BY f.created_at DESC`;
         return json(followed);
       }
       if (url.pathname === '/api/public/follows' && request.method === 'POST') {

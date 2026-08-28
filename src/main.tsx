@@ -936,14 +936,14 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
         ) : (
           <div className="table">
             {users.map((u: any) => (
-              <div className="tr" key={u.id} style={{ gridTemplateColumns: '52px 1fr 90px 90px 80px', cursor: 'pointer' }} onClick={() => openDetail(u.id)}>
+              <div className="tr" key={u.id} style={{ gridTemplateColumns: '52px 1fr 90px 90px 80px 80px', cursor: 'pointer' }} onClick={() => openDetail(u.id)}>
                 <span className="book-cell">
                   {u.avatar_url ? <img src={u.avatar_url} alt="" style={{ width: 40, height: 40, borderRadius: '50%', objectFit: 'cover' }} />
                     : <div className="mini-cover" style={{ width: 40, height: 40, borderRadius: '50%', background: '#124d43', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 16, fontWeight: '900' }}>{(u.writer_name || '?')[0]}</div>}
                 </span>
                 <span className="book-cell">
                   <em>
-                    <b>{u.writer_name}</b>
+                    <b>{u.writer_name} {u.badge && u.badge !== 'none' && (u.badge === 'verified' ? <img src="https://pub-55f5f01908bd4e3094ea07f7deaa7978.r2.dev/books/9d90db02-884a-47d9-9a07-19d7dd9f3a0c.png" alt="verified" style={{ width: 18, height: 18, verticalAlign: 'middle', marginLeft: 4 }} /> : u.badge === 'popular' ? <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 18, height: 18, borderRadius: 5, background: '#800020', marginLeft: 4, verticalAlign: 'middle', color: '#fff', fontSize: 12, fontWeight: 900, lineHeight: '18px' }}>✓</span> : <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 18, height: 18, borderRadius: 5, background: '#1B5E20', marginLeft: 4, verticalAlign: 'middle', color: '#fff', fontSize: 12, fontWeight: 900, lineHeight: '18px' }}>✓</span>)}</b>
                     <small>@{u.username || '—'} {u.email ? `• ${u.email}` : ''}</small>
                   </em>
                 </span>
@@ -969,7 +969,7 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
             <div style={{ display: 'flex', gap: 16, alignItems: 'center', padding: '4px 0 14px' }}>
               {sel.profile?.avatar_url ? <img src={sel.profile.avatar_url} alt="" style={{ width: 64, height: 64, borderRadius: '50%', objectFit: 'cover' }} /> : <div className="mini-cover" style={{ width: 64, height: 64, borderRadius: '50%', background: '#124d43', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, fontWeight: '900' }}>{(sel.profile?.writer_name || '?')[0]}</div>}
               <div>
-                <h3 style={{ margin: 0 }}>{sel.profile?.writer_name}</h3>
+                <h3 style={{ margin: 0 }}>{sel.profile?.writer_name} {sel.profile?.badge && sel.profile.badge !== 'none' && (sel.profile.badge === 'verified' ? <img src="https://pub-55f5f01908bd4e3094ea07f7deaa7978.r2.dev/books/9d90db02-884a-47d9-9a07-19d7dd9f3a0c.png" alt="verified" style={{ width: 22, height: 22, verticalAlign: 'middle', marginLeft: 6 }} /> : sel.profile.badge === 'popular' ? <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, borderRadius: 6, background: '#800020', marginLeft: 6, verticalAlign: 'middle', color: '#fff', fontSize: 14, fontWeight: 900, lineHeight: '22px' }}>✓</span> : <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, borderRadius: 6, background: '#1B5E20', marginLeft: 6, verticalAlign: 'middle', color: '#fff', fontSize: 14, fontWeight: 900, lineHeight: '22px' }}>✓</span>)}</h3>
                 <small style={{ color: '#6f827d' }}>@{sel.profile?.username}{sel.profile?.email ? ` • ${sel.profile.email}` : ''}</small>
                 {sel.profile?.bio && <p style={{ margin: '4px 0 0', fontSize: 12, color: '#9fb0ab' }}>{sel.profile.bio}</p>}
               </div>
@@ -980,6 +980,24 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
               <div><b>{sel.stories?.filter((s: any) => s.status === 'published').length ?? 0}</b><small style={{ display: 'block', color: '#6f827d', fontSize: 10 }}>Published</small></div>
               <div><b>{(sel.stories || []).reduce((a: number, s: any) => a + (+s.views || 0), 0)}</b><small style={{ display: 'block', color: '#6f827d', fontSize: 10 }}>Total views</small></div>
               {sel.profile?.created_at && <div><b>{new Date(sel.profile.created_at).toLocaleDateString()}</b><small style={{ display: 'block', color: '#6f827d', fontSize: 10 }}>Joined</small></div>}
+            </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 14, padding: '10px 14px', background: '#0e1614', borderRadius: 10, border: '1px solid #2d3e39' }}>
+              <span style={{ color: '#9fb0ab', fontSize: 12, fontWeight: 600 }}>Badge:</span>
+              {['none', 'verified', 'popular', 'top'].map(b => (
+                <button key={b} onClick={async () => {
+                  try {
+                    await api(`/api/admin/writer-users/${sel.profile.id}`, { method: 'PATCH', body: JSON.stringify({ badge: b }) });
+                    setSel((s: any) => ({ ...s, profile: { ...s.profile, badge: b } }));
+                    setUsers(prev => prev.map((u: any) => u.id === sel.profile.id ? { ...u, badge: b } : u));
+                    onToast(`Badge set to ${b}`);
+                  } catch { onToast('Failed to update badge'); }
+                }} style={{
+                  padding: '5px 12px', borderRadius: 8, border: 'none', cursor: 'pointer', fontWeight: 700, fontSize: 11,
+                  background: (sel.profile?.badge || 'none') === b ? (b === 'verified' ? '#3B82F6' : b === 'popular' ? '#F59E0B' : b === 'top' ? '#8B5CF6' : '#4ccaa7') : '#1a2622',
+                  color: (sel.profile?.badge || 'none') === b ? '#fff' : '#6f827d',
+                  textTransform: 'capitalize'
+                }}>{b === 'none' ? 'No badge' : b}</button>
+              ))}
             </div>
             <div className="table">
               {(sel.stories || []).map((s: any) => (
