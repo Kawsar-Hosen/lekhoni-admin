@@ -498,6 +498,28 @@ export default {
         return json({ ok: true, message: 'Comment submitted for moderation' }, 201);
       }
 
+      const pubLikeMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)\/like$/);
+      if (pubLikeMatch && request.method === 'POST') {
+        const bookId = pubLikeMatch[1];
+        const b = await request.json() as { device_id?: string; value?: boolean };
+        if (!b.device_id || typeof b.value !== 'boolean') return json({ error: 'device_id and value required' }, 400);
+        await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
+        const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
+        const dId = deviceRow.length ? deviceRow[0].id : null;
+        const cur = await sql`SELECT value FROM reactions WHERE device_id=${dId} AND book_id=${bookId} LIMIT 1`;
+        const curVal = cur.length ? cur[0].value : null;
+        if (b.value) {
+          if (curVal === 'dislike') await sql`UPDATE books SET likes=likes+1, dislikes=GREATEST(dislikes-1,0) WHERE id=${bookId}`;
+          else if (!curVal) await sql`UPDATE books SET likes=likes+1 WHERE id=${bookId}`;
+          if (dId) await sql`INSERT INTO reactions (device_id,book_id,value,created_at) VALUES (${dId},${bookId},'like',NOW()) ON CONFLICT (device_id,book_id) DO UPDATE SET value='like',created_at=NOW()`;
+        } else {
+          if (curVal === 'like') await sql`UPDATE books SET likes=GREATEST(likes-1,0) WHERE id=${bookId}`;
+          if (dId) await sql`DELETE FROM reactions WHERE device_id=${dId} AND book_id=${bookId}`;
+        }
+        const l = await sql`SELECT likes FROM books WHERE id=${bookId} LIMIT 1`;
+        return json({ ok: true, likes: l.length ? (l[0].likes as number) : 0 });
+      }
+
       if (url.pathname === '/api/public/notifications' && request.method === 'GET')
         return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,created_at FROM notifications WHERE status='sent' ORDER BY created_at DESC LIMIT 20`);
 
@@ -700,6 +722,18 @@ export default {
 
           if (request.method === 'GET') {
             const story = await sql`SELECT id,title,description,status,cover_url,category,views,likes,chapters_count,created_at,updated_at FROM stories WHERE id=${storyId}`;
+            if (story.length && story[0].status === 'published') {
+              try {
+                const stRow4 = await sql`SELECT w.writer_name,s.title FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}`;
+                const bkRow4 = await sql`SELECT id FROM books WHERE title=${stRow4[0].title} AND author=${stRow4[0].writer_name} LIMIT 1`;
+                if (bkRow4.length) {
+                  const allChs = await sql`SELECT title,body,position,minutes FROM story_chapters WHERE story_id=${storyId} ORDER BY position`;
+                  const exist4 = await sql`SELECT title FROM chapters WHERE book_id=${bkRow4[0].id}`;
+                  const have4 = new Set(exist4.map((e: any) => (e.title || '').trim()));
+                  for (const c of allChs) { if (have4.has((c.title || '').trim())) continue; await sql`INSERT INTO chapters (book_id,title,body,position,status,minutes) VALUES (${bkRow4[0].id},${c.title},${c.body||''},${c.position},'published',${c.minutes||5})`; }
+                }
+              } catch (e) { console.error('story chapter backfill failed', e); }
+            }
             const chapters = await sql`SELECT id,title,body,position,minutes,created_at FROM story_chapters WHERE story_id=${storyId} ORDER BY position`;
             return json({ ...story[0], chapters });
           }
@@ -735,6 +769,11 @@ export default {
             const pos = b.position ?? (await sql`SELECT COALESCE(MAX(position),0)+1 AS n FROM story_chapters WHERE story_id=${storyId}`)[0].n;
             const r = await sql`INSERT INTO story_chapters (story_id,title,body,position) VALUES (${storyId},${b.title},${b.body||''},${pos}) RETURNING id,title,position,created_at`;
             await sql`UPDATE stories SET chapters_count = (SELECT COUNT(*)::int FROM story_chapters WHERE story_id=${storyId}), updated_at=NOW() WHERE id=${storyId}`;
+            const stRow = await sql`SELECT st.status,w.writer_name,st.title FROM stories st JOIN writers w ON st.writer_id=w.id WHERE st.id=${storyId}`;
+            if (stRow.length && stRow[0].status === 'published') {
+              const bkRow = await sql`SELECT id FROM books WHERE title=${stRow[0].title} AND author=${stRow[0].writer_name} LIMIT 1`;
+              if (bkRow.length) await sql`INSERT INTO chapters (book_id,title,body,position,status,minutes) VALUES (${bkRow[0].id},${b.title},${b.body||''},${pos},'published',5)`;
+            }
             return json(r[0], 201);
           }
         }
@@ -750,11 +789,24 @@ export default {
           if (request.method === 'PUT') {
             const b = await request.json() as { title?: string; body?: string; position?: number };
             await sql`UPDATE story_chapters SET title=COALESCE(${b.title},title),body=COALESCE(${b.body},body),position=COALESCE(${b.position},position) WHERE id=${chapterId} AND story_id=${storyId}`;
+            if (b.title || b.body || b.position) {
+              const stRow2 = await sql`SELECT st.status,w.writer_name,st.title FROM stories st JOIN writers w ON st.writer_id=w.id WHERE st.id=${storyId}`;
+              if (stRow2.length && stRow2[0].status === 'published') {
+                const bkRow2 = await sql`SELECT id FROM books WHERE title=${stRow2[0].title} AND author=${stRow2[0].writer_name} LIMIT 1`;
+                if (bkRow2.length) await sql`UPDATE chapters ch SET title=COALESCE(${b.title},ch.title),body=COALESCE(${b.body},ch.body),position=COALESCE(${b.position},ch.position) WHERE ch.book_id=${bkRow2[0].id} AND ch.title=(SELECT title FROM story_chapters WHERE id=${chapterId} AND story_id=${storyId})`;
+              }
+            }
             return json({ ok: true });
           }
           if (request.method === 'DELETE') {
+            const delTitle = (await sql`SELECT title FROM story_chapters WHERE id=${chapterId} AND story_id=${storyId}`)[0]?.title;
             await sql`DELETE FROM story_chapters WHERE id=${chapterId} AND story_id=${storyId}`;
             await sql`UPDATE stories SET chapters_count = (SELECT COUNT(*)::int FROM story_chapters WHERE story_id=${storyId}), updated_at=NOW() WHERE id=${storyId}`;
+            const stRow3 = await sql`SELECT st.status,w.writer_name,st.title FROM stories st JOIN writers w ON st.writer_id=w.id WHERE st.id=${storyId}`;
+            if (stRow3.length && stRow3[0].status === 'published') {
+              const bkRow3 = await sql`SELECT id FROM books WHERE title=${stRow3[0].title} AND author=${stRow3[0].writer_name} LIMIT 1`;
+              if (bkRow3.length && delTitle) await sql`DELETE FROM chapters WHERE book_id=${bkRow3[0].id} AND title=${delTitle}`;
+            }
             return json({ ok: true });
           }
         }
