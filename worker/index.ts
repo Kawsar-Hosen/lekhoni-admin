@@ -36,6 +36,8 @@ export default {
         await sql`ALTER TABLE writers ADD COLUMN IF NOT EXISTS badge TEXT NOT NULL DEFAULT 'none'`;
         await sql`ALTER TABLE writers ADD COLUMN IF NOT EXISTS approval_required BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`ALTER TABLE follows ADD COLUMN IF NOT EXISTS follower_writer_id UUID DEFAULT NULL`;
+        await sql`ALTER TABLE stories ADD COLUMN IF NOT EXISTS writer_status TEXT DEFAULT ''`;
+        await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS writer_status TEXT DEFAULT ''`;
         await sql`CREATE TABLE IF NOT EXISTS home_settings (id INT PRIMARY KEY DEFAULT 1, sections JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`INSERT INTO home_settings (id, sections) VALUES (1, '[]') ON CONFLICT (id) DO NOTHING`;
         await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
@@ -214,7 +216,7 @@ export default {
         if (!uuid(writerMatch[1])) return json({ error: 'Invalid ID' }, 400);
         const b = await request.json() as { status?: string; note?: string };
         if (!b.status || !['published','rejected','pending'].includes(b.status)) return json({ error: 'Valid status required: published,rejected,pending' }, 400);
-        const story = await sql`SELECT s.id,s.title,s.description,s.category,s.cover_url,s.writer_id,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${writerMatch[1]}`;
+        const story = await sql`SELECT s.id,s.title,s.description,s.category,s.cover_url,s.display_status,s.writer_status,s.writer_id,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${writerMatch[1]}`;
         if (!story.length) return json({ error: 'Not found' }, 404);
         const s = story[0];
         if (b.status === 'published') {
@@ -232,9 +234,9 @@ export default {
           const existingBook = await sql`SELECT id FROM books WHERE title=${s.title} AND author=${s.writer_name} LIMIT 1`;
           if (existingBook.length) {
             bookId = existingBook[0].id;
-            await sql`UPDATE books SET display_status=${s.display_status||''} WHERE id=${bookId}`;
+            await sql`UPDATE books SET display_status=${s.display_status||''},writer_status=${s.writer_status||''} WHERE id=${bookId}`;
           } else {
-            const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status) VALUES (${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published',${s.display_status||''}) RETURNING id`;
+            const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status,writer_status) VALUES (${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published',${s.display_status||''},${s.writer_status||''}) RETURNING id`;
             bookId = bk[0]?.id || null;
           }
           if (bookId) {
@@ -424,7 +426,7 @@ export default {
       if (url.pathname === '/api/public/categories' && request.method === 'GET')
         return json(await sql`SELECT id,name,icon,color,cover_url FROM categories WHERE is_active=true ORDER BY position`);
       if (url.pathname === '/api/public/books' && request.method === 'GET')
-        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
+        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
       if (url.pathname === '/api/public/chapters' && request.method === 'GET')
         return json(await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE status='published' ORDER BY position`);
 
@@ -447,9 +449,9 @@ export default {
         const titleOf = (k: string) => { const s = savedCfg.find((x) => x.key === k); return (s && s.title) ? s.title : ''; };
         const isEnabled = (k: string) => { const s = savedCfg.find((x) => x.key === k); return !s || s.enabled !== false; };
         const now = Date.now();
-        const allBooks = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,b.category_id::text AS category_id,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.created_at,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published'`;
+        const allBooks = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,b.category_id::text AS category_id,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.created_at,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published'`;
         const fn = (id: string | null) => (id ? `${id}` : '');
-        const fmt = (b: any) => ({ id: fn(b.id), title: b.title, author: b.author, cover_url: b.cover_url, views: `${b.views}`, likes: b.likes, description: b.description, category: b.category, color: b.color, accent: b.accent, is_new: b.is_new, featured: b.featured, home_section: b.home_section || '', views_visible: b.views_visible !== false, display_status: b.display_status || '' });
+        const fmt = (b: any) => ({ id: fn(b.id), title: b.title, author: b.author, cover_url: b.cover_url, views: `${b.views}`, likes: b.likes, description: b.description, category: b.category, color: b.color, accent: b.accent, is_new: b.is_new, featured: b.featured, home_section: b.home_section || '', views_visible: b.views_visible !== false, display_status: b.display_status || '', writer_status: b.writer_status || '' });
         const byViews = (a: any, b: any) => +b.views - +a.views;
         const byNewest = (a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
         const ageDays = (b: any) => (now - new Date(b.created_at).getTime()) / 86400000;
@@ -797,13 +799,13 @@ export default {
 
         // --- Writer Stories CRUD ---
         if (url.pathname === '/api/writer/stories' && request.method === 'GET') {
-          const stories = await sql`SELECT id,title,description,status,cover_url,category,views,likes,chapters_count,display_status,created_at,updated_at FROM stories WHERE writer_id=${writerId} ORDER BY updated_at DESC`;
+          const stories = await sql`SELECT id,title,description,status,cover_url,category,views,likes,chapters_count,display_status,writer_status,created_at,updated_at FROM stories WHERE writer_id=${writerId} ORDER BY updated_at DESC`;
           return json(stories);
         }
         if (url.pathname === '/api/writer/stories' && request.method === 'POST') {
-          const b = await request.json() as { title?: string; description?: string; category?: string; cover_url?: string; display_status?: string };
+          const b = await request.json() as { title?: string; description?: string; category?: string; cover_url?: string; display_status?: string; writer_status?: string };
           if (!b.title) return json({ error: 'Title required' }, 400);
-          const r = await sql`INSERT INTO stories (writer_id,title,description,category,cover_url,display_status) VALUES (${writerId},${b.title},${b.description||''},${b.category||''},${b.cover_url||null},${b.display_status||''}) RETURNING id,title,status,display_status,created_at`;
+          const r = await sql`INSERT INTO stories (writer_id,title,description,category,cover_url,display_status,writer_status) VALUES (${writerId},${b.title},${b.description||''},${b.category||''},${b.cover_url||null},${b.display_status||''},${b.writer_status||''}) RETURNING id,title,status,display_status,writer_status,created_at`;
           await sql`INSERT INTO writer_activities (writer_id,type,data) VALUES (${writerId},'story_created',${JSON.stringify({ story_id: r[0].id, title: b.title })}::jsonb)`;
           return json(r[0], 201);
         }
@@ -833,12 +835,15 @@ export default {
             return json({ ...story[0], chapters });
           }
           if (request.method === 'PUT') {
-            const b = await request.json() as { title?: string; description?: string; status?: string; category?: string; display_status?: string };
-            await sql`UPDATE stories SET title=COALESCE(${b.title},title),description=COALESCE(${b.description},description),status=COALESCE(${b.status},status),category=COALESCE(${b.category},category),display_status=COALESCE(${b.display_status},display_status),updated_at=NOW() WHERE id=${storyId}`;
-            if (b.display_status !== undefined) {
-              const st = await sql`SELECT title FROM stories WHERE id=${storyId}`;
-              if (st.length) {
-                await sql`UPDATE books SET display_status=${b.display_status||''} WHERE title=${st[0].title}`;
+            const b = await request.json() as { title?: string; description?: string; status?: string; category?: string; display_status?: string; writer_status?: string; cover_url?: string };
+            const oldRow = await sql`SELECT title FROM stories WHERE id=${storyId}`;
+            const oldTitle = oldRow.length ? oldRow[0].title : '';
+            await sql`UPDATE stories SET title=COALESCE(${b.title},title),description=COALESCE(${b.description},description),status=COALESCE(${b.status},status),category=COALESCE(${b.category},category),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),cover_url=COALESCE(${b.cover_url},cover_url),updated_at=NOW() WHERE id=${storyId}`;
+            const newTitle = b.title || oldTitle;
+            if (oldTitle) {
+              const bkMatch = await sql`SELECT id FROM books WHERE title=${oldTitle} AND author=(SELECT writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}) LIMIT 1`;
+              if (bkMatch.length) {
+                await sql`UPDATE books SET title=${newTitle},description=COALESCE(${b.description},description),cover_url=COALESCE(${b.cover_url},cover_url),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),updated_at=NOW() WHERE id=${bkMatch[0].id}`;
               }
             }
             if (b.status === 'published') {
@@ -847,13 +852,17 @@ export default {
             return json({ ok: true });
           }
           if (request.method === 'DELETE') {
-            const stDel = await sql`SELECT s.title,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}`;
+            const stDel = await sql`SELECT s.title,s.cover_url,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}`;
             const wName = stDel.length ? stDel[0].writer_name : (await sql`SELECT writer_name FROM writers WHERE id=${writerId}`)[0]?.writer_name || '';
             const sTitle = stDel.length ? stDel[0].title : '';
+            const sCover = stDel.length ? stDel[0].cover_url : '';
             await sql`DELETE FROM story_chapters WHERE story_id=${storyId}`;
             await sql`DELETE FROM stories WHERE id=${storyId}`;
-            if (sTitle && wName) {
-              const bkDel = await sql`SELECT id FROM books WHERE title=${sTitle} AND author=${wName} LIMIT 1`;
+            if (wName) {
+              let bkDel = sTitle ? await sql`SELECT id FROM books WHERE title=${sTitle} AND author=${wName} LIMIT 1` : [];
+              if (!bkDel.length && sCover) bkDel = await sql`SELECT id FROM books WHERE cover_url=${sCover} AND author=${wName} LIMIT 1`;
+              if (!bkDel.length && sTitle) bkDel = await sql`SELECT id FROM books WHERE author=${wName} AND title ILIKE ${'%' + sTitle + '%'} LIMIT 1`;
+              if (!bkDel.length) bkDel = await sql`SELECT id FROM books WHERE author=${wName} ORDER BY updated_at DESC LIMIT 1`;
               if (bkDel.length) {
                 await sql`DELETE FROM chapters WHERE book_id=${bkDel[0].id}`;
                 await sql`DELETE FROM books WHERE id=${bkDel[0].id}`;
@@ -978,13 +987,13 @@ export default {
           const newStatus = needsApproval ? 'pending' : 'published';
           await sql`UPDATE stories SET status=${newStatus},review_note='',updated_at=NOW() WHERE id=${storySubmitMatch[1]}`;
           if (!needsApproval) {
-            const sRow = await sql`SELECT s.title,s.description,s.category,s.cover_url,s.display_status,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storySubmitMatch[1]}`;
+            const sRow = await sql`SELECT s.title,s.description,s.category,s.cover_url,s.display_status,s.writer_status,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storySubmitMatch[1]}`;
             if (sRow.length) {
               const catRow = await sql`SELECT id FROM categories WHERE name=${sRow[0].category} LIMIT 1`;
               const catId = catRow.length ? catRow[0].id : null;
               const existing = await sql`SELECT id FROM books WHERE title=${sRow[0].title} AND author=${sRow[0].writer_name} LIMIT 1`;
               if (!existing.length) {
-                await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status) VALUES (${sRow[0].title},${sRow[0].writer_name},${catId},${sRow[0].cover_url||null},${sRow[0].description||''},'published',${sRow[0].display_status||''})`;
+                await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status,writer_status) VALUES (${sRow[0].title},${sRow[0].writer_name},${catId},${sRow[0].cover_url||null},${sRow[0].description||''},'published',${sRow[0].display_status||''},${sRow[0].writer_status||''})`;
               }
             }
           }
