@@ -8,7 +8,7 @@ import {
   Edit3, ExternalLink, TrendingUp, Globe, Calendar, Clock,
   Heart, Bookmark, Share2, RefreshCw, Download, ToggleLeft, ToggleRight,
   Hash, Type, Palette, AlignLeft, ListOrdered, Upload,
-  Zap, Gift, Megaphone, Sparkles, Award, Coffee, Info, Star
+  Zap, Gift, Megaphone, Sparkles, Award, Coffee, Info, Star, GripVertical
 } from 'lucide-react';
 import './styles.css';
 
@@ -1060,14 +1060,22 @@ function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
 
   const setAll = (enabled: boolean) => setSections((s) => s.map((x) => ({ ...x, enabled })));
 
-  const move = (i: number, dir: -1 | 1) =>
-    setSections((s) => {
-      const j = i + dir;
-      if (j < 0 || j >= s.length) return s;
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [overIdx, setOverIdx] = useState<number | null>(null);
+
+  const onDragStart = (i: number) => setDragIdx(i);
+  const onDragOver = (e: React.DragEvent, i: number) => { e.preventDefault(); setOverIdx(i); };
+  const onDrop = (i: number) => {
+    if (dragIdx === null || dragIdx === i) { setDragIdx(null); setOverIdx(null); return; }
+    setSections(s => {
       const next = [...s];
-      [next[i], next[j]] = [next[j], next[i]];
+      const [moved] = next.splice(dragIdx, 1);
+      next.splice(i, 0, moved);
       return next;
     });
+    setDragIdx(null); setOverIdx(null);
+  };
+  const onDragEnd = () => { setDragIdx(null); setOverIdx(null); };
 
   const save = () => {
     setSaving(true);
@@ -1076,8 +1084,6 @@ function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
       .catch(() => onToast('Failed to save'))
       .finally(() => setSaving(false));
   };
-
-  const ordered = [...sections].sort((a, b) => HOME_SECTIONS.findIndex((x) => x.key === a.key) - HOME_SECTIONS.findIndex((x) => x.key === b.key));
 
   return (
     <div className="content">
@@ -1100,11 +1106,20 @@ function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
         <div className="hc-empty"><Loader2 className="spin" size={22} /></div>
       ) : (
         <div className="hc-list">
-          {ordered.map((s, i) => {
+          {sections.map((s, i) => {
             const meta = HOME_SECTIONS.find((x) => x.key === s.key);
             const Icon = meta?.icon || LayoutDashboard;
             return (
-              <div key={s.key} className={`hc-row ${s.enabled ? '' : 'off'}`}>
+              <div
+                key={s.key}
+                className={`hc-row ${s.enabled ? '' : 'off'} ${dragIdx === i ? 'dragging' : ''} ${overIdx === i ? 'drag-over' : ''}`}
+                draggable
+                onDragStart={() => onDragStart(i)}
+                onDragOver={(e) => onDragOver(e, i)}
+                onDrop={() => onDrop(i)}
+                onDragEnd={onDragEnd}
+              >
+                <div className="hc-drag" title="Drag to reorder"><GripVertical size={16} /></div>
                 <div className="hc-pos"><b>{i + 1}</b></div>
                 <div className="hc-icon"><Icon size={18} /></div>
                 <div className="hc-info">
@@ -1116,10 +1131,6 @@ function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
                     onChange={(e) => setTitle(s.key, e.target.value)}
                   />
                   <span>{meta?.desc}</span>
-                </div>
-                <div className="hc-order">
-                  <button className="icon sm" onClick={() => move(i, -1)} disabled={i === 0}><span>↑</span></button>
-                  <button className="icon sm" onClick={() => move(i, 1)} disabled={i === ordered.length - 1}><span>↓</span></button>
                 </div>
                 <button className="hc-toggle" onClick={() => toggle(s.key)} title={s.enabled ? 'Visible' : 'Hidden'}>
                   <span className={`hc-toggle-text ${s.enabled ? 'on' : ''}`}>{s.enabled ? 'On' : 'Off'}</span>

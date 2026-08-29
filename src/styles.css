@@ -6,19 +6,24 @@
 .hchost{border:1px solid #365048;background:#17231f;color:#4ccaa7;border-radius:9px;padding:10px 14px;display:flex;align-items:center;gap:7px;cursor:pointer;font-weight:700;font-size:12px}
 .hchost:hover{background:#1d2c26}
 .hc-list{display:grid;gap:10px}
-.hc-row{display:grid;grid-template-columns:38px 42px 1fr auto auto;align-items:center;gap:12px;background:#121b1a;border:1px solid #25332f;border-radius:11px;padding:14px 16px;transition:opacity .2s,border-color .2s}
+.hc-row{display:grid;grid-template-columns:32px 38px 42px 1fr auto auto;align-items:center;gap:10px;background:#121b1a;border:1px solid #25332f;border-radius:11px;padding:14px 16px;transition:opacity .2s,border-color .2s,transform .15s,box-shadow .15s}
+.hc-row.dragging{opacity:.4;transform:scale(.97)}
+.hc-row.drag-over{border-color:#2AA876;box-shadow:0 0 0 2px #2AA87633}
+.hc-drag{cursor:grab;color:#4a6360;display:flex;align-items:center;justify-content:center}
+.hc-drag:active{cursor:grabbing}
 .hc-row.off{opacity:.5;border-color:#2a2018}
 .hc-pos b{display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:#18342d;color:#4fd0ac;font-size:13px}
 .hc-row.off .hc-pos b{background:#3a2a18;color:#e1a74b}
 .hc-icon{width:40px;height:40px;border-radius:11px;background:#18342d;color:#4fd0ac;display:grid;place-items:center}
 .hc-row.off .hc-icon{background:#38261a;color:#e1a74b}
+.hc-drag{cursor:grab;color:#4a6360;display:flex;align-items:center;justify-content:center}
+.hc-drag:active{cursor:grabbing}
+.hc-row.dragging{opacity:.4;transform:scale(.97)}
+.hc-row.drag-over{border-color:#2AA876;box-shadow:0 0 0 2px #2AA87633}
 .hc-info strong{display:block;font-size:13px}
 .hc-info span{display:block;color:#71837e;font-size:10px;margin-top:3px}
 .hc-title-input{width:100%;max-width:260px;margin:5px 0 2px;background:#0d1413;border:1px solid #25332f;border-radius:7px;padding:5px 8px;color:#d7e3df;font-size:12px}
 .hc-title-input:focus{outline:none;border-color:#4fd0ac}
-.hc-order{display:flex;gap:6px}
-.hc-order button.icon{width:32px;height:32px;border:1px solid #2a3935;background:#131d1b;color:#b8c6c2;border-radius:8px;display:grid;place-items:center;font-size:14px;cursor:pointer}
-.hc-order button.icon:disabled{opacity:.3;cursor:not-allowed}
 .hc-toggle{display:flex;align-items:center;gap:6px;border:0;background:transparent;cursor:pointer;color:#e1a74b;padding:4px}
 .hc-toggle-text{font-size:9px;font-weight:800;letter-spacing:.5px}
 .hc-toggle-text.on{color:#4ccaa7}
