@@ -903,6 +903,15 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
     } catch { onToast('Failed to load writer detail'); }
   };
 
+  const toggleApproval = async (writer: any, current: boolean, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await api(`/api/admin/writers/${writer.id}/approval`, { method: 'PUT', body: JSON.stringify({ approval_required: !current }) });
+      setUsers(prev => prev.map(u => u.id === writer.id ? { ...u, approval_required: !current } : u));
+      onToast(current ? 'Approval OFF — stories publish directly' : 'Approval ON — stories need review');
+    } catch { onToast('Failed to update'); }
+  };
+
   const setStoryStatus = async (story: any, status: 'published' | 'rejected') => {
     const n = note[story.id] || '';
     try {
@@ -936,7 +945,7 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
         ) : (
           <div className="table">
             {users.map((u: any) => (
-              <div className="tr" key={u.id} style={{ gridTemplateColumns: '52px 1fr 90px 90px 80px 80px', cursor: 'pointer' }} onClick={() => openDetail(u.id)}>
+              <div className="tr" key={u.id} style={{ gridTemplateColumns: '52px 1fr 100px 90px 90px 80px 80px', cursor: 'pointer' }} onClick={() => openDetail(u.id)}>
                 <span className="book-cell">
                   {u.avatar_url ? <img src={u.avatar_url} alt="" style={{ width: 40, height: 40, borderRadius: '50%', objectFit: 'cover' }} />
                     : <div className="mini-cover" style={{ width: 40, height: 40, borderRadius: '50%', background: '#124d43', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 16, fontWeight: '900' }}>{(u.writer_name || '?')[0]}</div>}
@@ -946,6 +955,14 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
                     <b>{u.writer_name} {u.badge && u.badge !== 'none' && (u.badge === 'verified' ? <img src="https://pub-55f5f01908bd4e3094ea07f7deaa7978.r2.dev/books/9d90db02-884a-47d9-9a07-19d7dd9f3a0c.png" alt="verified" style={{ width: 18, height: 18, verticalAlign: 'middle', marginLeft: 4 }} /> : u.badge === 'popular' ? <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 18, height: 18, borderRadius: 5, background: '#800020', marginLeft: 4, verticalAlign: 'middle', color: '#fff', fontSize: 12, fontWeight: 900, lineHeight: '18px' }}>✓</span> : <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 18, height: 18, borderRadius: 5, background: '#1B5E20', marginLeft: 4, verticalAlign: 'middle', color: '#fff', fontSize: 12, fontWeight: 900, lineHeight: '18px' }}>✓</span>)}</b>
                     <small>@{u.username || '—'} {u.email ? `• ${u.email}` : ''}</small>
                   </em>
+                </span>
+                <span onClick={(e) => e.stopPropagation()}>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <div onClick={(e) => toggleApproval(u, u.approval_required !== false, e)} style={{ width: 38, height: 20, borderRadius: 10, background: u.approval_required !== false ? '#10B981' : '#94a3b8', position: 'relative', transition: 'background 0.2s' }}>
+                      <div style={{ width: 16, height: 16, borderRadius: 8, background: '#fff', position: 'absolute', top: 2, left: u.approval_required !== false ? 20 : 2, transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
+                    </div>
+                    <small style={{ color: '#6f827d', fontSize: 10 }}>{u.approval_required !== false ? 'On' : 'Off'}</small>
+                  </label>
                 </span>
                 <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                   <b>{u.published_stories ?? 0} published</b>

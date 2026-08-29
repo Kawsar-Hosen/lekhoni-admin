@@ -34,6 +34,7 @@ export default {
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS display_status TEXT DEFAULT ''`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS url TEXT DEFAULT ''`;
         await sql`ALTER TABLE writers ADD COLUMN IF NOT EXISTS badge TEXT NOT NULL DEFAULT 'none'`;
+        await sql`ALTER TABLE writers ADD COLUMN IF NOT EXISTS approval_required BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`ALTER TABLE follows ADD COLUMN IF NOT EXISTS follower_writer_id UUID DEFAULT NULL`;
         await sql`CREATE TABLE IF NOT EXISTS home_settings (id INT PRIMARY KEY DEFAULT 1, sections JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`INSERT INTO home_settings (id, sections) VALUES (1, '[]') ON CONFLICT (id) DO NOTHING`;
@@ -186,7 +187,7 @@ export default {
         ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END,s.updated_at DESC`);
       // --- Admin: Writer user profiles (stats + detail) ---
       if (url.pathname === '/api/admin/writer-users' && request.method === 'GET') {
-        return json(await sql`SELECT w.id,w.username,w.writer_name,w.email,w.avatar_url,w.bio,w.follower_count,w.badge,w.is_active,w.created_at,
+        return json(await sql`SELECT w.id,w.username,w.writer_name,w.email,w.avatar_url,w.bio,w.follower_count,w.badge,w.is_active,w.approval_required,w.created_at,
           (SELECT COUNT(*)::int FROM stories s WHERE s.writer_id=w.id) AS total_stories,
           (SELECT COUNT(*)::int FROM stories s WHERE s.writer_id=w.id AND s.status='published') AS published_stories,
           (SELECT COALESCE(SUM(s.views),0)::int FROM stories s WHERE s.writer_id=w.id) AS total_views,
@@ -339,6 +340,18 @@ export default {
         const b = await request.json() as { views_visible?: boolean };
         await sql`UPDATE home_settings SET views_visible=${b.views_visible === true}, updated_at=NOW() WHERE id=1`;
         return json({ ok: true, views_visible: b.views_visible === true });
+      }
+      // --- Admin: Writers Management (approval toggle) ---
+      const adminWriterMatch = url.pathname.match(/^\/api\/admin\/writers\/([^/]+)\/approval$/);
+      if (adminWriterMatch && request.method === 'PUT') {
+        if (!uuid(adminWriterMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        const b = await request.json() as { approval_required?: boolean; is_active?: boolean; badge?: string };
+        const updates: string[] = [];
+        if (b.approval_required !== undefined) await sql`UPDATE writers SET approval_required=${b.approval_required} WHERE id=${adminWriterMatch[1]}`;
+        if (b.is_active !== undefined) await sql`UPDATE writers SET is_active=${b.is_active} WHERE id=${adminWriterMatch[1]}`;
+        if (b.badge !== undefined) await sql`UPDATE writers SET badge=${b.badge} WHERE id=${adminWriterMatch[1]}`;
+        const r = await sql`SELECT id,username,writer_name,approval_required,is_active,badge FROM writers WHERE id=${adminWriterMatch[1]}`;
+        return json(r[0] || { error: 'Not found' }, r.length ? 200 : 404);
       }
       // --- Admin: Writer Stories (all writers' stories for approval) ---
       if (url.pathname === '/api/admin/stories' && request.method === 'GET')
@@ -834,8 +847,19 @@ export default {
             return json({ ok: true });
           }
           if (request.method === 'DELETE') {
+            const stDel = await sql`SELECT s.title,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}`;
+            const wName = stDel.length ? stDel[0].writer_name : (await sql`SELECT writer_name FROM writers WHERE id=${writerId}`)[0]?.writer_name || '';
+            const sTitle = stDel.length ? stDel[0].title : '';
             await sql`DELETE FROM story_chapters WHERE story_id=${storyId}`;
             await sql`DELETE FROM stories WHERE id=${storyId}`;
+            if (sTitle && wName) {
+              const bkDel = await sql`SELECT id FROM books WHERE title=${sTitle} AND author=${wName} LIMIT 1`;
+              if (bkDel.length) {
+                await sql`DELETE FROM chapters WHERE book_id=${bkDel[0].id}`;
+                await sql`DELETE FROM books WHERE id=${bkDel[0].id}`;
+              }
+            }
+            await sql`DELETE FROM writer_activities WHERE data->>'story_id'=${storyId}`;
             return json({ ok: true });
           }
         }
@@ -949,8 +973,22 @@ export default {
           if (!uuid(storySubmitMatch[1])) return json({ error: 'Invalid ID' }, 400);
           const s = await sql`SELECT id,title,writer_id FROM stories WHERE id=${storySubmitMatch[1]} AND writer_id=${writerId}`;
           if (!s.length) return json({ error: 'Not found' }, 404);
-          await sql`UPDATE stories SET status='pending',updated_at=NOW() WHERE id=${storySubmitMatch[1]}`;
-          return json({ ok: true, status: 'pending' });
+          const writerApproval = await sql`SELECT approval_required FROM writers WHERE id=${writerId}`;
+          const needsApproval = writerApproval.length ? writerApproval[0].approval_required : true;
+          const newStatus = needsApproval ? 'pending' : 'published';
+          await sql`UPDATE stories SET status=${newStatus},review_note='',updated_at=NOW() WHERE id=${storySubmitMatch[1]}`;
+          if (!needsApproval) {
+            const sRow = await sql`SELECT s.title,s.description,s.category,s.cover_url,s.display_status,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storySubmitMatch[1]}`;
+            if (sRow.length) {
+              const catRow = await sql`SELECT id FROM categories WHERE name=${sRow[0].category} LIMIT 1`;
+              const catId = catRow.length ? catRow[0].id : null;
+              const existing = await sql`SELECT id FROM books WHERE title=${sRow[0].title} AND author=${sRow[0].writer_name} LIMIT 1`;
+              if (!existing.length) {
+                await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status) VALUES (${sRow[0].title},${sRow[0].writer_name},${catId},${sRow[0].cover_url||null},${sRow[0].description||''},'published',${sRow[0].display_status||''})`;
+              }
+            }
+          }
+          return json({ ok: true, status: newStatus });
         }
 
         // --- Writer Dashboard Stats ---
