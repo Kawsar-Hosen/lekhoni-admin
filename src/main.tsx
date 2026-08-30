@@ -8,7 +8,8 @@ import {
   Edit3, ExternalLink, TrendingUp, Globe, Calendar, Clock,
   Heart, Bookmark, Share2, RefreshCw, Download, ToggleLeft, ToggleRight,
   Hash, Type, Palette, AlignLeft, ListOrdered, Upload,
-  Zap, Gift, Megaphone, Sparkles, Award, Coffee, Info, Star, GripVertical
+  Zap, Gift, Megaphone, Sparkles, Award, Coffee, Info, Star, GripVertical,
+  UserCheck
 } from 'lucide-react';
 import './styles.css';
 
@@ -116,7 +117,7 @@ interface Analytics {
   daily_views: { date: string; views: number }[];
 }
 
-type Page = 'Dashboard' | 'Books' | 'Chapters' | 'Categories' | 'Comments' | 'Writers' | 'Home Control' | 'Notifications' | 'Analytics' | 'Settings';
+type Page = 'Dashboard' | 'Books' | 'Chapters' | 'Categories' | 'Comments' | 'Writers' | 'Users' | 'Home Control' | 'Notifications' | 'Analytics' | 'Settings';
 
 const API_BASE = 'https://lekhoni-admin-api.smdkawsar2.workers.dev';
 
@@ -127,6 +128,7 @@ const nav: [Page, React.ElementType][] = [
   ['Categories', Menu],
   ['Comments', MessageSquare],
   ['Writers', Users],
+  ['Users', UserCheck],
   ['Home Control', Sparkles],
   ['Notifications', Bell],
   ['Analytics', BarChart3],
@@ -167,6 +169,78 @@ function Toast({ msg, onClose }: { msg: string; onClose: () => void }) {
   );
 }
 
+// ─── Terms Web Page (for Play Store) ───────────────────────────────────
+
+function TermsWebPage() {
+  const [lang, setLang] = useState<'bn' | 'en' | 'hi'>('bn');
+  const t: Record<string, { title: string; intro: string; terms: string[]; privacy: string[]; content: string[]; contact: string }> = {
+    bn: {
+      title: 'Lekhoni Kahini', intro: 'বাংলা সাহিত্য ও উপন্যাসের এক অনন্য পাঠভুবন',
+      terms: ['লেখনী কাহিনিতে স্বাগতম। এই অ্যাপ ব্যবহার করে আপনি নিম্নলিখিত শর্তাবলী মেনে নিচ্ছেন।', 'এই অ্যাপ ব্যবহার করতে আপনার বয়স কমপক্ষে ১৩ বছর হতে হবে।', 'আপনি যে গল্প লেখেন তার মালিকানা আপনারই থাকবে।', 'আপনি ক্ষতিকর, অপমানজনক বা বেআইনি কন্টেন্ট পোস্ট করবেন না।', 'শর্ত লঙ্ঘনে আমরা আপনার অ্যাকাউন্ট সাসপেন্ড বা টার্মিনেট করতে পারি।'],
+      privacy: ['আপনার গোপনীয়তা আমাদের কাছে গুরুত্বপূর্ণ।', 'আমরা সংগ্রহ করি: আপনার নাম/ইমেইল, পাঠ ইতিহাস, ডিভাইস তথ্য।', 'আমরা আপনার ডেটা অ্যাপ প্রদান ও উন্নত করতে ব্যবহার করি।', 'আমরা আপনার ব্যক্তিগত ডেটা বিক্রি করি না।', 'আমরা আপনার ব্যক্তিগত তথ্য রক্ষা করতে নিরাপত্তা ব্যবস্থা প্রয়োগ করি।', 'আমরা এই নীতি আপডেট করতে পারি।'],
+      content: ['লেখনী কাহিনি বাংলা সাহিত্যের একটি প্ল্যাটফর্ম।', 'লেখকরা তাদের মূল রচনার সম্পূর্ণ মালিকানা রাখেন।', 'সমস্ত প্রকাশিত কন্টেন্ট আমাদের দল দ্বারা পর্যালোচিত হয়।', 'ব্যবহারকারীরা অনুপযুক্ত কন্টেন্ট রিপোর্ট করতে পারেন।', 'যোগ্য লেখকরা পাঠক সংখ্যার ভিত্তিতে আয় করতে পারেন।'],
+      contact: 'ইমেইল: lekhoni-kahini@xyteee.com | আমরা ৪৮ ঘণ্টার মধ্যে উত্তর দিই।'
+    },
+    en: {
+      title: 'Lekhoni Kahini', intro: 'Your gateway to Bengali literature & novels',
+      terms: ['Welcome to Lekhoni Kahini. By using this app, you agree to these terms.', 'You must be at least 13 years old to use this app.', 'You retain ownership of stories you write.', 'You agree not to post harmful, abusive, or illegal content.', 'We may suspend or terminate your account for violations.'],
+      privacy: ['Your privacy is important to us.', 'We collect: your name/email, reading history, device info.', 'We use your data to provide and improve the app.', 'We do not sell your personal data.', 'We implement security measures to protect your information.', 'We may update this policy.'],
+      content: ['Lekhoni Kahini is a platform for Bengali literature.', 'Authors retain full ownership of their original works.', 'All published content is reviewed by our team.', 'Users can report inappropriate content.', 'Eligible writers may earn revenue based on readership.'],
+      contact: 'Email: lekhoni-kahini@xyteee.com | We respond within 48 hours.'
+    },
+    hi: {
+      title: 'Lekhoni Kahini', intro: 'बंगाली साहित्य और उपन्यासों का अनोखा मंच',
+      terms: ['लेखनी कहानी में आपका स्वागत है। इस ऐप का उपयोग करके आप इन शर्तों से सहमत होते हैं।', 'इस ऐप का उपयोग करने के लिए आपकी आयु कम से कम 13 वर्ष होनी चाहिए।', 'आप जो कहानियाँ लिखते हैं उनका स्वामित्व आपका ही रहता है।', 'आप हानिकारक या गैरकानूनी सामग्री पोस्ट नहीं करेंगे।', 'शर्तों का उल्लंघन करने पर हम आपका खाता निलंबित कर सकते हैं।'],
+      privacy: ['आपकी गोपनीयता हमारे लिए महत्वपूर्ण है।', 'हम एकत्र करते हैं: आपका नाम/ईमेल, पढ़ने का इतिहास, डिवाइस जानकारी।', 'हम आपके डेटा का उपयोग ऐप प्रदान करने के लिए करते हैं।', 'हम आपका व्यक्तिगत डेटा नहीं बेचते।', 'हम आपकी जानकारी की रक्षा के लिए सुरक्षा उपाय लागू करते हैं।', 'हम इस नीति को अपडेट कर सकते हैं।'],
+      content: ['लेखनी कहानी बंगाली साहित्य का मंच है।', 'लेखक अपने मूल कार्यों का पूर्ण स्वामित्व रखते हैं।', 'सभी प्रकाशित सामग्री की समीक्षा की जाती है।', 'उपयोगकर्ता अनुपयुक्त सामग्री की रिपोर्ट कर सकते हैं।', 'योग्य लेखक पाठकों के आधार पर कमा सकते हैं।'],
+      contact: 'ईमेल: lekhoni-kahini@xyteee.com | हम 48 घंटे में जवाब देते हैं।'
+    }
+  };
+  const d = t[lang];
+
+  return (
+    <div style={{ fontFamily: 'sans-serif', maxWidth: 700, margin: '0 auto', padding: '20px 16px', background: '#fafafa', minHeight: '100vh' }}>
+      {/* Language selector */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 24, justifyContent: 'center' }}>
+        {(['bn', 'en', 'hi'] as const).map(l => (
+          <button key={l} onClick={() => setLang(l)} style={{ padding: '6px 16px', borderRadius: 8, border: '1px solid #ddd', cursor: 'pointer', fontSize: 13, fontWeight: 600, background: lang === l ? '#10B981' : '#fff', color: lang === l ? '#fff' : '#333' }}>{l === 'bn' ? 'বাংলা' : l === 'en' ? 'English' : 'हिन्दी'}</button>
+        ))}
+      </div>
+      {/* Header */}
+      <div style={{ textAlign: 'center', marginBottom: 32, padding: '32px 16px', background: 'linear-gradient(135deg, #10B981, #059669)', borderRadius: 16, color: '#fff' }}>
+        <div style={{ fontSize: 48, marginBottom: 8 }}>📖</div>
+        <h1 style={{ margin: 0, fontSize: 24 }}>{d.title}</h1>
+        <p style={{ margin: '8px 0 0', opacity: 0.85, fontSize: 14 }}>{d.intro}</p>
+      </div>
+      {/* Terms of Service */}
+      <div style={{ background: '#fff', borderRadius: 12, padding: 20, marginBottom: 16, border: '1px solid #eee' }}>
+        <h2 style={{ margin: '0 0 16px', fontSize: 18, color: '#10B981' }}>📜 {lang === 'bn' ? 'সেবার শর্তাবলী' : lang === 'hi' ? 'सेवा की शर्तें' : 'Terms of Service'}</h2>
+        {d.terms.map((s: string, i: number) => <p key={i} style={{ fontSize: 14, lineHeight: 1.7, color: '#444', margin: '0 0 10px' }}>{i + 1}. {s}</p>)}
+      </div>
+      {/* Privacy Policy */}
+      <div style={{ background: '#fff', borderRadius: 12, padding: 20, marginBottom: 16, border: '1px solid #eee' }}>
+        <h2 style={{ margin: '0 0 16px', fontSize: 18, color: '#3B82F6' }}>🔒 {lang === 'bn' ? 'গোপনীয়তা নীতি' : lang === 'hi' ? 'गोपनीयता नीति' : 'Privacy Policy'}</h2>
+        {d.privacy.map((s: string, i: number) => <p key={i} style={{ fontSize: 14, lineHeight: 1.7, color: '#444', margin: '0 0 10px' }}>{i + 1}. {s}</p>)}
+      </div>
+      {/* Content Policy */}
+      <div style={{ background: '#fff', borderRadius: 12, padding: 20, marginBottom: 16, border: '1px solid #eee' }}>
+        <h2 style={{ margin: '0 0 16px', fontSize: 18, color: '#8B5CF6' }}>📝 {lang === 'bn' ? 'কন্টেন্ট নীতি' : lang === 'hi' ? 'सामग्री नीति' : 'Content Policy'}</h2>
+        {d.content.map((s: string, i: number) => <p key={i} style={{ fontSize: 14, lineHeight: 1.7, color: '#444', margin: '0 0 10px' }}>{i + 1}. {s}</p>)}
+      </div>
+      {/* Contact */}
+      <div style={{ background: '#fff', borderRadius: 12, padding: 20, marginBottom: 16, border: '1px solid #eee', textAlign: 'center' }}>
+        <h2 style={{ margin: '0 0 12px', fontSize: 18, color: '#F59E0B' }}>✉️ {lang === 'bn' ? 'যোগাযোগ' : lang === 'hi' ? 'संपर्क' : 'Contact'}</h2>
+        <p style={{ fontSize: 14, color: '#444', margin: 0 }}>{d.contact}</p>
+      </div>
+      {/* Footer */}
+      <div style={{ textAlign: 'center', padding: '16px 0', color: '#999', fontSize: 12 }}>
+        <p style={{ margin: 0 }}>© 2026 {d.title}. All rights reserved.</p>
+        <p style={{ margin: '4px 0 0' }}>Last updated: 2026-08-30</p>
+      </div>
+    </div>
+  );
+}
+
 // ─── App ────────────────────────────────────────────────────────────────
 
 function App() {
@@ -176,6 +250,9 @@ function App() {
   const [pendingComments, setPendingComments] = useState(0);
   const [pendingWriters, setPendingWriters] = useState(0);
   const [editItem, setEditItem] = useState<any>(null);
+
+  // Terms page route
+  if (window.location.pathname === '/terms') return <TermsWebPage />;
 
   useEffect(() => {
     api('/api/admin/analytics').then((d: any) => {
@@ -237,6 +314,7 @@ function App() {
         {page === 'Categories' && <CategoriesPage onEdit={(c: Category) => openEdit('category', c)} onToast={showToast} />}
         {page === 'Comments' && <CommentsPage onToast={showToast} onRefreshPending={setPendingComments} />}
             {page === 'Writers' && <WritersPage onToast={showToast} onRefreshPending={setPendingWriters} />}
+            {page === 'Users' && <UsersPage onToast={showToast} />}
             {page === 'Home Control' && <HomeControlPage onToast={showToast} />}
             {page === 'Notifications' && <NotificationsPage onToast={showToast} />}
         {page === 'Analytics' && <AnalyticsPage />}
@@ -1054,6 +1132,111 @@ const HOME_SECTIONS: { key: string; label: string; desc: string; icon: React.Ele
   { key: 'popularAuthors', label: 'জনপ্রিয় লেখক / Popular Authors', desc: 'অনুসারী অনুযায়ী সেরা লেখক', icon: Users },
 ];
 
+function UsersPage({ onToast }: { onToast: (m: string) => void }) {
+  const [users, setUsers] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  const load = () => {
+    setLoading(true);
+    api('/api/admin/users')
+      .then(d => setUsers(d))
+      .catch(() => onToast('Failed to load users'))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { load(); }, []);
+
+  const filtered = search
+    ? users.filter(u => (u.user_name || u.display_name || '').toLowerCase().includes(search.toLowerCase()) || (u.device_key || '').toLowerCase().includes(search.toLowerCase()))
+    : users;
+
+  const handleDelete = async () => {
+    if (!deleteId) return;
+    setDeleting(true);
+    try {
+      const d = await api(`/api/admin/users/${deleteId}`, { method: 'DELETE' });
+      if (d.ok) { onToast('User deleted'); setDeleteId(null); load(); }
+      else onToast(d.error || 'Delete failed');
+    } catch { onToast('Delete failed'); }
+    finally { setDeleting(false); }
+  };
+
+  const formatDate = (s: string) => s ? new Date(s).toLocaleDateString('bn-BD', { year: 'numeric', month: 'short', day: 'numeric' }) : '-';
+  const formatDateTime = (s: string) => s ? new Date(s).toLocaleString('bn-BD', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '-';
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 16, alignItems: 'center' }}>
+        <div style={{ flex: 1, position: 'relative' }}>
+          <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', opacity: 0.4 }} />
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search users..." style={{ width: '100%', padding: '9px 12px 9px 36px', borderRadius: 10, border: '1px solid var(--line)', background: 'var(--bg)', fontSize: 13 }} />
+        </div>
+        <span style={{ fontSize: 12, color: 'var(--muted)', whiteSpace: 'nowrap' }}>{filtered.length} users</span>
+      </div>
+
+      {loading ? (
+        <div style={{ textAlign: 'center', padding: 40 }}><Loader2 size={28} className="spin" style={{ opacity: 0.3 }} /></div>
+      ) : !filtered.length ? (
+        <div style={{ textAlign: 'center', padding: 40, color: 'var(--muted)', fontSize: 13 }}>No users found</div>
+      ) : (
+        <div style={{ display: 'grid', gap: 10 }}>
+          {filtered.map(u => (
+            <div key={u.id} style={{ background: 'var(--card)', border: '1px solid var(--line)', borderRadius: 12, padding: 14, display: 'flex', alignItems: 'center', gap: 14 }}>
+              {u.avatar_url ? (
+                <img src={u.avatar_url} alt="" style={{ width: 44, height: 44, borderRadius: 22, objectFit: 'cover' }} />
+              ) : (
+                <div style={{ width: 44, height: 44, borderRadius: 22, background: 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 800, fontSize: 17 }}>
+                  {(u.user_name || u.display_name || '?')[0]?.toUpperCase()}
+                </div>
+              )}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 14, color: 'var(--ink)' }}>{u.user_name || u.display_name || 'Anonymous'}</div>
+                {u.user_bio && <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.user_bio}</div>}
+                <div style={{ display: 'flex', gap: 12, marginTop: 6, fontSize: 11, color: 'var(--muted)' }}>
+                  <span>Joined: {formatDate(u.last_active || u.last_seen_at)}</span>
+                  <span>Favorites: {u.favorites_count || 0}</span>
+                  <span>Bookmarks: {u.bookmarks_count || 0}</span>
+                  <span>Comments: {u.comments_count || 0}</span>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <span style={{ fontSize: 10, padding: '3px 8px', borderRadius: 6, background: u.language === 'bn' ? '#10B98122' : u.language === 'hi' ? '#F59E0B22' : '#3B82F622', color: u.language === 'bn' ? '#10B981' : u.language === 'hi' ? '#F59E0B' : '#3B82F6', fontWeight: 600 }}>
+                  {u.language === 'bn' ? 'বাংলা' : u.language === 'hi' ? 'हिन्दी' : 'English'}
+                </span>
+                <button onClick={() => setDeleteId(u.device_key)} style={{ padding: 6, borderRadius: 8, border: 'none', background: '#FEE2E2', color: '#EF4444', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {deleteId && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
+          <div style={{ background: 'var(--card)', borderRadius: 18, padding: 28, width: 360, textAlign: 'center', border: '1px solid var(--line)' }}>
+            <div style={{ width: 52, height: 52, borderRadius: 26, background: '#FEE2E2', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+              <AlertTriangle size={26} color="#EF4444" />
+            </div>
+            <h3 style={{ margin: '0 0 8px', fontSize: 17, fontWeight: 800 }}>Delete this user?</h3>
+            <p style={{ margin: '0 0 20px', fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
+              This will permanently delete the user's data including favorites, bookmarks, history, and comments. This action cannot be undone.
+            </p>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button onClick={() => setDeleteId(null)} style={{ flex: 1, padding: '11px 0', borderRadius: 12, border: 'none', background: 'var(--bg)', color: 'var(--ink)', fontWeight: 700, fontSize: 13, cursor: 'pointer' }}>Cancel</button>
+              <button onClick={handleDelete} disabled={deleting} style={{ flex: 1, padding: '11px 0', borderRadius: 12, border: 'none', background: '#EF4444', color: '#fff', fontWeight: 700, fontSize: 13, cursor: 'pointer', opacity: deleting ? 0.6 : 1 }}>
+                {deleting ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
   const [sections, setSections] = useState<{ key: string; enabled: boolean; title?: string }[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1420,6 +1603,117 @@ function SettingsPage() {
         <div className="modal-actions">
           <button className="primary">Save settings</button>
         </div>
+      </div>
+      <AboutContentEditor onToast={(m: string) => {}} />
+    </div>
+  );
+}
+
+function AboutContentEditor({ onToast }: { onToast: (m: string) => void }) {
+  const [lang, setLang] = useState<'bn' | 'en' | 'hi'>('bn');
+  const defaults: Record<string, { title: string; subtitle: string; desc: string; features: string[] }> = {
+    bn: { title: 'Lekhoni Kahini', subtitle: 'বাংলা সাহিত্য ও উপন্যাসের এক অনন্য পাঠভুবন', desc: 'এখানে পাবেন নতুন ও জনপ্রিয় লেখকদের অসংখ্য উপন্যাস, ছোটগল্প, কবিতা ও বিভিন্ন সাহিত্যকর্ম। নিজের পছন্দের গল্প খুঁজে পড়ুন, প্রিয় লেখকদের অনুসরণ করুন এবং বাংলা সাহিত্যের গল্পে হারিয়ে যান।', features: ['হাজার হাজার বাংলা গল্প ও উপন্যাস', 'নতুন ও জনপ্রিয় লেখকদের সৃজনশীল সাহিত্য', 'অফলাইনে পড়ার সুবিধা', 'নিজের গল্প লেখা ও প্রকাশের সুযোগ', 'গল্প লিখে আয়ের সুযোগ পান', 'নিরাপদ ও ব্যবহারকারী-বান্ধব অভিজ্ঞতা'] },
+    en: { title: 'Lekhoni Kahini', subtitle: 'Your gateway to Bengali literature & novels', desc: 'Discover thousands of novels, short stories, poems and literary works from popular Bengali authors.', features: ['Thousands of Bengali stories & novels', 'Creative works from popular authors', 'Read offline anytime', 'Write & publish your own stories', 'Earn money by writing stories', 'Safe & user-friendly experience'] },
+    hi: { title: 'Lekhoni Kahini', subtitle: 'बंगाली साहित्य और उपन्यासों का अनोखा मंच', desc: 'यहाँ पाएं नए और लोकप्रिय लेखकों की असंख्य कहानियाँ, लघु कथाएँ, कविताएँ और साहित्यिक कृतियाँ।', features: ['हज़ारों बंगाली कहानियाँ और उपन्यास', 'लोकप्रिय लेखकों की रचनाएँ', 'कभी भी ऑफ़लाइन पढ़ें', 'अपनी कहानियाँ लिखें और प्रकाशित करें', 'कहानी लिखकर कमाएं', 'सुरक्षित और उपयोगकर्ता-अनुकूल'] }
+  };
+  const [data, setData] = useState<Record<string, { title: string; subtitle: string; desc: string; features: string[] }>>(defaults);
+  const [version, setVersion] = useState('1.0.0');
+  const [developer, setDeveloper] = useState('Kawsar Hosen');
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    api('/api/admin/about').then((d: any) => {
+      if (d && d.title) {
+        setVersion(d.version || '1.0.0');
+        setDeveloper(d.developer || 'Kawsar Hosen');
+      }
+    }).catch(() => {});
+  }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const allFeatures = [...new Set([...data.bn.features, ...data.en.features, ...data.hi.features].filter(f => f.trim()))];
+      await api('/api/admin/about', {
+        method: 'PUT',
+        body: JSON.stringify({
+          title: data[lang].title,
+          subtitle: data[lang].subtitle,
+          description: data[lang].desc,
+          features: data[lang].features.filter(f => f.trim()),
+          version, developer
+        })
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch {}
+    finally { setSaving(false); }
+  };
+
+  const updateField = (field: string, value: string) => {
+    setData(prev => ({ ...prev, [lang]: { ...prev[lang], [field]: value } }));
+  };
+  const updateFeature = (idx: number, value: string) => {
+    const f = [...data[lang].features];
+    while (f.length <= idx) f.push('');
+    f[idx] = value;
+    setData(prev => ({ ...prev, [lang]: { ...prev[lang], features: f } }));
+  };
+  const addFeature = () => {
+    setData(prev => ({ ...prev, [lang]: { ...prev[lang], features: [...prev[lang].features, ''] } }));
+  };
+
+  return (
+    <div className="panel" style={{ maxWidth: 600, marginTop: 24 }}>
+      <h3 style={{ marginBottom: 16 }}>About App Content</h3>
+      <p style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 16 }}>This content appears on the "About App" page. App shows permanent defaults if not saved.</p>
+      {/* Language tabs */}
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+        {(['bn', 'en', 'hi'] as const).map(l => (
+          <button key={l} onClick={() => setLang(l)} style={{
+            padding: '6px 16px', borderRadius: 8, border: '1px solid var(--line)', cursor: 'pointer', fontSize: 12, fontWeight: 600,
+            background: lang === l ? 'var(--primary)' : 'var(--card)', color: lang === l ? '#fff' : 'var(--ink)'
+          }}>{l === 'bn' ? 'বাংলা' : l === 'en' ? 'English' : 'हिन्दी'}</button>
+        ))}
+      </div>
+      <label>
+        Title
+        <input value={data[lang].title} onChange={e => updateField('title', e.target.value)} placeholder="App title" />
+      </label>
+      <label>
+        Subtitle
+        <input value={data[lang].subtitle} onChange={e => updateField('subtitle', e.target.value)} placeholder="Short tagline" />
+      </label>
+      <label>
+        Description
+        <textarea rows={3} value={data[lang].desc} onChange={e => updateField('desc', e.target.value)} placeholder="App description..." />
+      </label>
+      <label style={{ fontWeight: 600, marginBottom: 8 }}>Features</label>
+      {data[lang].features.map((f: string, i: number) => (
+        <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+          <input value={f} onChange={e => updateFeature(i, e.target.value)} placeholder={`Feature ${i + 1}`} style={{ flex: 1 }} />
+          <button onClick={() => {
+            const f2 = data[lang].features.filter((_: string, j: number) => j !== i);
+            setData(prev => ({ ...prev, [lang]: { ...prev[lang], features: f2 } }));
+          }} style={{ padding: '4px 8px', background: 'none', border: '1px solid var(--line)', borderRadius: 6, cursor: 'pointer', color: 'var(--muted)', fontSize: 12 }}>✕</button>
+        </div>
+      ))}
+      <button onClick={addFeature} style={{ fontSize: 12, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginBottom: 16 }}>+ Add feature</button>
+      <div style={{ display: 'flex', gap: 12 }}>
+        <label style={{ flex: 1 }}>
+          Version
+          <input value={version} onChange={e => setVersion(e.target.value)} placeholder="1.0.0" />
+        </label>
+        <label style={{ flex: 1 }}>
+          Developer
+          <input value={developer} onChange={e => setDeveloper(e.target.value)} placeholder="Kawsar Hosen" />
+        </label>
+      </div>
+      <div className="modal-actions">
+        <button className="primary" onClick={handleSave} disabled={saving} style={{ opacity: saving ? 0.6 : 1 }}>
+          {saved ? '✓ Saved' : saving ? 'Saving...' : 'Save About Content'}
+        </button>
       </div>
     </div>
   );

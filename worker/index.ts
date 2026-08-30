@@ -44,6 +44,7 @@ export default {
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS home_section TEXT`;
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`CREATE TABLE IF NOT EXISTS user_state (device_key TEXT PRIMARY KEY, settings JSONB NOT NULL DEFAULT '{}', favorites JSONB NOT NULL DEFAULT '[]', downloads JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]', positions JSONB NOT NULL DEFAULT '{}', bookmarks JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        await sql`CREATE TABLE IF NOT EXISTS about_content (id INT PRIMARY KEY DEFAULT 1, content JSONB NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         // Backfill: sync chapters from published writer stories into their books (fix: books with missing chapters)
         try {
           const pubStories = await sql`SELECT s.id,s.title,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.status='published'`;
@@ -211,6 +212,37 @@ export default {
         await sql`UPDATE writers SET badge=${b.badge} WHERE id=${writerUserMatch[1]}`;
         return json({ ok: true });
       }
+      // --- Admin Users (devices) ---
+      if (url.pathname === '/api/admin/users' && request.method === 'GET') {
+        const users = await sql`SELECT d.id,d.device_key,d.display_name,d.last_seen_at,
+          COALESCE(
+            (SELECT us.settings->>'name' FROM user_state us WHERE us.device_key=d.device_key AND us.settings->>'name' IS NOT NULL AND us.settings->>'name' != ''),
+            d.display_name,
+            'Anonymous'
+          ) AS user_name,
+          (SELECT us.settings->>'bio' FROM user_state us WHERE us.device_key=d.device_key) AS user_bio,
+          (SELECT us.settings->>'language' FROM user_state us WHERE us.device_key=d.device_key) AS language,
+          (SELECT us.updated_at FROM user_state us WHERE us.device_key=d.device_key) AS last_active,
+          (SELECT jsonb_array_length(COALESCE(us.favorites, '[]'::jsonb)) FROM user_state us WHERE us.device_key=d.device_key) AS favorites_count,
+          (SELECT jsonb_array_length(COALESCE(us.bookmarks, '[]'::jsonb)) FROM user_state us WHERE us.device_key=d.device_key) AS bookmarks_count,
+          0 AS comments_count
+          FROM devices d ORDER BY d.last_seen_at DESC NULLS LAST`;
+        return json(users);
+      }
+      const userDelMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)$/);
+      if (userDelMatch && request.method === 'DELETE') {
+        const deviceId = userDelMatch[1];
+        const dRow = await sql`SELECT id,device_key FROM devices WHERE device_key=${deviceId} LIMIT 1`;
+        if (!dRow.length) return json({ error: 'User not found' }, 404);
+        const pk = dRow[0].id;
+        const dk = dRow[0].device_key;
+        await sql`DELETE FROM comments WHERE device_id::text=${dk}`;
+        await sql`DELETE FROM follows WHERE device_id=${pk}`;
+        await sql`DELETE FROM view_events WHERE device_id=${pk}`;
+        await sql`DELETE FROM user_state WHERE device_key=${dk}`;
+        await sql`DELETE FROM devices WHERE id=${pk}`;
+        return json({ ok: true });
+      }
       const writerMatch = url.pathname.match(/^\/api\/admin\/writers\/([^/]+)$/);
       if (writerMatch && request.method === 'PUT') {
         if (!uuid(writerMatch[1])) return json({ error: 'Invalid ID' }, 400);
@@ -342,6 +374,23 @@ export default {
         const b = await request.json() as { views_visible?: boolean };
         await sql`UPDATE home_settings SET views_visible=${b.views_visible === true}, updated_at=NOW() WHERE id=1`;
         return json({ ok: true, views_visible: b.views_visible === true });
+      }
+      // --- Public: About App ---
+      if (url.pathname === '/api/public/about' && request.method === 'GET') {
+        const row = await sql`SELECT content FROM about_content WHERE id=1 LIMIT 1`;
+        return json(row[0]?.content || { title: 'Lekhoni Kahini', subtitle: 'বাংলা সাহিত্য ও উপন্যাসের এক অনন্য পাঠভুবন', description: 'এখানে পাবেন নতুন ও জনপ্রিয় লেখকদের অসংখ্য উপন্যাস, ছোটগল্প, কবিতা ও বিভিন্ন সাহিত্যকর্ম। নিজের পছন্দের গল্প খুঁজে পড়ুন, প্রিয় লেখকদের অনুসরণ করুন এবং বাংলা সাহিত্যের গল্পে হারিয়ে যান।', features: ['হাজার হাজার বাংলা গল্প ও উপন্যাস', 'নতুন ও জনপ্রিয় লেখকদের সৃজনশীল সাহিত্য', 'অফলাইনে পড়ার সুবিধা', 'নিজের গল্প লেখা ও প্রকাশের সুযোগ'], version: '1.0.0', developer: 'Kawsar Hosen' });
+      }
+      // --- Admin: About Content ---
+      if (url.pathname === '/api/admin/about' && request.method === 'GET') {
+        const row = await sql`SELECT content FROM about_content WHERE id=1 LIMIT 1`;
+        return json(row[0]?.content || {});
+      }
+      if (url.pathname === '/api/admin/about' && request.method === 'PUT') {
+        const b = await request.json();
+        const exists = await sql`SELECT id FROM about_content WHERE id=1 LIMIT 1`;
+        if (exists.length) await sql`UPDATE about_content SET content=${JSON.stringify(b)}, updated_at=NOW() WHERE id=1`;
+        else await sql`INSERT INTO about_content (id, content) VALUES (1, ${JSON.stringify(b)})`;
+        return json({ ok: true });
       }
       // --- Admin: Writers Management (approval toggle) ---
       const adminWriterMatch = url.pathname.match(/^\/api\/admin\/writers\/([^/]+)\/approval$/);
@@ -567,7 +616,7 @@ export default {
       }
 
       // --- JWT ---
-      const JWT_SECRET = 'lekhoni-writer-jwt-secret-2024';
+      const JWT_SECRET = (env as any).JWT_SECRET || 'lekhoni-writer-jwt-secret-dev-only';
       async function createJWT(payload: Record<string, any>): Promise<string> {
         const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
         const body = btoa(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 }));
@@ -945,6 +994,32 @@ export default {
           }
           await sql`UPDATE writers SET username=COALESCE(${b.username},username),writer_name=COALESCE(${b.writer_name},writer_name),bio=COALESCE(${b.bio},bio),avatar_url=COALESCE(${b.avatar_url},avatar_url) WHERE id=${writerId}`;
           return json({ ok: true });
+        }
+
+        // --- Writer: Delete Account ---
+        if (url.pathname === '/api/writer/account' && request.method === 'DELETE') {
+          try {
+            // Get writer info first
+            const writer = await sql`SELECT id,username FROM writers WHERE id=${writerId} LIMIT 1`;
+            if (!writer.length) return json({ error: 'Writer not found' }, 404);
+            // Delete writer's stories and chapters
+            const stories = await sql`SELECT id FROM stories WHERE writer_id=${writerId}`;
+            for (const s of stories) {
+              await sql`DELETE FROM story_chapters WHERE story_id=${s.id}`;
+            }
+            await sql`DELETE FROM stories WHERE writer_id=${writerId}`;
+            // Delete from books table
+            await sql`DELETE FROM books WHERE author=(SELECT writer_name FROM writers WHERE id=${writerId})`;
+            // Delete follows
+            await sql`DELETE FROM follows WHERE writer_id=${writerId}`;
+            // Delete notifications
+            await sql`DELETE FROM notifications WHERE writer_id=${writerId}`;
+            // Delete the writer account
+            await sql`DELETE FROM writers WHERE id=${writerId}`;
+            return json({ ok: true, message: 'Account deleted successfully' });
+          } catch (e) {
+            return json({ error: 'Failed to delete account' }, 500);
+          }
         }
 
         // --- Writer Image Upload ---
