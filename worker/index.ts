@@ -424,19 +424,22 @@ export default {
           await sql`UPDATE story_reports SET status='dismissed', admin_note=${body.admin_note||''} WHERE id=${reportMatch[1]}`;
         } else if (body.action === 'warn') {
           await sql`UPDATE story_reports SET status='warned', admin_note=${body.admin_note||''} WHERE id=${reportMatch[1]}`;
-          const story = await sql`SELECT writer_id,title FROM stories WHERE id::text=${r.book_id} LIMIT 1`;
-          if (story.length) {
-            await sql`INSERT INTO writer_notifications (writer_id,title,body,type,story_id) VALUES (${story[0].writer_id},'Content Warning','Your story \"${story[0].title}\" has been reported for: ${r.reason}. ${body.admin_note||''}','warning',${r.book_id}::uuid)`;
+          const book = await sql`SELECT title,author FROM books WHERE id::text=${r.book_id} LIMIT 1`;
+          const writer = book.length ? await sql`SELECT id FROM writers WHERE writer_name=${book[0].author} LIMIT 1` : [];
+          if (writer.length) {
+            await sql`INSERT INTO writer_notifications (writer_id,title,body,type) VALUES (${writer[0].id},'Content Warning','Your story "${book[0].title}" has been reported for: ${r.reason}. ${body.admin_note||''}','warning')`;
           }
         } else if (body.action === 'delete') {
           await sql`UPDATE story_reports SET status='deleted', admin_note=${body.admin_note||''} WHERE id=${reportMatch[1]}`;
-          const story = await sql`SELECT writer_id,title FROM stories WHERE id::text=${r.book_id} LIMIT 1`;
-          if (story.length) {
-            await sql`INSERT INTO writer_notifications (writer_id,title,body,type,story_id) VALUES (${story[0].writer_id},'Story Removed','Your story \"${story[0].title}\" was removed due to policy violation. ${body.admin_note||''}','removed',${r.book_id}::uuid)`;
-            await sql`DELETE FROM story_chapters WHERE story_id=${r.book_id}::uuid`;
-            await sql`DELETE FROM stories WHERE id=${r.book_id}::uuid`;
-            await sql`DELETE FROM books WHERE id::text=${r.book_id}`;
+          const book = await sql`SELECT title,author FROM books WHERE id::text=${r.book_id} LIMIT 1>`;
+          if (book.length) {
+            const writer = await sql`SELECT id FROM writers WHERE writer_name=${book[0].author} LIMIT 1`;
+            if (writer.length) {
+              await sql`INSERT INTO writer_notifications (writer_id,title,body,type) VALUES (${writer[0].id},'Story Removed','Your story "${book[0].title}" was removed due to policy violation. ${body.admin_note||''}','removed')`;
+            }
           }
+          await sql`DELETE FROM chapters WHERE book_id::text=${r.book_id}`;
+          await sql`DELETE FROM books WHERE id::text=${r.book_id}`;
         }
         return json({ ok: true });
       }
