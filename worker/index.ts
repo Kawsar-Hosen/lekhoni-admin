@@ -45,6 +45,8 @@ export default {
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`CREATE TABLE IF NOT EXISTS user_state (device_key TEXT PRIMARY KEY, settings JSONB NOT NULL DEFAULT '{}', favorites JSONB NOT NULL DEFAULT '[]', downloads JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]', positions JSONB NOT NULL DEFAULT '{}', bookmarks JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`CREATE TABLE IF NOT EXISTS about_content (id INT PRIMARY KEY DEFAULT 1, content JSONB NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        await sql`CREATE TABLE IF NOT EXISTS story_reports (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), book_id TEXT NOT NULL, device_id TEXT DEFAULT '', reporter_name TEXT DEFAULT 'Anonymous', reason TEXT NOT NULL, details TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', admin_note TEXT DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS report_id UUID DEFAULT NULL`;
         // Backfill: sync chapters from published writer stories into their books (fix: books with missing chapters)
         try {
           const pubStories = await sql`SELECT s.id,s.title,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.status='published'`;
@@ -390,6 +392,52 @@ export default {
         const exists = await sql`SELECT id FROM about_content WHERE id=1 LIMIT 1`;
         if (exists.length) await sql`UPDATE about_content SET content=${JSON.stringify(b)}, updated_at=NOW() WHERE id=1`;
         else await sql`INSERT INTO about_content (id, content) VALUES (1, ${JSON.stringify(b)})`;
+        return json({ ok: true });
+      }
+      // --- Public: Submit Report ---
+      if (url.pathname === '/api/reports' && request.method === 'POST') {
+        const b = await request.json() as { book_id: string; device_id?: string; reporter_name?: string; reason: string; details?: string };
+        if (!b.book_id || !b.reason) return json({ error: 'Missing book_id or reason' }, 400);
+        await sql`INSERT INTO story_reports (book_id,device_id,reporter_name,reason,details) VALUES (${b.book_id},${b.device_id||''},${b.reporter_name||'Anonymous'},${b.reason},${b.details||''})`;
+        return json({ ok: true });
+      }
+      // --- Admin: Get Reports ---
+      if (url.pathname === '/api/admin/reports' && request.method === 'GET') {
+        const status = url.searchParams.get('status') || 'pending';
+        const reports = await sql`SELECT r.*,b.title AS book_title,b.author AS book_author FROM story_reports r LEFT JOIN books b ON r.book_id::text = b.id::text WHERE r.status=${status} ORDER BY r.created_at DESC`;
+        return json(reports);
+      }
+      // --- Admin: Get Report Count ---
+      if (url.pathname === '/api/admin/reports/count' && request.method === 'GET') {
+        const counts = await sql`SELECT status, COUNT(*)::int AS n FROM story_reports GROUP BY status`;
+        return json(counts);
+      }
+      // --- Admin: Resolve Report (delete story or send warning) ---
+      const reportMatch = url.pathname.match(/^\/api\/admin\/reports\/([^/]+)$/);
+      if (reportMatch && request.method === 'POST') {
+        if (!uuid(reportMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        const body = await request.json() as { action: 'dismiss' | 'warn' | 'delete'; admin_note?: string };
+        const report = await sql`SELECT * FROM story_reports WHERE id=${reportMatch[1]}`;
+        if (!report.length) return json({ error: 'Report not found' }, 404);
+        const r = report[0];
+        if (body.action === 'dismiss') {
+          await sql`UPDATE story_reports SET status='dismissed', admin_note=${body.admin_note||''} WHERE id=${reportMatch[1]}`;
+        } else if (body.action === 'warn') {
+          await sql`UPDATE story_reports SET status='warned', admin_note=${body.admin_note||''} WHERE id=${reportMatch[1]}`;
+          const story = await sql`SELECT writer_id,title FROM stories WHERE id::text=${r.book_id} LIMIT 1`;
+          if (story.length) {
+            await sql`INSERT INTO writer_notifications (writer_id,title,body,type,story_id) VALUES (${story[0].writer_id},'Content Warning','Your story \"${story[0].title}\" has been reported for: ${r.reason}. ${body.admin_note||''}','warning',${r.book_id}::uuid)`;
+          }
+        } else if (body.action === 'delete') {
+          await sql`UPDATE story_reports SET status='deleted', admin_note=${body.admin_note||''} WHERE id=${reportMatch[1]}`;
+          const story = await sql`SELECT writer_id,title FROM stories WHERE id::text=${r.book_id} LIMIT 1`;
+          if (story.length) {
+            await sql`INSERT INTO writer_notifications (writer_id,title,body,type,story_id) VALUES (${story[0].writer_id},'Story Removed','Your story \"${story[0].title}\" was removed due to policy violation. ${body.admin_note||''}','removed',${r.book_id}::uuid)`;
+            await sql`DELETE FROM story_chapters WHERE story_id=${r.book_id}::uuid`;
+            await sql`DELETE FROM stories WHERE id=${r.book_id}::uuid`;
+            await sql`DELETE FROM books WHERE id::text=${r.book_id}`;
+          }
+        }
         return json({ ok: true });
       }
       // --- Admin: Writers Management (approval toggle) ---

@@ -9,7 +9,7 @@ import {
   Heart, Bookmark, Share2, RefreshCw, Download, ToggleLeft, ToggleRight,
   Hash, Type, Palette, AlignLeft, ListOrdered, Upload,
   Zap, Gift, Megaphone, Sparkles, Award, Coffee, Info, Star, GripVertical,
-  UserCheck
+  UserCheck, Flag
 } from 'lucide-react';
 import './styles.css';
 
@@ -117,7 +117,7 @@ interface Analytics {
   daily_views: { date: string; views: number }[];
 }
 
-type Page = 'Dashboard' | 'Books' | 'Chapters' | 'Categories' | 'Comments' | 'Writers' | 'Users' | 'Home Control' | 'Notifications' | 'Analytics' | 'Settings';
+type Page = 'Dashboard' | 'Books' | 'Chapters' | 'Categories' | 'Comments' | 'Writers' | 'Users' | 'Home Control' | 'Notifications' | 'Analytics' | 'Settings' | 'Reports';
 
 const API_BASE = 'https://lekhoni-admin-api.smdkawsar2.workers.dev';
 
@@ -131,6 +131,7 @@ const nav: [Page, React.ElementType][] = [
   ['Users', UserCheck],
   ['Home Control', Sparkles],
   ['Notifications', Bell],
+  ['Reports', Flag],
   ['Analytics', BarChart3],
   ['Settings', Settings],
 ];
@@ -318,6 +319,7 @@ function App() {
             {page === 'Home Control' && <HomeControlPage onToast={showToast} />}
             {page === 'Notifications' && <NotificationsPage onToast={showToast} />}
         {page === 'Analytics' && <AnalyticsPage />}
+        {page === 'Reports' && <ReportsPage onToast={showToast} />}
         {page === 'Settings' && <SettingsPage />}
       </main>
       {modal === 'book' && <BookModal editItem={editItem} close={closeModal} onToast={showToast} />}
@@ -1544,6 +1546,121 @@ function AnalyticsPage() {
               <b>{d?.active_readers ?? 0}</b>
             </div>
           </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Reports Page ──────────────────────────────────────────────────────
+
+function ReportsPage({ onToast }: { onToast: (m: string, t?: string) => void }) {
+  const [reports, setReports] = useState<any[]>([]);
+  const [status, setStatus] = useState<'pending' | 'warned' | 'dismissed' | 'deleted'>('pending');
+  const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState<any>(null);
+  const [actionNote, setActionNote] = useState('');
+  const [processing, setProcessing] = useState(false);
+  const [counts, setCounts] = useState<Record<string, number>>({});
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [r, c] = await Promise.all([
+        api(`/api/admin/reports?status=${status}`),
+        api('/api/admin/reports/count'),
+      ]);
+      setReports(Array.isArray(r) ? r : []);
+      const map: Record<string, number> = {};
+      (Array.isArray(c) ? c : []).forEach((x: any) => { map[x.status] = x.n; });
+      setCounts(map);
+    } catch { setReports([]); }
+    setLoading(false);
+  }, [status]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleAction = async (action: 'dismiss' | 'warn' | 'delete') => {
+    if (!selected || processing) return;
+    if (action === 'delete' && !confirm('Delete this story permanently?')) return;
+    setProcessing(true);
+    try {
+      await api(`/api/admin/reports/${selected.id}`, { method: 'POST', body: JSON.stringify({ action, admin_note: actionNote }) });
+      onToast(action === 'dismiss' ? 'Report dismissed' : action === 'warn' ? 'Warning sent to writer' : 'Story deleted', 'success');
+      setSelected(null);
+      setActionNote('');
+      load();
+    } catch (e: any) { onToast(e.message || 'Failed', 'error'); }
+    setProcessing(false);
+  };
+
+  const reasonLabel = (r: string) => ({ abusive: 'Abusive', spam: 'Spam', hate: 'Hate Speech', violence: 'Violence', inappropriate: 'Inappropriate', other: 'Other' }[r] || r);
+
+  return (
+    <div className="content">
+      <div className="resource-head">
+        <div>
+          <h2><Flag size={22} style={{ marginRight: 8, verticalAlign: 'middle' }} />Reports</h2>
+          <p>Manage user-reported content.</p>
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+        {(['pending', 'warned', 'dismissed', 'deleted'] as const).map(s => (
+          <button key={s} onClick={() => setStatus(s)} style={{ padding: '6px 14px', borderRadius: 8, border: `1.5px solid ${status === s ? '#123E39' : '#E5E7EB'}`, background: status === s ? '#123E39' : '#fff', color: status === s ? '#fff' : '#374151', fontWeight: 600, fontSize: 13, cursor: 'pointer' }}>
+            {s.charAt(0).toUpperCase() + s.slice(1)} {counts[s] ? `(${counts[s]})` : ''}
+          </button>
+        ))}
+      </div>
+      {loading ? <div style={{ textAlign: 'center', padding: 40 }}><Loader2 className="spin" size={28} /></div> :
+        reports.length === 0 ? <div className="empty"><p>No {status} reports.</p></div> :
+        <div className="table-wrap">
+          <table className="table">
+            <thead><tr><th>Story</th><th>Reason</th><th>Reporter</th><th>Date</th><th></th></tr></thead>
+            <tbody>
+              {reports.map(r => (
+                <tr key={r.id} style={{ cursor: 'pointer' }} onClick={() => setSelected(r)}>
+                  <td><strong>{r.book_title || 'Unknown'}</strong><br /><small style={{ color: '#6B7280' }}>by {r.book_author || '—'}</small></td>
+                  <td><span style={{ padding: '3px 8px', borderRadius: 6, background: r.reason === 'abusive' ? '#FEE2E2' : r.reason === 'spam' ? '#FEF3C7' : r.reason === 'hate' ? '#EDE9FE' : '#F3F4F6', fontSize: 12, fontWeight: 600 }}>{reasonLabel(r.reason)}</span></td>
+                  <td>{r.reporter_name || 'Anonymous'}</td>
+                  <td><small>{new Date(r.created_at).toLocaleDateString()}</small></td>
+                  <td><button className="icon-btn" onClick={(e) => { e.stopPropagation(); setSelected(r); }}><MoreHorizontal size={16} /></button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      }
+      {selected && (
+        <div className="modal-overlay" onClick={() => { setSelected(null); setActionNote(''); }}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+            <h3 style={{ margin: 0, marginBottom: 12 }}>Report Details</h3>
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr', gap: '6px 12px', fontSize: 14 }}>
+                <span style={{ color: '#6B7280' }}>Story:</span><strong>{selected.book_title || 'Unknown'}</strong>
+                <span style={{ color: '#6B7280' }}>Author:</span><span>{selected.book_author || '—'}</span>
+                <span style={{ color: '#6B7280' }}>Reason:</span><span style={{ fontWeight: 600 }}>{reasonLabel(selected.reason)}</span>
+                <span style={{ color: '#6B7280' }}>Reporter:</span><span>{selected.reporter_name || 'Anonymous'}</span>
+                <span style={{ color: '#6B7280' }}>Date:</span><span>{new Date(selected.created_at).toLocaleString()}</span>
+                {selected.details && <><span style={{ color: '#6B7280' }}>Details:</span><span>{selected.details}</span></>}
+              </div>
+            </div>
+            {selected.book_id && (
+              <div style={{ marginBottom: 16 }}>
+                <h4 style={{ margin: '0 0 8px', fontSize: 14 }}>Story Preview</h4>
+                <div style={{ padding: 12, background: '#F9FAFB', borderRadius: 8, border: '1px solid #E5E7EB', fontSize: 13 }}>
+                  <p style={{ margin: 0, fontWeight: 600 }}>{selected.book_title}</p>
+                  <p style={{ margin: '4px 0 0', color: '#6B7280' }}>by {selected.book_author}</p>
+                </div>
+              </div>
+            )}
+            <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Admin Note (optional)</label>
+            <textarea value={actionNote} onChange={e => setActionNote(e.target.value)} rows={2} style={{ width: '100%', padding: 8, borderRadius: 6, border: '1px solid #D1D5DB', fontSize: 13, resize: 'vertical', marginBottom: 16 }} placeholder="Reason for action..." />
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button onClick={() => handleAction('dismiss')} disabled={processing} style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid #D1D5DB', background: '#fff', cursor: 'pointer', fontWeight: 600, fontSize: 13 }}>Dismiss</button>
+              <button onClick={() => handleAction('warn')} disabled={processing} style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: '#F59E0B', color: '#fff', cursor: 'pointer', fontWeight: 600, fontSize: 13 }}>Warn Writer</button>
+              <button onClick={() => handleAction('delete')} disabled={processing} style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: '#EF4444', color: '#fff', cursor: 'pointer', fontWeight: 600, fontSize: 13 }}>Delete Story</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
