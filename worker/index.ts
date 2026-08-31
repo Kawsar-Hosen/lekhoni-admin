@@ -41,14 +41,25 @@ export default {
         await sql`CREATE TABLE IF NOT EXISTS home_settings (id INT PRIMARY KEY DEFAULT 1, sections JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`INSERT INTO home_settings (id, sections) VALUES (1, '[]') ON CONFLICT (id) DO NOTHING`;
         await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
+        await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS comments_approval BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS home_section TEXT`;
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`CREATE TABLE IF NOT EXISTS user_state (device_key TEXT PRIMARY KEY, settings JSONB NOT NULL DEFAULT '{}', favorites JSONB NOT NULL DEFAULT '[]', downloads JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]', positions JSONB NOT NULL DEFAULT '{}', bookmarks JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`CREATE TABLE IF NOT EXISTS about_content (id INT PRIMARY KEY DEFAULT 1, content JSONB NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`CREATE TABLE IF NOT EXISTS story_reports (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), book_id TEXT NOT NULL, device_id TEXT DEFAULT '', reporter_name TEXT DEFAULT 'Anonymous', reason TEXT NOT NULL, details TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', admin_note TEXT DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS report_id UUID DEFAULT NULL`;
+        await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`;
+        await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS story_title TEXT DEFAULT ''`;
+        await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS story_cover TEXT DEFAULT ''`;
+        // Users table for regular signed-up users
+        await sql`CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL DEFAULT '', display_name TEXT NOT NULL, avatar_url TEXT DEFAULT '', bio TEXT DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        // Add follower_user_id to follows for user follows
+        await sql`ALTER TABLE follows ADD COLUMN IF NOT EXISTS follower_user_id UUID DEFAULT NULL`;
+        await sql`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS device_id TEXT DEFAULT ''`;
+        await sql`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS story_cover TEXT DEFAULT ''`;
         await sql`ALTER TABLE stories ADD COLUMN IF NOT EXISTS hide_title_on_cover BOOLEAN NOT NULL DEFAULT FALSE`;
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS hide_title_on_cover BOOLEAN NOT NULL DEFAULT FALSE`;
+        await sql`ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token TEXT DEFAULT ''`;
         // Backfill: sync hide_title_on_cover from stories to their books
         try {
           await sql`UPDATE books SET hide_title_on_cover = s.hide_title_on_cover FROM stories s JOIN writers w ON s.writer_id=w.id WHERE books.title = s.title AND books.author = w.writer_name AND s.hide_title_on_cover = true`;
@@ -72,6 +83,10 @@ export default {
             if (added > 0) { console.log('backfilled', added, 'chapters for', st.title); }
           }
         } catch (e) { console.error('backfill error', e); }
+        // Recalculate all follower_counts from actual follows
+        try {
+          await sql`UPDATE writers SET follower_count = (SELECT COUNT(*)::int FROM follows WHERE follows.writer_id = writers.id)`;
+        } catch (e) { console.error('follower_count recalc error', e); }
         return json({ ok: true, message: 'Migration applied' });
       }
 
@@ -293,6 +308,21 @@ export default {
           await sql`UPDATE stories SET status='published',review_note=${b.note||''},updated_at=NOW() WHERE id=${s.id}`;
           await sql`INSERT INTO writer_activities (writer_id,type,data) VALUES (${s.writer_id},'story_approved',${actData}::jsonb)`;
           await sql`INSERT INTO writer_notifications (writer_id,title,body,type) VALUES (${s.writer_id},${approveTitle},${approveBody},${'approved'})`;
+          // Notify all followers about new story
+          try {
+            const followers = await sql`SELECT device_id FROM follows WHERE writer_id=${s.writer_id}`;
+            const writerInfo = await sql`SELECT writer_name,avatar_url FROM writers WHERE id=${s.writer_id} LIMIT 1`;
+            const writerName = writerInfo.length ? writerInfo[0].writer_name : 'লেখক';
+            const storyCover = s.cover_url || '';
+            for (const f of followers) {
+              if (f.device_id) {
+                const dKey = await sql`SELECT device_key FROM devices WHERE id=${f.device_id} LIMIT 1`;
+                if (dKey.length) {
+                  await sql`INSERT INTO notifications (title,body,icon,url,device_id,story_cover,status) VALUES (${'নতুন গল্প'},${writerName+' নতুন গল্প প্রকাশ করেছেন: "'+s.title+'"'},'book-open',${s.id},${dKey[0].device_key},${storyCover},'sent')`;
+                }
+              }
+            }
+          } catch(e) { console.error('admin approve follower notification error', e); }
           return json({ ok: true, book_id: bookId });
         } else if (b.status === 'rejected') {
           await sql`UPDATE stories SET status='rejected',review_note=${b.note||''},updated_at=NOW() WHERE id=${s.id}`;
@@ -316,6 +346,13 @@ export default {
         const b = await request.json() as { title?: string; body?: string; icon?: string; url?: string };
         if (!b.title || !b.body) return json({ error: 'title and body required' }, 400);
         const r = await sql`INSERT INTO notifications (title,body,icon,url,status) VALUES (${b.title},${b.body},${b.icon||'bell'},${b.url||''},'sent') RETURNING id,title,body,icon,url,status,created_at`;
+        // Send push notifications to all devices with push tokens
+        try {
+          const allTokens = await sql`SELECT push_token FROM devices WHERE push_token != '' AND push_token IS NOT NULL`;
+          if (allTokens.length) {
+            await sendExpoPushNotifications(allTokens.map((t: any) => t.push_token), b.title, b.body, { type: 'admin', url: b.url || '' });
+          }
+        } catch (e) { console.error('admin broadcast push error', e); }
         return json(r[0], 201);
       }
       const notifMatch = url.pathname.match(/^\/api\/admin\/notifications\/([^/]+)$/);
@@ -375,18 +412,25 @@ export default {
       }
       // --- Admin: App config (global settings) ---
       if (url.pathname === '/api/admin/app-config' && request.method === 'GET') {
-        const row = await sql`SELECT views_visible FROM home_settings WHERE id=1 LIMIT 1`;
-        return json({ views_visible: row[0]?.views_visible !== false });
+        const row = await sql`SELECT views_visible, comments_approval FROM home_settings WHERE id=1 LIMIT 1`;
+        return json({ views_visible: row[0]?.views_visible !== false, comments_approval: row[0]?.comments_approval !== false });
       }
       if (url.pathname === '/api/admin/app-config' && request.method === 'PUT') {
-        const b = await request.json() as { views_visible?: boolean };
-        await sql`UPDATE home_settings SET views_visible=${b.views_visible === true}, updated_at=NOW() WHERE id=1`;
-        return json({ ok: true, views_visible: b.views_visible === true });
+        const b = await request.json() as { views_visible?: boolean; comments_approval?: boolean };
+        if (b.views_visible !== undefined) await sql`UPDATE home_settings SET views_visible=${b.views_visible === true}, updated_at=NOW() WHERE id=1`;
+        if (b.comments_approval !== undefined) await sql`UPDATE home_settings SET comments_approval=${b.comments_approval === true}, updated_at=NOW() WHERE id=1`;
+        const row = await sql`SELECT views_visible, comments_approval FROM home_settings WHERE id=1 LIMIT 1`;
+        return json({ ok: true, views_visible: row[0]?.views_visible !== false, comments_approval: row[0]?.comments_approval !== false });
       }
       // --- Public: About App ---
       if (url.pathname === '/api/public/about' && request.method === 'GET') {
         const row = await sql`SELECT content FROM about_content WHERE id=1 LIMIT 1`;
         return json(row[0]?.content || { title: 'Lekhoni Kahini', subtitle: 'বাংলা সাহিত্য ও উপন্যাসের এক অনন্য পাঠভুবন', description: 'এখানে পাবেন নতুন ও জনপ্রিয় লেখকদের অসংখ্য উপন্যাস, ছোটগল্প, কবিতা ও বিভিন্ন সাহিত্যকর্ম। নিজের পছন্দের গল্প খুঁজে পড়ুন, প্রিয় লেখকদের অনুসরণ করুন এবং বাংলা সাহিত্যের গল্পে হারিয়ে যান।', features: ['হাজার হাজার বাংলা গল্প ও উপন্যাস', 'নতুন ও জনপ্রিয় লেখকদের সৃজনশীল সাহিত্য', 'অফলাইনে পড়ার সুবিধা', 'নিজের গল্প লেখা ও প্রকাশের সুযোগ'], version: '1.0.0', developer: 'Kawsar Hosen' });
+      }
+      // --- Public: Comments approval setting ---
+      if (url.pathname === '/api/public/comments-config' && request.method === 'GET') {
+        const row = await sql`SELECT comments_approval FROM home_settings WHERE id=1 LIMIT 1`;
+        return json({ comments_approval: row[0]?.comments_approval !== false });
       }
       // --- Admin: About Content ---
       if (url.pathname === '/api/admin/about' && request.method === 'GET') {
@@ -463,6 +507,89 @@ export default {
         const r = await sql`SELECT id,username,writer_name,approval_required,is_active,badge FROM writers WHERE id=${adminWriterMatch[1]}`;
         return json(r[0] || { error: 'Not found' }, r.length ? 200 : 404);
       }
+      // --- Admin: Delete Writer (cascade) ---
+      const adminWriterDeleteMatch = url.pathname.match(/^\/api\/admin\/writers\/([^/]+)$/);
+      if (adminWriterDeleteMatch && request.method === 'DELETE') {
+        const wid = adminWriterDeleteMatch[1];
+        if (!uuid(wid)) return json({ error: 'Invalid ID' }, 400);
+        const storyIds = (await sql`SELECT id FROM stories WHERE writer_id=${wid}`).map((r: any) => r.id);
+        if (storyIds.length > 0) {
+          try { await sql`DELETE FROM comments WHERE book_id = ANY(${storyIds})`; } catch(e) {}
+          try { await sql`DELETE FROM story_reports WHERE book_id = ANY(${storyIds})`; } catch(e) {}
+          try { await sql`DELETE FROM likes WHERE book_id = ANY(${storyIds})`; } catch(e) {}
+          try { await sql`DELETE FROM bookmarks WHERE book_id = ANY(${storyIds})`; } catch(e) {}
+          try { await sql`DELETE FROM chapters WHERE book_id = ANY(${storyIds})`; } catch(e) {}
+        }
+        try { await sql`DELETE FROM stories WHERE writer_id=${wid}`; } catch(e) {}
+        try { await sql`DELETE FROM writer_notifications WHERE writer_id=${wid}`; } catch(e) {}
+        try { await sql`DELETE FROM follows WHERE writer_id=${wid}`; } catch(e) {}
+        await sql`DELETE FROM writers WHERE id=${wid}`;
+        return json({ ok: true, message: 'Writer and all related data deleted' });
+      }
+      // --- Admin: Delete User (cascade) ---
+      const adminUserDeleteMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)$/);
+      if (adminUserDeleteMatch && request.method === 'DELETE') {
+        const uid = adminUserDeleteMatch[1];
+        if (!uuid(uid)) return json({ error: 'Invalid ID' }, 400);
+        try { await sql`DELETE FROM follows WHERE follower_user_id=${uid}`; } catch(e) {}
+        try { await sql`DELETE FROM writer_notifications WHERE user_id=${uid}`; } catch(e) {}
+        try { await sql`DELETE FROM users WHERE id=${uid}`; } catch(e) {}
+        return json({ ok: true, message: 'User and all related data deleted' });
+      }
+      // --- Admin: Delete Device ---
+      const adminDeviceDeleteMatch = url.pathname.match(/^\/api\/admin\/devices\/([^/]+)$/);
+      if (adminDeviceDeleteMatch && request.method === 'DELETE') {
+        const did = adminDeviceDeleteMatch[1];
+        if (!uuid(did)) return json({ error: 'Invalid ID' }, 400);
+        try { await sql`DELETE FROM notifications WHERE device_id=${did}`; } catch(e) {}
+        await sql`DELETE FROM devices WHERE id=${did}`;
+        return json({ ok: true, message: 'Device and related notifications deleted' });
+      }
+      // --- Admin: Delete Story (cascade) ---
+      const adminStoryDeleteMatch = url.pathname.match(/^\/api\/admin\/stories\/([^/]+)$/);
+      if (adminStoryDeleteMatch && request.method === 'DELETE') {
+        const sid = adminStoryDeleteMatch[1];
+        if (!uuid(sid)) return json({ error: 'Invalid ID' }, 400);
+        try { await sql`DELETE FROM comments WHERE book_id=${sid}`; } catch(e) {}
+        try { await sql`DELETE FROM story_reports WHERE book_id=${sid}`; } catch(e) {}
+        try { await sql`DELETE FROM likes WHERE book_id=${sid}`; } catch(e) {}
+        try { await sql`DELETE FROM bookmarks WHERE book_id=${sid}`; } catch(e) {}
+        try { await sql`DELETE FROM chapters WHERE book_id=${sid}`; } catch(e) {}
+        await sql`DELETE FROM stories WHERE id=${sid}`;
+        return json({ ok: true, message: 'Story and all related data deleted' });
+      }
+      // --- Admin: Bulk Delete Notifications ---
+      if (url.pathname === '/api/admin/notifications/delete' && request.method === 'POST') {
+        const body = await request.json() as { ids?: string[]; all?: boolean };
+        if (body.all) {
+          const r = await sql`DELETE FROM notifications`;
+          return json({ ok: true, message: 'All notifications deleted' });
+        }
+        if (body.ids && body.ids.length > 0) {
+          const r = await sql`DELETE FROM notifications WHERE id = ANY(${body.ids})`;
+          return json({ ok: true, message: `${body.ids.length} notifications deleted` });
+        }
+        return json({ error: 'Provide ids array or all:true' }, 400);
+      }
+      // --- Admin: Bulk Delete Devices ---
+      if (url.pathname === '/api/admin/devices/delete' && request.method === 'POST') {
+        const body = await request.json() as { ids?: string[]; all?: boolean };
+        if (body.all) {
+          try { await sql`DELETE FROM notifications`; } catch(e) {}
+          try { await sql`DELETE FROM follows`; } catch(e) {}
+          try { await sql`DELETE FROM writer_notifications`; } catch(e) {}
+          await sql`DELETE FROM devices`;
+          return json({ ok: true, message: 'All devices deleted' });
+        }
+        if (body.ids && body.ids.length > 0) {
+          for (const did of body.ids) {
+            try { await sql`DELETE FROM notifications WHERE device_id=${did}`; } catch(e) {}
+            try { await sql`DELETE FROM devices WHERE id=${did}`; } catch(e) {}
+          }
+          return json({ ok: true, message: `${body.ids.length} devices deleted` });
+        }
+        return json({ error: 'Provide ids array or all:true' }, 400);
+      }
       // --- Admin: Writer Stories (all writers' stories for approval) ---
       if (url.pathname === '/api/admin/stories' && request.method === 'GET')
         return json(await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,s.chapters_count,s.review_note,s.created_at,s.updated_at,w.writer_name,w.username FROM stories s LEFT JOIN writers w ON s.writer_id=w.id ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 ELSE 2 END,s.updated_at DESC`);
@@ -507,6 +634,12 @@ export default {
       // --- Admin: Writer Notifications ---
       if (url.pathname === '/api/admin/writer-notifications' && request.method === 'GET')
         return json(await sql`SELECT wn.id,wn.title,wn.body,wn.type,wn.is_read,wn.created_at,w.writer_name,w.username FROM writer_notifications wn LEFT JOIN writers w ON wn.writer_id=w.id ORDER BY wn.created_at DESC LIMIT 100`);
+      if (url.pathname === '/api/admin/writer-notifications/delete' && request.method === 'POST') {
+        const body = await request.json() as { ids?: string[]; all?: boolean };
+        if (body.all) { await sql`DELETE FROM writer_notifications`; return json({ ok: true, message: 'All writer notifications deleted' }); }
+        if (body.ids && body.ids.length > 0) { await sql`DELETE FROM writer_notifications WHERE id = ANY(${body.ids})`; return json({ ok: true, message: `${body.ids.length} writer notifications deleted` }); }
+        return json({ error: 'Provide ids array or all:true' }, 400);
+      }
       if (url.pathname === '/api/admin/writer-notifications/send' && request.method === 'POST') {
         const b = await request.json() as { writer_id?: string; title?: string; body?: string; type?: string; url?: string };
         if (!b.title || !b.body) return json({ error: 'title, body required' }, 400);
@@ -607,8 +740,12 @@ export default {
         if (!deviceRow.length) return json({ error: 'Device registration failed' }, 500);
         const dId = deviceRow[0].id;
         if (b.event_type === 'view') {
-          await sql`INSERT INTO view_events (device_id, book_id, created_at) VALUES (${dId},${b.book_id},NOW())`;
-          await sql`UPDATE books SET views = views + 1 WHERE id = ${b.book_id}`;
+          const bookUp = await sql`UPDATE books SET views = views + 1 WHERE id = ${b.book_id}`;
+          if (bookUp.rowCount > 0) {
+            await sql`INSERT INTO view_events (device_id, book_id, created_at) VALUES (${dId},${b.book_id},NOW())`;
+          } else {
+            await sql`UPDATE stories SET views = views + 1 WHERE id = ${b.book_id}`;
+          }
         } else if (b.event_type === 'like' || b.event_type === 'dislike') {
           const existing = await sql`SELECT value FROM reactions WHERE device_id=${dId} AND book_id=${b.book_id} LIMIT 1`;
           const newVal = b.event_type === 'like' ? 'like' : 'dislike';
@@ -617,10 +754,10 @@ export default {
             await sql`UPDATE reactions SET value=${newVal}, created_at=NOW() WHERE device_id=${dId} AND book_id=${b.book_id}`;
           } else {
             await sql`INSERT INTO reactions (device_id, book_id, value, created_at) VALUES (${dId},${b.book_id},${newVal},NOW()) ON CONFLICT (device_id, book_id) DO UPDATE SET value=${newVal}, created_at=NOW()`;
-            if (oldVal === 'like') await sql`UPDATE books SET likes = GREATEST(likes - 1, 0), dislikes = dislikes + 1 WHERE id = ${b.book_id}`;
-            else if (oldVal === 'dislike') await sql`UPDATE books SET dislikes = GREATEST(dislikes - 1, 0), likes = likes + 1 WHERE id = ${b.book_id}`;
-            else if (b.event_type === 'like') await sql`UPDATE books SET likes = likes + 1 WHERE id = ${b.book_id}`;
-            else await sql`UPDATE books SET dislikes = dislikes + 1 WHERE id = ${b.book_id}`;
+            if (oldVal === 'like') { await sql`UPDATE books SET likes = GREATEST(likes - 1, 0), dislikes = dislikes + 1 WHERE id = ${b.book_id}`; await sql`UPDATE stories SET likes = GREATEST(likes - 1, 0), dislikes = dislikes + 1 WHERE id = ${b.book_id}`; }
+            else if (oldVal === 'dislike') { await sql`UPDATE books SET dislikes = GREATEST(dislikes - 1, 0), likes = likes + 1 WHERE id = ${b.book_id}`; await sql`UPDATE stories SET dislikes = GREATEST(dislikes - 1, 0), likes = likes + 1 WHERE id = ${b.book_id}`; }
+            else if (b.event_type === 'like') { await sql`UPDATE books SET likes = likes + 1 WHERE id = ${b.book_id}`; await sql`UPDATE stories SET likes = likes + 1 WHERE id = ${b.book_id}`; }
+            else { await sql`UPDATE books SET dislikes = dislikes + 1 WHERE id = ${b.book_id}`; await sql`UPDATE stories SET dislikes = dislikes + 1 WHERE id = ${b.book_id}`; }
           }
         }
         return json({ ok: true }, 201);
@@ -636,14 +773,29 @@ export default {
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
         const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
         const dId = deviceRow.length ? deviceRow[0].id : null;
-        await sql`INSERT INTO comments (book_id, device_id, display_name, body, status, created_at) VALUES (${bookId},${dId},${b.name},${b.body},'pending',NOW())`;
-        return json({ ok: true, message: 'Comment submitted for moderation' }, 201);
+        // Check if approval is required
+        const cfgRow = await sql`SELECT comments_approval FROM home_settings WHERE id=1 LIMIT 1`;
+        const needsApproval = cfgRow[0]?.comments_approval !== false;
+        const commentStatus = needsApproval ? 'pending' : 'approved';
+        await sql`INSERT INTO comments (book_id, device_id, display_name, body, status, created_at) VALUES (${bookId},${dId},${b.name},${b.body},${commentStatus},NOW())`;
+        // Send comment notification to book's writer
+        try {
+          const bookInfo = await sql`SELECT author,cover_url FROM books WHERE id=${bookId} LIMIT 1`;
+          if (bookInfo.length) {
+            const writerRow = await sql`SELECT id FROM writers WHERE writer_name=${bookInfo[0].author} LIMIT 1`;
+            if (writerRow.length) {
+              const snippet = b.body.length > 40 ? b.body.slice(0, 40) + '...' : b.body;
+              await sql`INSERT INTO writer_notifications (writer_id,title,body,type,story_id,story_cover) VALUES (${writerRow[0].id},${'নতুন মন্তব্য'},${b.name+' আপনার "'+((await sql`SELECT title FROM books WHERE id=${bookId} LIMIT 1`)[0]?.title||'')+'" গল্পে মন্তব্য করেছেন: "'+snippet+'"'},'comment',${bookId},${bookInfo[0].cover_url||''})`;
+            }
+          }
+        } catch(e) { console.error('comment notification error', e); }
+        return json({ ok: true, needs_approval: needsApproval, message: needsApproval ? 'Comment submitted for moderation' : 'Comment posted' }, 201);
       }
 
       const pubLikeMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)\/like$/);
       if (pubLikeMatch && request.method === 'POST') {
         const bookId = pubLikeMatch[1];
-        const b = await request.json() as { device_id?: string; value?: boolean };
+        const b = await request.json() as { device_id?: string; value?: boolean; display_name?: string };
         if (!b.device_id || typeof b.value !== 'boolean') return json({ error: 'device_id and value required' }, 400);
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
         const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
@@ -654,6 +806,17 @@ export default {
           if (curVal === 'dislike') await sql`UPDATE books SET likes=likes+1, dislikes=GREATEST(dislikes-1,0) WHERE id=${bookId}`;
           else if (!curVal) await sql`UPDATE books SET likes=likes+1 WHERE id=${bookId}`;
           if (dId) await sql`INSERT INTO reactions (device_id,book_id,value,created_at) VALUES (${dId},${bookId},'like',NOW()) ON CONFLICT (device_id,book_id) DO UPDATE SET value='like',created_at=NOW()`;
+          // Send like notification to book's writer
+          try {
+            const bookInfo = await sql`SELECT author,cover_url FROM books WHERE id=${bookId} LIMIT 1`;
+            if (bookInfo.length) {
+              const writerRow = await sql`SELECT id FROM writers WHERE writer_name=${bookInfo[0].author} LIMIT 1`;
+              if (writerRow.length && writerRow[0].id !== dId) {
+                const likerName = b.display_name || 'কেউ একজন';
+                await sql`INSERT INTO writer_notifications (writer_id,title,body,type,story_id,avatar_url,story_cover) VALUES (${writerRow[0].id},${'নতুন লাইক'},${likerName+' আপনার "'+((await sql`SELECT title FROM books WHERE id=${bookId} LIMIT 1`)[0]?.title||'')+'" গল্পটি পছন্দ করেছেন'},'like',${bookId},${''},${bookInfo[0].cover_url||''})`;
+              }
+            }
+          } catch(e) { console.error('like notification error', e); }
         } else {
           if (curVal === 'like') await sql`UPDATE books SET likes=GREATEST(likes-1,0) WHERE id=${bookId}`;
           if (dId) await sql`DELETE FROM reactions WHERE device_id=${dId} AND book_id=${bookId}`;
@@ -662,8 +825,45 @@ export default {
         return json({ ok: true, likes: l.length ? (l[0].likes as number) : 0 });
       }
 
-      if (url.pathname === '/api/public/notifications' && request.method === 'GET')
-        return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,created_at FROM notifications WHERE status='sent' ORDER BY created_at DESC LIMIT 20`);
+      // --- Push Token Registration ---
+      if (url.pathname === '/api/public/devices/register' && request.method === 'POST') {
+        const b = await request.json() as { device_id?: string; push_token?: string };
+        if (!b.device_id || !b.push_token) return json({ error: 'device_id and push_token required' }, 400);
+        await sql`INSERT INTO devices (device_key, push_token, last_seen_at) VALUES (${b.device_id}, ${b.push_token}, NOW()) ON CONFLICT (device_key) DO UPDATE SET push_token = ${b.push_token}, last_seen_at = NOW()`;
+        return json({ ok: true });
+      }
+
+      // --- Send Expo Push Notifications ---
+      async function sendExpoPushNotifications(pushTokens: string[], title: string, body: string, data: Record<string, string> = {}): Promise<void> {
+        if (!pushTokens.length) return;
+        const messages = pushTokens.filter(t => t && t.startsWith('ExponentPushToken')).map(token => ({
+          to: token,
+          sound: 'default',
+          title,
+          body,
+          data,
+          channelId: 'default',
+        }));
+        if (!messages.length) return;
+        // Send in batches of 100
+        for (let i = 0; i < messages.length; i += 100) {
+          try {
+            await fetch('https://exp.host/--/api/v2/push/send', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(messages.slice(i, i + 100)),
+            });
+          } catch (e) { console.error('Expo push send error', e); }
+        }
+      }
+
+      if (url.pathname === '/api/public/notifications' && request.method === 'GET') {
+        const deviceId = url.searchParams.get('device_id') || '';
+        if (deviceId) {
+          return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND (device_id='' OR device_id=${deviceId}) ORDER BY created_at DESC LIMIT 30`);
+        }
+        return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND device_id='' ORDER BY created_at DESC LIMIT 20`);
+      }
 
       // --- PBKDF2 Hashing ---
       async function hashPassword(password: string, salt?: string): Promise<{ hash: string; salt: string }> {
@@ -748,11 +948,6 @@ export default {
           // Check existing writer by email
           const existing = await sql`SELECT id,username,writer_name,email,bio,avatar_url,follower_count,created_at FROM writers WHERE email=${email} AND is_active=true`;
           if (existing.length) {
-            // Update avatar if Google has a newer one
-            if (avatarUrl && existing[0].avatar_url !== avatarUrl) {
-              await sql`UPDATE writers SET avatar_url=${avatarUrl} WHERE id=${existing[0].id}`;
-              existing[0].avatar_url = avatarUrl;
-            }
             const token = await createJWT({ id: existing[0].id, username: existing[0].username });
             return json({ writer: existing[0], token });
           }
@@ -790,6 +985,61 @@ export default {
         return json({ writer: r[0] });
       }
 
+      // --- User Signup ---
+      if (url.pathname === '/api/public/users/signup' && request.method === 'POST') {
+        const b = await request.json() as { username?: string; email?: string; password?: string; display_name?: string };
+        if (!b.username || !b.email || !b.password) return json({ error: 'All fields required' }, 400);
+        if (b.password.length < 6) return json({ error: 'Password must be at least 6 characters' }, 400);
+        const uname = b.username.toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 20);
+        if (!uname) return json({ error: 'Invalid username' }, 400);
+        const { hash, salt } = await hashPassword(b.password);
+        const displayName = (b.display_name || uname).slice(0, 20);
+        try {
+          const r = await sql`INSERT INTO users (username,email,password_hash,salt,display_name) VALUES (${uname},${b.email.toLowerCase().trim()},${hash},${salt},${displayName}) RETURNING id,username,email,display_name,avatar_url,bio,created_at`;
+          const token = await createJWT({ id: r[0].id, username: r[0].username, role: 'user' });
+          return json({ user: r[0], token }, 201);
+        } catch (e: any) {
+          if (e.message?.includes('unique')) return json({ error: 'Username or email already taken' }, 409);
+          throw e;
+        }
+      }
+      // --- User Login ---
+      if (url.pathname === '/api/public/users/login' && request.method === 'POST') {
+        const b = await request.json() as { email_or_username?: string; password?: string };
+        if (!b.email_or_username || !b.password) return json({ error: 'All fields required' }, 400);
+        const ident = b.email_or_username.trim().toLowerCase();
+        const r = await sql`SELECT id,username,email,display_name,avatar_url,bio,password_hash,salt,created_at FROM users WHERE (email=${ident} OR username=${ident})`;
+        if (!r.length) return json({ error: 'Invalid credentials' }, 401);
+        const { hash } = await hashPassword(b.password, r[0].salt);
+        if (hash !== r[0].password_hash) return json({ error: 'Invalid credentials' }, 401);
+        const token = await createJWT({ id: r[0].id, username: r[0].username, role: 'user' });
+        const { salt: _, password_hash: __, ...user } = r[0];
+        return json({ user, token });
+      }
+      // --- User Verify Token ---
+      if (url.pathname === '/api/public/users/verify' && request.method === 'POST') {
+        const b = await request.json() as { token?: string };
+        if (!b.token) return json({ error: 'Token required' }, 400);
+        const payload = await verifyJWT(b.token);
+        if (!payload?.id) return json({ error: 'Invalid token' }, 401);
+        const r = await sql`SELECT id,username,display_name,avatar_url,bio,created_at FROM users WHERE id=${payload.id}`;
+        if (!r.length) return json({ error: 'User not found' }, 404);
+        return json({ user: r[0] });
+      }
+      // --- User Update Profile ---
+      if (url.pathname === '/api/public/users/profile' && request.method === 'PUT') {
+        const b = await request.json() as { token?: string; display_name?: string; bio?: string; avatar_url?: string };
+        if (!b.token) return json({ error: 'Token required' }, 400);
+        const payload = await verifyJWT(b.token);
+        if (!payload?.id) return json({ error: 'Invalid token' }, 401);
+        const updates: string[] = [];
+        if (b.display_name) await sql`UPDATE users SET display_name=${b.display_name.slice(0,20)} WHERE id=${payload.id}`;
+        if (b.bio !== undefined) await sql`UPDATE users SET bio=${b.bio.slice(0,200)} WHERE id=${payload.id}`;
+        if (b.avatar_url !== undefined) await sql`UPDATE users SET avatar_url=${b.avatar_url} WHERE id=${payload.id}`;
+        const r = await sql`SELECT id,username,display_name,avatar_url,bio,created_at FROM users WHERE id=${payload.id}`;
+        return json({ user: r[0] });
+      }
+
       // --- Public Writers List ---
       if (url.pathname === '/api/public/writers' && request.method === 'GET')
         return json(await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE is_active=true ORDER BY follower_count DESC,created_at DESC`);
@@ -813,18 +1063,21 @@ export default {
         return json(followed);
       }
       if (url.pathname === '/api/public/follows' && request.method === 'POST') {
-        const b = await request.json() as { device_id?: string; writer_id?: string; follower_writer_id?: string };
+        const b = await request.json() as { device_id?: string; writer_id?: string; follower_writer_id?: string; follower_user_id?: string };
         if (!b.device_id || !b.writer_id) return json({ error: 'device_id and writer_id required' }, 400);
         if (!uuid(b.writer_id)) return json({ error: 'Invalid writer_id' }, 400);
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
         const dRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
         if (!dRow.length) return json({ error: 'Device not found' }, 500);
-        const ins = await sql`INSERT INTO follows (device_id,writer_id,follower_writer_id) VALUES (${dRow[0].id},${b.writer_id},${b.follower_writer_id||null}) ON CONFLICT (device_id,writer_id) DO NOTHING RETURNING id`;
+        const ins = await sql`INSERT INTO follows (device_id,writer_id,follower_writer_id,follower_user_id) VALUES (${dRow[0].id},${b.writer_id},${b.follower_writer_id||null},${b.follower_user_id||null}) ON CONFLICT (device_id,writer_id) DO NOTHING RETURNING id`;
         if (ins.length > 0) {
-          await sql`UPDATE writers SET follower_count = follower_count + 1 WHERE id=${b.writer_id}`;
+          await sql`UPDATE writers SET follower_count = (SELECT COUNT(*)::int FROM follows WHERE writer_id = ${b.writer_id}) WHERE id = ${b.writer_id}`;
           if (b.follower_writer_id && uuid(b.follower_writer_id)) {
-            const fw = await sql`SELECT writer_name FROM writers WHERE id=${b.follower_writer_id} LIMIT 1`;
-            if (fw.length) await sql`INSERT INTO writer_notifications (writer_id,title,body,type,url) VALUES (${b.writer_id},${'নতুন অনুসারক'},${fw[0].writer_name+' আপনাকে ফলো করেছেন'},'follow',${b.follower_writer_id})`;
+            const fw = await sql`SELECT writer_name,profile_image FROM writers WHERE id=${b.follower_writer_id} LIMIT 1`;
+            if (fw.length) await sql`INSERT INTO writer_notifications (writer_id,title,body,type,url,avatar_url) VALUES (${b.writer_id},${'নতুন অনুসারক'},${fw[0].writer_name+' আপনাকে ফলো করেছেন'},'follow',${b.follower_writer_id},${fw[0].profile_image||''})`;
+          } else if (b.follower_user_id && uuid(b.follower_user_id)) {
+            const fu = await sql`SELECT display_name,avatar_url FROM users WHERE id=${b.follower_user_id} LIMIT 1`;
+            if (fu.length) await sql`INSERT INTO writer_notifications (writer_id,title,body,type,url,avatar_url) VALUES (${b.writer_id},${'নতুন অনুসারক'},${fu[0].display_name+' আপনাকে ফলো করেছেন'},'follow',${b.follower_user_id},${fu[0].avatar_url||''})`;
           }
         }
         return json({ ok: true }, 201);
@@ -836,7 +1089,7 @@ export default {
         const dRow = await sql`SELECT id FROM devices WHERE device_key=${deviceId} LIMIT 1`;
         if (!dRow.length) return json({ ok: true });
         const del = await sql`DELETE FROM follows WHERE device_id=${dRow[0].id} AND writer_id=${writerId}`;
-        if (del.rowCount && del.rowCount > 0) await sql`UPDATE writers SET follower_count = GREATEST(follower_count - 1, 0) WHERE id=${writerId}`;
+        if (del.rowCount && del.rowCount > 0) await sql`UPDATE writers SET follower_count = (SELECT COUNT(*)::int FROM follows WHERE writer_id = ${writerId}) WHERE id = ${writerId}`;
         return json({ ok: true });
       }
 
@@ -1002,6 +1255,28 @@ export default {
             if (stRow.length && stRow[0].status === 'published') {
               const bkRow = await sql`SELECT id FROM books WHERE title=${stRow[0].title} AND author=${stRow[0].writer_name} LIMIT 1`;
               if (bkRow.length) await sql`INSERT INTO chapters (book_id,title,body,position,status,minutes) VALUES (${bkRow[0].id},${b.title},${b.body||''},${pos},'published',5)`;
+              // Notify all followers about new chapter
+              try {
+                const storyInfo = await sql`SELECT s.title,s.cover_url FROM stories s WHERE s.id=${storyId} LIMIT 1`;
+                const followers = await sql`SELECT device_id FROM follows WHERE writer_id=${writerId}`;
+                const writerInfo = await sql`SELECT writer_name FROM writers WHERE id=${writerId} LIMIT 1`;
+                const writerName = writerInfo.length ? writerInfo[0].writer_name : 'লেখক';
+                const storyTitle = storyInfo.length ? storyInfo[0].title : '';
+                const storyCover = storyInfo.length ? storyInfo[0].cover_url || '' : '';
+                const pushTokens: string[] = [];
+                for (const f of followers) {
+                  if (f.device_id) {
+                    const dKey = await sql`SELECT device_key,push_token FROM devices WHERE id=${f.device_id} LIMIT 1`;
+                    if (dKey.length) {
+                      await sql`INSERT INTO notifications (title,body,icon,url,device_id,story_cover,status) VALUES (${'নতুন অধ্যায়'},${writerName+' এর "'+storyTitle+'"-এ নতুন অধ্যায় এসেছে: "'+b.title+'"'},'book-open',${storyId},${dKey[0].device_key},${storyCover},'sent')`;
+                      if (dKey[0].push_token) pushTokens.push(dKey[0].push_token);
+                    }
+                  }
+                }
+                if (pushTokens.length) {
+                  await sendExpoPushNotifications(pushTokens, 'নতুন অধ্যায়', writerName+' এর "'+storyTitle+'"-এ নতুন অধ্যায় এসেছে: "'+b.title+'"', { storyId, type: 'new_chapter' });
+                }
+              } catch(e) { console.error('chapter add follower notification error', e); }
             }
             return json(r[0], 201);
           }
@@ -1100,7 +1375,7 @@ export default {
 
         // --- Writer Notifications ---
         if (url.pathname === '/api/writer/notifications' && request.method === 'GET') {
-          const r = await sql`SELECT id,title,body,type,story_id,is_read,url,created_at FROM writer_notifications WHERE writer_id=${writerId} ORDER BY created_at DESC LIMIT 50`;
+          const r = await sql`SELECT id,title,body,type,story_id,is_read,url,COALESCE(avatar_url,'') as avatar_url,COALESCE(story_title,'') as story_title,COALESCE(story_cover,'') as story_cover,created_at FROM writer_notifications WHERE writer_id=${writerId} ORDER BY created_at DESC LIMIT 50`;
           return json(r);
         }
         if (url.pathname === '/api/writer/notifications/read' && request.method === 'POST') {
@@ -1143,8 +1418,33 @@ export default {
                 const chapters = await sql`SELECT title,body,position FROM story_chapters WHERE story_id=${storySubmitMatch[1]} ORDER BY position`;
                 const existingChs = await sql`SELECT title FROM chapters WHERE book_id=${bookId}`;
                 const have = new Set(existingChs.map((e: any) => (e.title || '').trim()));
-                for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published')`; } catch (e) { console.error('auto-approve chapter insert failed', e); } }
+                for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status) VALUES (${bookId},${c.title},${b.body||''},${c.position},'published')`; } catch (e) { console.error('auto-approve chapter insert failed', e); } }
               }
+              // Notify all followers about new story
+              try {
+                const writerId = (await sql`SELECT writer_id FROM stories WHERE id=${storySubmitMatch[1]} LIMIT 1`)[0]?.writer_id;
+                if (writerId) {
+                  const writerInfo = await sql`SELECT writer_name,avatar_url FROM writers WHERE id=${writerId} LIMIT 1`;
+                  const followers = await sql`SELECT device_id FROM follows WHERE writer_id=${writerId}`;
+                  const writerName = writerInfo.length ? writerInfo[0].writer_name : 'লেখক';
+                  const writerAvatar = writerInfo.length ? writerInfo[0].avatar_url || '' : '';
+                  const storyTitle = sRow[0]?.title || '';
+                  const storyCover = sRow[0]?.cover_url || '';
+                  const pushTokens: string[] = [];
+                  for (const f of followers) {
+                    if (f.device_id) {
+                      const dKey = await sql`SELECT device_key,push_token FROM devices WHERE id=${f.device_id} LIMIT 1`;
+                      if (dKey.length) {
+                        await sql`INSERT INTO notifications (title,body,icon,url,device_id,story_cover,status) VALUES (${'নতুন গল্প'},${writerName+' নতুন গল্প প্রকাশ করেছেন: "'+storyTitle+'"'},'book-open',${storySubmitMatch[1]},${dKey[0].device_key},${storyCover},'sent')`;
+                        if (dKey[0].push_token) pushTokens.push(dKey[0].push_token);
+                      }
+                    }
+                  }
+                  if (pushTokens.length) {
+                    await sendExpoPushNotifications(pushTokens, 'নতুন গল্প', writerName+' নতুন গল্প প্রকাশ করেছেন: "'+storyTitle+'"', { storyId: storySubmitMatch[1], type: 'new_story' });
+                  }
+                }
+              } catch(e) { console.error('story publish follower notification error', e); }
             }
           }
           return json({ ok: true, status: newStatus });
@@ -1173,7 +1473,6 @@ export default {
         return json({ error: 'Not found' }, 404);
       }
 
-      return json({ error: 'Not found' }, 404);
     } catch (error) { return json({ error: error instanceof Error ? error.message : 'Request failed' }, 500); }
   }
 };

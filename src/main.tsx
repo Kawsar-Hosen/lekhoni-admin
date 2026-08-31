@@ -250,17 +250,68 @@ function App() {
   const [toast, setToast] = useState('');
   const [pendingComments, setPendingComments] = useState(0);
   const [pendingWriters, setPendingWriters] = useState(0);
+  const [pendingNotifications, setPendingNotifications] = useState(0);
   const [editItem, setEditItem] = useState<any>(null);
+  const lastNotifCount = useRef(0);
+  const notifAudio = useRef<HTMLAudioElement | null>(null);
 
   // Terms page route
   if (window.location.pathname === '/terms') return <TermsWebPage />;
 
+  // Request browser notification permission
   useEffect(() => {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+    notifAudio.current = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVggoKIeGBGPWeoqoRbRElujH+Le1xCO22zr4FWRUZ1mZ+UfWBBRnqooperIh1AXJivrJBhNjVggoKIeGBGPWeoqoRbRElujH+Le1xCO22zr4FWRUZ1mZ+UfWBBRnqooperIh1AXJiv');
+  }, []);
+
+  // Poll for new notifications every 15 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      api('/api/admin/analytics').then((d: any) => {
+        setPendingComments(d.pending_comments || 0);
+        setPendingWriters(d.pending_writers || 0);
+      }).catch(() => {});
+      api('/api/admin/notifications').then((d: any) => {
+        const list = Array.isArray(d) ? d : d.notifications || d.data || [];
+        const count = list.length;
+        if (lastNotifCount.current > 0 && count > lastNotifCount.current) {
+          const diff = count - lastNotifCount.current;
+          setPendingNotifications(diff);
+          // Browser notification
+          if ('Notification' in window && Notification.permission === 'granted') {
+            const newest = list[0];
+            new Notification(newest?.title || 'New Notification', {
+              body: newest?.body || 'You have a new notification',
+              icon: '/favicon.ico',
+            });
+          }
+          // Sound
+          try { notifAudio.current?.play().catch(() => {}); } catch {}
+        } else if (lastNotifCount.current === 0 && count > 0) {
+          setPendingNotifications(count);
+        }
+        lastNotifCount.current = count;
+      }).catch(() => {});
+    }, 15000);
+    // Initial load
     api('/api/admin/analytics').then((d: any) => {
       setPendingComments(d.pending_comments || 0);
       setPendingWriters(d.pending_writers || 0);
     }).catch(() => {});
+    api('/api/admin/notifications').then((d: any) => {
+      const list = Array.isArray(d) ? d : d.notifications || d.data || [];
+      lastNotifCount.current = list.length;
+      setPendingNotifications(list.length);
+    }).catch(() => {});
+    return () => clearInterval(interval);
   }, []);
+
+  // Clear notification badge when on Notifications page
+  useEffect(() => {
+    if (page === 'Notifications') setPendingNotifications(0);
+  }, [page]);
 
   const openCreate = (type: string) => { setEditItem(null); setModal(type); };
   const openEdit = (type: string, item: any) => { setEditItem(item); setModal(type); };
@@ -281,6 +332,7 @@ function App() {
               <span>{label}</span>
               {label === 'Comments' && pendingComments > 0 && <b>{pendingComments}</b>}
               {label === 'Writers' && pendingWriters > 0 && <b>{pendingWriters}</b>}
+              {label === 'Notifications' && pendingNotifications > 0 && <b>{pendingNotifications}</b>}
             </button>
           ))}
         </nav>
@@ -320,7 +372,7 @@ function App() {
             {page === 'Notifications' && <NotificationsPage onToast={showToast} />}
         {page === 'Analytics' && <AnalyticsPage />}
         {page === 'Reports' && <ReportsPage onToast={showToast} />}
-        {page === 'Settings' && <SettingsPage />}
+        {page === 'Settings' && <SettingsPage onToast={showToast} />}
       </main>
       {modal === 'book' && <BookModal editItem={editItem} close={closeModal} onToast={showToast} />}
       {modal === 'chapter' && <ChapterModal close={closeModal} onToast={showToast} />}
@@ -1669,12 +1721,36 @@ function ReportsPage({ onToast }: { onToast: (m: string, t?: string) => void }) 
 
 // ─── Settings Page ──────────────────────────────────────────────────────
 
-function SettingsPage() {
+function SettingsPage({ onToast }: { onToast?: (m: string) => void }) {
   const [siteName, setSiteName] = useState('Lekhoni Kahini');
   const [siteDesc, setSiteDesc] = useState('A Bengali storytelling platform');
   const [apiUrl, setApiUrl] = useState(API_BASE);
   const [notifEnabled, setNotifEnabled] = useState(true);
-  const [autoApprove, setAutoApprove] = useState(false);
+  const [commentsApproval, setCommentsApproval] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    api('/api/admin/app-config').then((d: any) => {
+      if (d) {
+        if (d.views_visible !== undefined) setNotifEnabled(d.views_visible);
+        if (d.comments_approval !== undefined) setCommentsApproval(d.comments_approval);
+      }
+    }).catch(() => {});
+  }, []);
+
+  const saveSettings = async () => {
+    setSaving(true);
+    try {
+      await api('/api/admin/app-config', {
+        method: 'PUT',
+        body: JSON.stringify({ views_visible: notifEnabled, comments_approval: commentsApproval }),
+      });
+      onToast?.('Settings saved');
+    } catch {
+      onToast?.('Failed to save settings');
+    }
+    setSaving(false);
+  };
 
   return (
     <div className="content">
@@ -1706,22 +1782,29 @@ function SettingsPage() {
             onChange={e => setNotifEnabled(e.target.checked)}
             style={{ width: 18, height: 18 }}
           />
-          <span>Enable push notifications</span>
+          <span>Show views on books</span>
         </label>
         <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', marginBottom: 14 }}>
           <input
             type="checkbox"
-            checked={autoApprove}
-            onChange={e => setAutoApprove(e.target.checked)}
+            checked={commentsApproval}
+            onChange={e => setCommentsApproval(e.target.checked)}
             style={{ width: 18, height: 18 }}
           />
-          <span>Auto-approve comments</span>
+          <span>Comments require approval</span>
         </label>
+        <p style={{ fontSize: 12, color: '#6f827d', marginTop: -8, marginBottom: 16 }}>
+          {commentsApproval
+            ? 'ON — New comments will be pending until you approve them'
+            : 'OFF — All comments are auto-approved and shown immediately'}
+        </p>
         <div className="modal-actions">
-          <button className="primary">Save settings</button>
+          <button className="primary" onClick={saveSettings} disabled={saving}>
+            {saving ? 'Saving...' : 'Save settings'}
+          </button>
         </div>
       </div>
-      <AboutContentEditor onToast={(m: string) => {}} />
+      <AboutContentEditor onToast={onToast || ((m: string) => {})} />
     </div>
   );
 }
