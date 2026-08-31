@@ -42,6 +42,7 @@ export default {
         await sql`INSERT INTO home_settings (id, sections) VALUES (1, '[]') ON CONFLICT (id) DO NOTHING`;
         await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS comments_approval BOOLEAN NOT NULL DEFAULT TRUE`;
+        await sql`ALTER TABLE comments ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`;
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS home_section TEXT`;
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`CREATE TABLE IF NOT EXISTS user_state (device_key TEXT PRIMARY KEY, settings JSONB NOT NULL DEFAULT '{}', favorites JSONB NOT NULL DEFAULT '[]', downloads JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]', positions JSONB NOT NULL DEFAULT '{}', bookmarks JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
@@ -195,7 +196,7 @@ export default {
 
       // --- Comments Moderation ---
       if (url.pathname === '/api/admin/comments' && request.method === 'GET')
-        return json(await sql`SELECT cm.id,cm.book_id,cm.display_name,cm.body,cm.status,cm.created_at,b.title AS book_title FROM comments cm LEFT JOIN books b ON cm.book_id=b.id WHERE cm.status<>'deleted' ORDER BY cm.created_at DESC LIMIT 100`);
+        return json(await sql`SELECT cm.id,cm.book_id,cm.display_name,cm.body,cm.status,cm.created_at,cm.avatar_url,b.title AS book_title FROM comments cm LEFT JOIN books b ON cm.book_id=b.id WHERE cm.status<>'deleted' ORDER BY cm.created_at DESC LIMIT 100`);
       const comMatch = url.pathname.match(/^\/api\/admin\/comments\/([^/]+)$/);
       if (comMatch && request.method === 'PUT') {
         if (!uuid(comMatch[1])) return json({ error: 'Invalid ID' }, 400);
@@ -765,10 +766,10 @@ export default {
 
       const pubComMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)\/comments$/);
       if (pubComMatch && request.method === 'GET')
-        return json(await sql`SELECT id,book_id,display_name,body,status,created_at FROM comments WHERE book_id=${pubComMatch[1]} AND status='approved' ORDER BY created_at DESC LIMIT 50`);
+        return json(await sql`SELECT id,book_id,display_name,body,status,created_at,avatar_url FROM comments WHERE book_id=${pubComMatch[1]} AND status='approved' ORDER BY created_at DESC LIMIT 50`);
       if (pubComMatch && request.method === 'POST') {
         const bookId = pubComMatch[1];
-        const b = await request.json() as { device_id?: string; name?: string; body?: string };
+        const b = await request.json() as { device_id?: string; name?: string; body?: string; avatar_url?: string };
         if (!b.device_id || !b.name || !b.body) return json({ error: 'device_id, name, body required' }, 400);
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
         const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
@@ -777,7 +778,8 @@ export default {
         const cfgRow = await sql`SELECT comments_approval FROM home_settings WHERE id=1 LIMIT 1`;
         const needsApproval = cfgRow[0]?.comments_approval !== false;
         const commentStatus = needsApproval ? 'pending' : 'approved';
-        await sql`INSERT INTO comments (book_id, device_id, display_name, body, status, created_at) VALUES (${bookId},${dId},${b.name},${b.body},${commentStatus},NOW())`;
+        const avatarUrl = b.avatar_url || '';
+        await sql`INSERT INTO comments (book_id, device_id, display_name, body, status, avatar_url, created_at) VALUES (${bookId},${dId},${b.name},${b.body},${commentStatus},${avatarUrl},NOW())`;
         // Send comment notification to book's writer
         try {
           const bookInfo = await sql`SELECT author,cover_url FROM books WHERE id=${bookId} LIMIT 1`;
