@@ -665,6 +665,16 @@ export default {
 
       // ==================== PUBLIC MOBILE APP ROUTES ====================
 
+      if (url.pathname === '/api/public/sync-views' && request.method === 'POST') {
+        const allBooks = await sql`SELECT title, author, views FROM books WHERE views > 0`;
+        let synced = 0;
+        for (const bk of allBooks) {
+          const r = await sql`UPDATE stories SET views = ${bk.views} WHERE title = ${bk.title}`;
+          if (r.rowCount > 0) synced += r.rowCount;
+        }
+        return json({ ok: true, synced, total: allBooks.length });
+      }
+
       if (url.pathname === '/api/public/categories' && request.method === 'GET')
         return json(await sql`SELECT id,name,icon,color,cover_url FROM categories WHERE is_active=true ORDER BY position`);
       if (url.pathname === '/api/public/books' && request.method === 'GET')
@@ -744,6 +754,10 @@ export default {
           const bookUp = await sql`UPDATE books SET views = views + 1 WHERE id = ${b.book_id}`;
           if (bookUp.rowCount > 0) {
             await sql`INSERT INTO view_events (device_id, book_id, created_at) VALUES (${dId},${b.book_id},NOW())`;
+            const bk = await sql`SELECT title FROM books WHERE id = ${b.book_id} LIMIT 1`;
+            if (bk.length) {
+              await sql`UPDATE stories SET views = views + 1 WHERE title = ${bk[0].title}`;
+            }
           } else {
             await sql`UPDATE stories SET views = views + 1 WHERE id = ${b.book_id}`;
           }
@@ -1461,7 +1475,11 @@ export default {
             sql`SELECT COUNT(*)::int AS n FROM stories WHERE writer_id=${writerId} AND status='published'`,
             sql`SELECT COUNT(*)::int AS n FROM stories WHERE writer_id=${writerId} AND status='pending'`,
           ]);
-          const publishedStories = await sql`SELECT id,title,views,cover_url,created_at,updated_at FROM stories WHERE writer_id=${writerId} AND status='published' ORDER BY views DESC`;
+          const publishedStories = await sql`
+            SELECT s.id,s.title,s.views,s.cover_url,s.created_at,s.updated_at,
+            (SELECT COALESCE(bk.likes,0) FROM books bk WHERE bk.title=s.title LIMIT 1) AS likes,
+            (SELECT COUNT(*)::int FROM comments c WHERE c.book_id IN (SELECT id FROM books WHERE title=s.title) AND c.status='approved') AS comment_count
+            FROM stories s WHERE s.writer_id=${writerId} AND s.status='published' ORDER BY s.views DESC`;
           const todayViews = await sql`SELECT COALESCE(SUM(views),0)::int AS n FROM stories WHERE writer_id=${writerId} AND updated_at >= CURRENT_DATE`;
           const weekViews = await sql`SELECT COALESCE(SUM(views),0)::int AS n FROM stories WHERE writer_id=${writerId} AND updated_at >= CURRENT_DATE - INTERVAL '7 days'`;
           const monthViews = await sql`SELECT COALESCE(SUM(views),0)::int AS n FROM stories WHERE writer_id=${writerId} AND updated_at >= CURRENT_DATE - INTERVAL '30 days'`;
