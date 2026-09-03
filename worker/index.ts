@@ -1035,7 +1035,7 @@ export default {
       }
 
       // --- Writer Verify Email Code ---
-      if (url.pathname === '/api/public/writers/verify' && request.method === 'POST') {
+      if (url.pathname === '/api/public/writers/verify-code' && request.method === 'POST') {
         const b = await request.json() as { email?: string; code?: string };
         const email = (b.email || '').trim().toLowerCase();
         const code = (b.code || '').trim();
@@ -1056,7 +1056,7 @@ export default {
       }
 
       // --- Writer Resend Verification Code ---
-      if (url.pathname === '/api/public/writers/resend' && request.method === 'POST') {
+      if (url.pathname === '/api/public/writers/resend-code' && request.method === 'POST') {
         const b = await request.json() as { email?: string };
         const email = (b.email || '').trim().toLowerCase();
         if (!email) return json({ error: 'invalid_email' }, 400);
