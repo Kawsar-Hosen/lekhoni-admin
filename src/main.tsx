@@ -28,6 +28,10 @@ interface Book {
   featured?: boolean;
   home_section?: string;
   views_visible?: boolean;
+  pdf_url?: string;
+  dedication?: string;
+  author_name?: string;
+  show_ads?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -43,6 +47,7 @@ interface Chapter {
   created_at: string;
   updated_at: string;
   book_title?: string;
+  reward_ad?: boolean;
 }
 
 interface Category {
@@ -729,6 +734,20 @@ function ChaptersPage({ onToast }: { onToast: (m: string) => void }) {
     }
   };
 
+  const toggleRewardAd = async (ch: Chapter) => {
+    const newRewardAd = !ch.reward_ad;
+    try {
+      await api(`/api/admin/chapters/${ch.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ reward_ad: newRewardAd }),
+      });
+      setChapters(prev => prev.map(c => c.id === ch.id ? { ...c, reward_ad: newRewardAd } : c));
+      onToast(`Chapter ${newRewardAd ? 'locked' : 'unlocked'}`);
+    } catch {
+      onToast('Failed to update chapter');
+    }
+  };
+
   const filtered = chapters.filter(c =>
     c.title?.toLowerCase().includes(search.toLowerCase()) ||
     (c.book_title || '').toLowerCase().includes(search.toLowerCase())
@@ -780,6 +799,16 @@ function ChaptersPage({ onToast }: { onToast: (m: string) => void }) {
                   </u>
                 </span>
                 <span>Pos. {ch.position}</span>
+                <span>
+                  <u
+                    className={ch.reward_ad ? 'draft' : ''}
+                    style={{ cursor: 'pointer', color: ch.reward_ad ? '#8B5CF6' : undefined }}
+                    onClick={() => toggleRewardAd(ch)}
+                    title={`Click to toggle reward ad`}
+                  >
+                    {ch.reward_ad ? '🔒 Locked' : '🔓 Free'}
+                  </u>
+                </span>
                 <span>{formatNumber(ch.views)} views</span>
                 <span>
                   <button style={{ background: 'none', border: 'none', color: '#e15e4e', cursor: 'pointer', padding: 2 }} onClick={() => deleteChapter(ch)} title="Delete">
@@ -1931,6 +1960,11 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
   const [coverPreview, setCoverPreview] = useState(editItem?.cover_url || '');
   const [categories, setCategories] = useState<Category[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const [pdfUrl, setPdfUrl] = useState((editItem as any)?.pdf_url || '');
+  const [authorName, setAuthorName] = useState((editItem as any)?.author_name || '');
+  const [dedication, setDedication] = useState((editItem as any)?.dedication || '');
+  const [showAds, setShowAds] = useState(editItem?.show_ads !== false);
+  const [pdfRewardAd, setPdfRewardAd] = useState((editItem as any)?.pdf_reward_ad !== false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -1975,6 +2009,11 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
         cover_url: coverUrl,
         category_id: categoryId || undefined,
         status,
+        pdf_url: pdfUrl.trim(),
+        author_name: authorName.trim(),
+        dedication: dedication.trim(),
+        show_ads: showAds,
+        pdf_reward_ad: pdfRewardAd,
       };
 
       if (editItem) {
@@ -2076,6 +2115,82 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
             />
           </div>
         )}
+        <label className="upload" style={pdfUrl ? { borderStyle: 'solid', borderColor: '#8B5CF6' } : {}}>
+          <CloudUpload />
+          <span>{pdfUrl ? 'PDF selected - click to change' : 'Upload PDF file'}</span>
+          <small>PDF · max 50MB · stored in Cloudflare R2</small>
+          <input
+            type="file"
+            accept=".pdf,application/pdf"
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              setSubmitting(true);
+              try {
+                const fd = new FormData();
+                fd.append('file', file);
+                const res = await fetch(`${API_BASE}/api/upload-pdf`, { method: 'POST', body: fd });
+                if (!res.ok) throw new Error('Upload failed');
+                const data = await res.json();
+                setPdfUrl(data.url || '');
+                onToast('PDF uploaded');
+              } catch { onToast('PDF upload failed'); }
+              setSubmitting(false);
+            }}
+          />
+        </label>
+        {pdfUrl && (
+          <div style={{ marginTop: 8, padding: 8, background: '#F3F4F6', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 13, color: '#374151', flex: 1, wordBreak: 'break-all' }}>{pdfUrl}</span>
+            <button type="button" onClick={() => setPdfUrl('')} style={{ background: 'none', border: 'none', color: '#EF4444', cursor: 'pointer', padding: 4 }}><X size={14} /></button>
+          </div>
+        )}
+        <label>
+          Or PDF URL <small style={{ color: '#6B7280' }}>(if file is hosted elsewhere)</small>
+          <input
+            placeholder="https://example.com/file.pdf"
+            value={pdfUrl}
+            onChange={e => setPdfUrl(e.target.value)}
+          />
+        </label>
+        <div className="form-grid">
+          <label>
+            Author Name <small style={{ color: '#6B7280' }}>(for PDF)</small>
+            <input
+              placeholder="লেখকের নাম (PDF-এর জন্য)"
+              value={authorName}
+              onChange={e => setAuthorName(e.target.value)}
+            />
+          </label>
+          <label>
+            Dedication <small style={{ color: '#6B7280' }}>(optional)</small>
+            <input
+              placeholder="যাকে উৎসর্গ করতে চান"
+              value={dedication}
+              onChange={e => setDedication(e.target.value)}
+            />
+          </label>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0', borderTop: '1px solid #E5E7EB', marginTop: 8 }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>Show Ads</div>
+            <div style={{ fontSize: 12, color: '#6B7280' }}>Interstitial ad before reading</div>
+          </div>
+          <button type="button" onClick={() => setShowAds(!showAds)} style={{ width: 48, height: 26, borderRadius: 13, border: 'none', background: showAds ? '#10B981' : '#D1D5DB', cursor: 'pointer', position: 'relative', transition: 'background 0.2s' }}>
+            <span style={{ position: 'absolute', top: 3, left: showAds ? 25 : 3, width: 20, height: 20, borderRadius: 10, background: '#fff', transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
+          </button>
+        </div>
+        {pdfUrl && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0', borderTop: '1px solid #E5E7EB' }}>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>PDF Reward Ad</div>
+              <div style={{ fontSize: 12, color: '#6B7280' }}>Watch ad to open PDF</div>
+            </div>
+            <button type="button" onClick={() => setPdfRewardAd(!pdfRewardAd)} style={{ width: 48, height: 26, borderRadius: 13, border: 'none', background: pdfRewardAd ? '#8B5CF6' : '#D1D5DB', cursor: 'pointer', position: 'relative', transition: 'background 0.2s' }}>
+              <span style={{ position: 'absolute', top: 3, left: pdfRewardAd ? 25 : 3, width: 20, height: 20, borderRadius: 10, background: '#fff', transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
+            </button>
+          </div>
+        )}
         <div className="modal-actions">
           <button type="button" onClick={close} disabled={submitting}>Cancel</button>
           <button className="primary" type="submit" disabled={submitting}>
@@ -2096,6 +2211,7 @@ function ChapterModal({ close, onToast }: { close: () => void; onToast: (m: stri
   const [body, setBody] = useState('');
   const [position, setPosition] = useState(1);
   const [status, setStatus] = useState('draft');
+  const [rewardAd, setRewardAd] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
@@ -2120,6 +2236,7 @@ function ChapterModal({ close, onToast }: { close: () => void; onToast: (m: stri
           body,
           position: Number(position),
           status,
+          reward_ad: rewardAd,
         }),
       });
       onToast('Chapter created');
@@ -2186,6 +2303,15 @@ function ChapterModal({ close, onToast }: { close: () => void; onToast: (m: stri
             onChange={e => setBody(e.target.value)}
           />
         </label>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0', borderTop: '1px solid #E5E7EB' }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>Reward Ad</div>
+            <div style={{ fontSize: 12, color: '#6B7280' }}>Lock chapter + show ad to unlock</div>
+          </div>
+          <button type="button" onClick={() => setRewardAd(!rewardAd)} style={{ width: 48, height: 26, borderRadius: 13, border: 'none', background: rewardAd ? '#8B5CF6' : '#D1D5DB', cursor: 'pointer', position: 'relative', transition: 'background 0.2s' }}>
+            <span style={{ position: 'absolute', top: 3, left: rewardAd ? 25 : 3, width: 20, height: 20, borderRadius: 10, background: '#fff', transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
+          </button>
+        </div>
         <div className="modal-actions">
           <button type="button" onClick={close} disabled={submitting}>Cancel</button>
           <button className="primary" type="submit" disabled={submitting}>
@@ -2600,10 +2726,11 @@ function ChartArea({ data }: { data: { date: string; views: number }[] }) {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-function formatNumber(n: number): string {
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
-  return String(n);
+function formatNumber(n: number | string): string {
+  const num = Number(n);
+  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+  if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+  return String(num);
 }
 
 function stringToColor(str: string): string {
