@@ -149,6 +149,10 @@ async function api<T = any>(path: string, options: RequestInit = {}): Promise<T>
   if (!(options.body instanceof FormData)) {
     headers['Content-Type'] = 'application/json';
   }
+  try {
+    const s = localStorage.getItem('lekhoni_admin_secret');
+    if (s) headers['Authorization'] = 'Bearer ' + s;
+  } catch {}
   const res = await fetch(url, { ...options, headers: { ...headers, ...options.headers as Record<string, string> } });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -251,6 +255,9 @@ function TermsWebPage() {
 
 function App() {
   const [page, setPage] = useState<Page>('Dashboard');
+  const [secret, setSecret] = useState<string>(() => { try { return localStorage.getItem('lekhoni_admin_secret') || ''; } catch { return ''; } });
+  const [secretInput, setSecretInput] = useState('');
+  const [secretErr, setSecretErr] = useState('');
   const [modal, setModal] = useState<string | null>(null);
   const [toast, setToast] = useState('');
   const [pendingComments, setPendingComments] = useState(0);
@@ -262,6 +269,26 @@ function App() {
 
   // Terms page route
   if (window.location.pathname === '/terms') return <TermsWebPage />;
+
+  const saveSecret = () => {
+    const v = secretInput.trim();
+    if (!v) { setSecretErr('Enter the admin secret'); return; }
+    try { localStorage.setItem('lekhoni_admin_secret', v); } catch {}
+    setSecret(v); setSecretInput(''); setSecretErr('');
+  };
+  const clearSecret = () => { try { localStorage.removeItem('lekhoni_admin_secret'); } catch {} setSecret(''); };
+  if (!secret) return (
+    <div className="shell" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+      <div style={{ maxWidth: 360, width: '100%', padding: 24, textAlign: 'center' }}>
+        <div className="mark" style={{ margin: '0 auto 12px' }}>ল</div>
+        <h2>Admin Login</h2>
+        <p style={{ opacity: 0.7 }}>Enter the ADMIN_SECRET to manage Lekhoni Kahini.</p>
+        <input type="password" value={secretInput} onChange={e => setSecretInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') saveSecret(); }} placeholder="Admin secret" style={{ width: '100%', padding: '10px 12px', margin: '12px 0', borderRadius: 8, border: '1px solid #ccc' }} />
+        {secretErr && <p style={{ color: 'red' }}>{secretErr}</p>}
+        <button onClick={saveSecret} style={{ width: '100%', padding: '10px', borderRadius: 8, cursor: 'pointer' }}>Unlock</button>
+      </div>
+    </div>
+  );
 
   // Request browser notification permission
   useEffect(() => {
@@ -329,6 +356,7 @@ function App() {
         <div className="brand">
           <div className="mark">ল</div>
           <div><strong>Lekhoni</strong><small>CONTENT STUDIO</small></div>
+          <button onClick={clearSecret} title="Lock admin" style={{ marginLeft: 'auto', cursor: 'pointer', background: 'none', border: 'none', fontSize: 16 }}>🔒</button>
         </div>
         <nav>
           {nav.map(([label, Icon]) => (
