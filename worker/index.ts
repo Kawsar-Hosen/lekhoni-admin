@@ -1625,7 +1625,7 @@ export default {
           const form = await request.formData();
           const file = form.get('file');
           if (!(file instanceof File)) return json({ error: 'PDF required' }, 400);
-          if (!file.name.toLowerCase().endsWith('.pdf') || file.type !== 'application/pdf') return json({ error: 'Only PDF files allowed' }, 400);
+          if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf' && !(file.type||'').includes('pdf')) return json({ error: 'Only PDF files allowed' }, 400);
           if (file.size > 50 * 1024 * 1024) return json({ error: 'PDF must be under 50MB' }, 400);
           const key = `writers/${writerId}/pdfs/${crypto.randomUUID()}.pdf`;
           await env.MEDIA.put(key, file.stream(), { httpMetadata: { contentType: 'application/pdf' } });
