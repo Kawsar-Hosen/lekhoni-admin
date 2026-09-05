@@ -41,6 +41,10 @@ export default {
     if (url.pathname === '/api/health') return json({ ok: true, service: 'lekhoni-admin-api', database: Boolean(env.DATABASE_URL) }, 200, env.ALLOWED_ORIGIN);
 
     try {
+      // Admin gate FIRST: every /api/admin/* (incl. migrations) requires ADMIN_SECRET.
+      if (url.pathname === '/api/admin/migrate' || url.pathname === '/api/admin/migrate-verification' || url.pathname.startsWith('/api/admin/')) {
+        if (!adminAuthed(request, env)) return json({ error: 'Unauthorized' }, 401);
+      }
       // --- DB Migration (run once) ---
       if (url.pathname === '/api/admin/migrate' && request.method === 'POST') {
         if (!env.DATABASE_URL) return json({ error: 'No DB' }, 503);
@@ -138,15 +142,19 @@ export default {
         return json({ ok: true, message: 'Verification migration applied' });
       }
 
-      // --- R2 Media Upload ---
+      // --- R2 Media Upload (writer JWT or admin) ---
       if (url.pathname === '/api/media' && request.method === 'POST') {
+        const ab = request.headers.get('Authorization')?.match(/^Bearer (.+)$/)?.[1] || '';
+        const writerOk = ab ? await verifyJWT(ab) : null;
+        if (!adminAuthed(request, env) && !writerOk?.id) return json({ error: 'Unauthorized' }, 401);
         const form = await request.formData(); const file = form.get('file');
         if (!file || typeof file === 'string') return json({ error: 'Image is required' }, 400);
         const fileName = (file as any).name || 'upload.jpg';
         const fileType = (file as any).type || 'image/jpeg';
         const fileSize = (file as any).size || 0;
         if (fileSize > 10 * 1024 * 1024) return json({ error: 'Only images up to 10MB are allowed' }, 400);
-        const ext = fileName.split('.').pop()?.replace(/[^a-z0-9]/gi, '') || 'jpg';
+        const ext = (fileName.split('.').pop()?.replace(/[^a-z0-9]/gi, '') || 'jpg').toLowerCase();
+        if (!['jpg','jpeg','png','webp'].includes(ext) || !fileType.startsWith('image/')) return json({ error: 'Only image files allowed' }, 400);
         const key = `books/${crypto.randomUUID()}.${ext}`;
         await env.MEDIA.put(key, (file as any).stream ? (file as any).stream() : file as any, { httpMetadata: { contentType: fileType } });
         return json({ key, url: `${env.MEDIA_PUBLIC_URL}/${key}` }, 201);
@@ -154,12 +162,14 @@ export default {
 
       // PDF upload endpoint (max 50MB)
       if (url.pathname === '/api/upload-pdf' && request.method === 'POST') {
+        if (!adminAuthed(request, env)) return json({ error: 'Unauthorized' }, 401);
         const form = await request.formData(); const file = form.get('file');
         if (!file || typeof file === 'string') return json({ error: 'PDF file is required' }, 400);
         const fileName = (file as any).name || 'document.pdf';
         const fileType = (file as any).type || 'application/pdf';
         const fileSize = (file as any).size || 0;
         if (fileSize > 50 * 1024 * 1024) return json({ error: 'PDF up to 50MB allowed' }, 400);
+        if (!fileName.toLowerCase().endsWith('.pdf') && fileType !== 'application/pdf' && !(fileType||'').includes('pdf')) return json({ error: 'Only PDF files allowed' }, 400);
         const key = `pdfs/${crypto.randomUUID()}.pdf`;
         await env.MEDIA.put(key, (file as any).stream ? (file as any).stream() : file as any, { httpMetadata: { contentType: fileType } });
         return json({ key, url: `${env.MEDIA_PUBLIC_URL}/${key}` }, 201);
@@ -169,10 +179,7 @@ export default {
       const sql = neon(env.DATABASE_URL);
 
       // ==================== ADMIN ROUTES ====================
-      // All /api/admin/* require ADMIN_SECRET. Fail-closed when unconfigured.
-      if (url.pathname === '/api/admin/migrate' || url.pathname === '/api/admin/migrate-verification' || url.pathname.startsWith('/api/admin/')) {
-        if (!adminAuthed(request, env)) return json({ error: 'Unauthorized' }, 401);
-      }
+      // (gated at top of try: all /api/admin/* require ADMIN_SECRET)
 
       // --- Categories CRUD ---
       if (url.pathname === '/api/admin/categories' && request.method === 'GET')
@@ -329,6 +336,9 @@ export default {
         await sql`DELETE FROM comments WHERE device_id::text=${dk}`;
         await sql`DELETE FROM follows WHERE device_id=${pk}`;
         await sql`DELETE FROM view_events WHERE device_id=${pk}`;
+        await sql`DELETE FROM reactions WHERE device_id=${pk}`;
+        await sql`DELETE FROM story_reports WHERE device_id=${dk}`;
+        try { await sql`DELETE FROM notifications WHERE device_id=${pk} OR device_id=${dk}`; } catch(e) {}
         await sql`DELETE FROM user_state WHERE device_key=${dk}`;
         await sql`DELETE FROM devices WHERE id=${pk}`;
         return json({ ok: true });
@@ -750,6 +760,7 @@ export default {
       // ==================== PUBLIC MOBILE APP ROUTES ====================
 
       if (url.pathname === '/api/public/sync-views' && request.method === 'POST') {
+        if (!adminAuthed(request, env)) return json({ error: 'Unauthorized' }, 401);
         const allBooks = await sql`SELECT title, author, views FROM books WHERE views > 0`;
         let synced = 0;
         for (const bk of allBooks) {
@@ -1140,14 +1151,17 @@ export default {
         const b = await request.json() as { credential?: string };
         if (!b.credential) return json({ error: 'Google credential required' }, 400);
         try {
-          const resp = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${b.credential}`);
+          const resp = await fetch('https://oauth2.googleapis.com/tokeninfo', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'id_token=' + encodeURIComponent(b.credential) });
           if (!resp.ok) return json({ error: 'Invalid Google token' }, 401);
-          const payload = await resp.json() as { sub?: string; email?: string; name?: string; picture?: string; aud?: string };
+          const payload = await resp.json() as { sub?: string; email?: string; name?: string; picture?: string; aud?: string; iss?: string; exp?: number; email_verified?: string };
           if (!payload.email) return json({ error: 'Google account has no email' }, 400);
           if (!payload.aud || !String(payload.aud).startsWith('940343114841-')) return json({ error: 'Invalid Google token audience' }, 401);
+          if (payload.iss !== 'accounts.google.com' && payload.iss !== 'https://accounts.google.com') return json({ error: 'Invalid Google token issuer' }, 401);
+          if (!payload.exp || payload.exp * 1000 < Date.now()) return json({ error: 'Expired Google token' }, 401);
+          if (payload.email_verified !== 'true') return json({ error: 'Google email not verified' }, 401);
           const email = payload.email.toLowerCase();
           const googleId = payload.sub;
-          const avatarUrl = payload.picture || null;
+          const avatarUrl = (payload.picture && payload.picture.startsWith('https://') ? payload.picture : '').slice(0, 2048) || null;
           const writerName = validateWriterName(payload.name || '') || email.split('@')[0].replace(/[^a-z0-9_]/g, '').slice(0, 20) || 'Lekhoni Writer';
           // Check existing writer by email
           const existing = await sql`SELECT id,username,writer_name,email,bio,avatar_url,follower_count,created_at FROM writers WHERE email=${email} AND is_active=true`;
@@ -1174,7 +1188,7 @@ export default {
             throw e;
           }
         } catch (e: any) {
-          return json({ error: e.message || 'Google auth failed' }, 500);
+          return json({ error: 'Google auth failed' }, 500);
         }
       }
 
@@ -1188,7 +1202,9 @@ export default {
           await sql`DELETE FROM comments WHERE device_id=${dId}`;
           await sql`DELETE FROM follows WHERE device_id=${dId}`;
           await sql`DELETE FROM view_events WHERE device_id=${dId}`;
+          await sql`DELETE FROM reactions WHERE device_id=${dId}`;
           await sql`DELETE FROM story_reports WHERE device_id=${b.device_key}`;
+          try { await sql`DELETE FROM notifications WHERE device_id=${dId} OR device_id=${b.device_key}`; } catch(e) {}
           await sql`DELETE FROM devices WHERE id=${dId}`;
         }
         await sql`DELETE FROM user_state WHERE device_key=${b.device_key}`;
