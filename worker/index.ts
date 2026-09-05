@@ -1355,15 +1355,15 @@ export default {
             return json({ ...story[0], chapters });
           }
           if (request.method === 'PUT') {
-            const b = await request.json() as { title?: string; description?: string; status?: string; category?: string; display_status?: string; writer_status?: string; cover_url?: string; dedication?: string; author_name?: string };
+            const b = await request.json() as { title?: string; description?: string; status?: string; category?: string; display_status?: string; writer_status?: string; cover_url?: string; dedication?: string; author_name?: string; pdf_url?: string };
             const oldRow = await sql`SELECT title FROM stories WHERE id=${storyId}`;
             const oldTitle = oldRow.length ? oldRow[0].title : '';
-            await sql`UPDATE stories SET title=COALESCE(${b.title},title),description=COALESCE(${b.description},description),status=COALESCE(${b.status},status),category=COALESCE(${b.category},category),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),cover_url=COALESCE(${b.cover_url},cover_url),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),updated_at=NOW() WHERE id=${storyId}`;
+            await sql`UPDATE stories SET title=COALESCE(${b.title},title),description=COALESCE(${b.description},description),status=COALESCE(${b.status},status),category=COALESCE(${b.category},category),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),cover_url=COALESCE(${b.cover_url},cover_url),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),updated_at=NOW() WHERE id=${storyId}`;
             const newTitle = b.title || oldTitle;
             if (oldTitle) {
               const bkMatch = await sql`SELECT id FROM books WHERE title=${oldTitle} AND author=(SELECT writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}) LIMIT 1`;
               if (bkMatch.length) {
-                await sql`UPDATE books SET title=${newTitle},description=COALESCE(${b.description},description),cover_url=COALESCE(${b.cover_url},cover_url),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),updated_at=NOW() WHERE id=${bkMatch[0].id}`;
+                await sql`UPDATE books SET title=${newTitle},description=COALESCE(${b.description},description),cover_url=COALESCE(${b.cover_url},cover_url),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),updated_at=NOW() WHERE id=${bkMatch[0].id}`;
               }
             }
             if (b.status === 'published') {
