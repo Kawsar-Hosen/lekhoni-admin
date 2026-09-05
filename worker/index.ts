@@ -1,6 +1,6 @@
 import { neon } from '@neondatabase/serverless';
 
-export interface Env { DATABASE_URL: string; MEDIA: R2Bucket; ALLOWED_ORIGIN: string; MEDIA_PUBLIC_URL: string; MAIL_WEBHOOK_URL?: string; MAIL_WEBHOOK_SECRET?: string; JWT_SECRET?: string }
+export interface Env { DATABASE_URL: string; MEDIA: R2Bucket; ALLOWED_ORIGIN: string; MEDIA_PUBLIC_URL: string; MAIL_WEBHOOK_URL?: string; MAIL_WEBHOOK_SECRET?: string; JWT_SECRET?: string; ADMIN_SECRET?: string }
 const corsHeaders = (origin: string) => ({ 'content-type': 'application/json', 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type', 'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS' });
 const json = (data: unknown, status = 200, origin = '*') => new Response(JSON.stringify(data), { status, headers: corsHeaders(origin) });
 
@@ -19,6 +19,20 @@ async function sendVerificationMail(env: Env, to: string, code: string, kind?: s
 }
 
 function uuid(id: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id); }
+
+// Admin auth: constant-time Bearer comparison. Fail-closed: no secret => deny all.
+function adminAuthed(request: Request, env: Env): boolean {
+  const s = (env as any).ADMIN_SECRET as string | undefined;
+  if (!s) return false;
+  const h = request.headers.get('Authorization') || '';
+  const m = h.match(/^Bearer (.+)$/);
+  if (!m) return false;
+  const a = m[1], b = s;
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -155,6 +169,10 @@ export default {
       const sql = neon(env.DATABASE_URL);
 
       // ==================== ADMIN ROUTES ====================
+      // All /api/admin/* require ADMIN_SECRET. Fail-closed when unconfigured.
+      if (url.pathname === '/api/admin/migrate' || url.pathname === '/api/admin/migrate-verification' || url.pathname.startsWith('/api/admin/')) {
+        if (!adminAuthed(request, env)) return json({ error: 'Unauthorized' }, 401);
+      }
 
       // --- Categories CRUD ---
       if (url.pathname === '/api/admin/categories' && request.method === 'GET')
@@ -497,7 +515,13 @@ export default {
       if (url.pathname === '/api/reports' && request.method === 'POST') {
         const b = await request.json() as { book_id: string; device_id?: string; reporter_name?: string; reason: string; details?: string };
         if (!b.book_id || !b.reason) return json({ error: 'Missing book_id or reason' }, 400);
-        await sql`INSERT INTO story_reports (book_id,device_id,reporter_name,reason,details) VALUES (${b.book_id},${b.device_id||''},${b.reporter_name||'Anonymous'},${b.reason},${b.details||''})`;
+        const REASONS = ['abusive','spam','hate','violence','inappropriate','plagiarism','misinfo','other'];
+        if (!REASONS.includes(b.reason)) return json({ error: 'Invalid reason' }, 400);
+        const details = (b.details || '').slice(0, 1000);
+        const reporter = (b.reporter_name || 'Anonymous').slice(0, 50);
+        const dupe = await sql`SELECT id FROM story_reports WHERE book_id=${b.book_id} AND device_id=${b.device_id||''} AND status='pending' LIMIT 1`;
+        if (dupe.length) return json({ ok: true, duplicate: true });
+        await sql`INSERT INTO story_reports (book_id,device_id,reporter_name,reason,details) VALUES (${b.book_id},${b.device_id||''},${reporter},${b.reason},${details})`;
         return json({ ok: true });
       }
       // --- Admin: Get Reports ---
@@ -841,6 +865,10 @@ export default {
         const bookId = pubComMatch[1];
         const b = await request.json() as { device_id?: string; name?: string; body?: string; avatar_url?: string };
         if (!b.device_id || !b.name || !b.body) return json({ error: 'device_id, name, body required' }, 400);
+        const cname = b.name.slice(0, 50), cbody = b.body.slice(0, 1000);
+        if (!cname.trim() || !cbody.trim()) return json({ error: 'Empty comment' }, 400);
+        const recent = await sql`SELECT id FROM comments WHERE book_id=${bookId} AND device_id=(SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1) AND created_at>NOW()-INTERVAL '10 minutes' LIMIT 5`;
+        if (recent.length >= 5) return json({ error: 'Too many comments — try later' }, 429);
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
         const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
         const dId = deviceRow.length ? deviceRow[0].id : null;
@@ -848,16 +876,16 @@ export default {
         const cfgRow = await sql`SELECT comments_approval FROM home_settings WHERE id=1 LIMIT 1`;
         const needsApproval = cfgRow[0]?.comments_approval !== false;
         const commentStatus = needsApproval ? 'pending' : 'approved';
-        const avatarUrl = b.avatar_url || '';
-        await sql`INSERT INTO comments (book_id, device_id, display_name, body, status, avatar_url, created_at) VALUES (${bookId},${dId},${b.name},${b.body},${commentStatus},${avatarUrl},NOW())`;
+        const avatarUrl = (b.avatar_url || '').slice(0, 2048);
+        await sql`INSERT INTO comments (book_id, device_id, display_name, body, status, avatar_url, created_at) VALUES (${bookId},${dId},${cname},${cbody},${commentStatus},${avatarUrl},NOW())`;
         // Send comment notification to book's writer
         try {
           const bookInfo = await sql`SELECT author,cover_url FROM books WHERE id=${bookId} LIMIT 1`;
           if (bookInfo.length) {
             const writerRow = await sql`SELECT id FROM writers WHERE writer_name=${bookInfo[0].author} LIMIT 1`;
             if (writerRow.length) {
-              const snippet = b.body.length > 40 ? b.body.slice(0, 40) + '...' : b.body;
-              await sql`INSERT INTO writer_notifications (writer_id,title,body,type,story_id,story_cover) VALUES (${writerRow[0].id},${'নতুন মন্তব্য'},${b.name+' আপনার "'+((await sql`SELECT title FROM books WHERE id=${bookId} LIMIT 1`)[0]?.title||'')+'" গল্পে মন্তব্য করেছেন: "'+snippet+'"'},'comment',${bookId},${bookInfo[0].cover_url||''})`;
+              const snippet = cbody.length > 40 ? cbody.slice(0, 40) + '...' : cbody;
+              await sql`INSERT INTO writer_notifications (writer_id,title,body,type,story_id,story_cover) VALUES (${writerRow[0].id},${'নতুন মন্তব্য'},${cname+' আপনার "'+((await sql`SELECT title FROM books WHERE id=${bookId} LIMIT 1`)[0]?.title||'')+'" গল্পে মন্তব্য করেছেন: "'+snippet+'"'},'comment',${bookId},${bookInfo[0].cover_url||''})`;
             }
           }
         } catch(e) { console.error('comment notification error', e); }
@@ -946,9 +974,10 @@ export default {
         return { hash, salt: s };
       }
 
-      // --- JWT ---
-      const JWT_SECRET = (env as any).JWT_SECRET || 'lekhoni-writer-jwt-secret-dev-only';
+      // --- JWT (fail-closed: never fall back to a dev secret) ---
+      const JWT_SECRET = (env as any).JWT_SECRET || '';
       async function createJWT(payload: Record<string, any>): Promise<string> {
+        if (!JWT_SECRET) throw new Error('JWT_SECRET not configured');
         const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
         const body = btoa(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 }));
         const data = `${header}.${body}`;
@@ -957,6 +986,7 @@ export default {
         return `${data}.${btoa(String.fromCharCode(...new Uint8Array(sig)))}`;
       }
       async function verifyJWT(token: string): Promise<Record<string, any> | null> {
+        if (!JWT_SECRET) return null;
         try {
           const [h, b, s] = token.split('.');
           const data = `${h}.${b}`;
@@ -1110,12 +1140,13 @@ export default {
         try {
           const resp = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${b.credential}`);
           if (!resp.ok) return json({ error: 'Invalid Google token' }, 401);
-          const payload = await resp.json() as { sub?: string; email?: string; name?: string; picture?: string };
+          const payload = await resp.json() as { sub?: string; email?: string; name?: string; picture?: string; aud?: string };
           if (!payload.email) return json({ error: 'Google account has no email' }, 400);
+          if (!payload.aud || !String(payload.aud).startsWith('940343114841-')) return json({ error: 'Invalid Google token audience' }, 401);
           const email = payload.email.toLowerCase();
           const googleId = payload.sub;
           const avatarUrl = payload.picture || null;
-          const writerName = payload.name || email.split('@')[0];
+          const writerName = validateWriterName(payload.name || '') || email.split('@')[0].replace(/[^a-z0-9_]/g, '').slice(0, 20) || 'Lekhoni Writer';
           // Check existing writer by email
           const existing = await sql`SELECT id,username,writer_name,email,bio,avatar_url,follower_count,created_at FROM writers WHERE email=${email} AND is_active=true`;
           if (existing.length) {
@@ -1143,6 +1174,23 @@ export default {
         } catch (e: any) {
           return json({ error: e.message || 'Google auth failed' }, 500);
         }
+      }
+
+      // --- Reader self-delete: erase all server data for a device_key ---
+      if (url.pathname === '/api/public/account' && request.method === 'DELETE') {
+        const b = await request.json() as { device_key?: string };
+        if (!b.device_key) return json({ error: 'device_key required' }, 400);
+        const dRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_key} LIMIT 1`;
+        const dId = dRow.length ? dRow[0].id : null;
+        if (dId) {
+          await sql`DELETE FROM comments WHERE device_id=${dId}`;
+          await sql`DELETE FROM follows WHERE device_id=${dId}`;
+          await sql`DELETE FROM view_events WHERE device_id=${dId}`;
+          await sql`DELETE FROM story_reports WHERE device_id=${b.device_key}`;
+          await sql`DELETE FROM devices WHERE id=${dId}`;
+        }
+        await sql`DELETE FROM user_state WHERE device_key=${b.device_key}`;
+        return json({ ok: true });
       }
 
       // --- Writer Verify Token ---
@@ -1244,8 +1292,8 @@ export default {
         if (ins.length > 0) {
           await sql`UPDATE writers SET follower_count = (SELECT COUNT(*)::int FROM follows WHERE writer_id = ${b.writer_id}) WHERE id = ${b.writer_id}`;
           if (b.follower_writer_id && uuid(b.follower_writer_id)) {
-            const fw = await sql`SELECT writer_name,profile_image FROM writers WHERE id=${b.follower_writer_id} LIMIT 1`;
-            if (fw.length) await sql`INSERT INTO writer_notifications (writer_id,title,body,type,url,avatar_url) VALUES (${b.writer_id},${'নতুন অনুসারক'},${fw[0].writer_name+' আপনাকে ফলো করেছেন'},'follow',${b.follower_writer_id},${fw[0].profile_image||''})`;
+            const fw = await sql`SELECT writer_name,avatar_url FROM writers WHERE id=${b.follower_writer_id} LIMIT 1`;
+            if (fw.length) await sql`INSERT INTO writer_notifications (writer_id,title,body,type,url,avatar_url) VALUES (${b.writer_id},${'নতুন অনুসারক'},${fw[0].writer_name+' আপনাকে ফলো করেছেন'},'follow',${b.follower_writer_id},${fw[0].avatar_url||''})`;
           } else if (b.follower_user_id && uuid(b.follower_user_id)) {
             const fu = await sql`SELECT display_name,avatar_url FROM users WHERE id=${b.follower_user_id} LIMIT 1`;
             if (fu.length) await sql`INSERT INTO writer_notifications (writer_id,title,body,type,url,avatar_url) VALUES (${b.writer_id},${'নতুন অনুসারক'},${fu[0].display_name+' আপনাকে ফলো করেছেন'},'follow',${b.follower_user_id},${fu[0].avatar_url||''})`;
@@ -1268,7 +1316,7 @@ export default {
       if (url.pathname === '/api/writer/followers' && request.method === 'GET') {
         const writerUserMatch = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
         if (!writerUserMatch) return json({ error: 'Unauthorized' }, 401);
-        const payload = jwtVerify(writerUserMatch[1], env.JWT_SECRET);
+        const payload = await verifyJWT(writerUserMatch[1]);
         if (!payload?.id) return json({ error: 'Invalid token' }, 401);
         const followers = await sql`SELECT DISTINCT w.id,w.username,w.writer_name,w.bio,w.avatar_url,w.follower_count,w.badge FROM follows f JOIN writers w ON f.follower_writer_id=w.id WHERE f.writer_id=${payload.id} AND f.follower_writer_id IS NOT NULL AND w.is_active=true ORDER BY f.created_at DESC`;
         return json(followers);
@@ -1387,14 +1435,11 @@ export default {
             const stDel = await sql`SELECT s.title,s.cover_url,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}`;
             const wName = stDel.length ? stDel[0].writer_name : (await sql`SELECT writer_name FROM writers WHERE id=${writerId}`)[0]?.writer_name || '';
             const sTitle = stDel.length ? stDel[0].title : '';
-            const sCover = stDel.length ? stDel[0].cover_url : '';
             await sql`DELETE FROM story_chapters WHERE story_id=${storyId}`;
             await sql`DELETE FROM stories WHERE id=${storyId}`;
             if (wName) {
-              let bkDel = sTitle ? await sql`SELECT id FROM books WHERE title=${sTitle} AND author=${wName} LIMIT 1` : [];
-              if (!bkDel.length && sCover) bkDel = await sql`SELECT id FROM books WHERE cover_url=${sCover} AND author=${wName} LIMIT 1`;
-              if (!bkDel.length && sTitle) bkDel = await sql`SELECT id FROM books WHERE author=${wName} AND title ILIKE ${'%' + sTitle + '%'} LIMIT 1`;
-              if (!bkDel.length) bkDel = await sql`SELECT id FROM books WHERE author=${wName} ORDER BY updated_at DESC LIMIT 1`;
+              // Exact match only — never fallback-delete another book.
+              const bkDel = (sTitle && wName) ? await sql`SELECT id FROM books WHERE title=${sTitle} AND author=${wName} LIMIT 1` : [];
               if (bkDel.length) {
                 await sql`DELETE FROM chapters WHERE book_id=${bkDel[0].id}`;
                 await sql`DELETE FROM books WHERE id=${bkDel[0].id}`;
@@ -1632,7 +1677,7 @@ export default {
                 const chapters = await sql`SELECT title,body,position FROM story_chapters WHERE story_id=${storySubmitMatch[1]} ORDER BY position`;
                 const existingChs = await sql`SELECT title FROM chapters WHERE book_id=${bookId}`;
                 const have = new Set(existingChs.map((e: any) => (e.title || '').trim()));
-                for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status,reward_ad) VALUES (${bookId},${c.title},${b.body||''},${c.position},'published')`; } catch (e) { console.error('auto-approve chapter insert failed', e); } }
+                for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status,reward_ad) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published')`; } catch (e) { console.error('auto-approve chapter insert failed', e); } }
               }
               // Notify all followers about new story
               try {
