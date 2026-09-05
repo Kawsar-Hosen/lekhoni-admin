@@ -865,6 +865,8 @@ export default {
         const bookId = pubComMatch[1];
         const b = await request.json() as { device_id?: string; name?: string; body?: string; avatar_url?: string };
         if (!b.device_id || !b.name || !b.body) return json({ error: 'device_id, name, body required' }, 400);
+        const bkExists = await sql`SELECT id FROM books WHERE id=${bookId} LIMIT 1`;
+        if (!bkExists.length) return json({ error: 'Book not found' }, 404);
         const cname = b.name.slice(0, 50), cbody = b.body.slice(0, 1000);
         if (!cname.trim() || !cbody.trim()) return json({ error: 'Empty comment' }, 400);
         const recent = await sql`SELECT id FROM comments WHERE book_id=${bookId} AND device_id=(SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1) AND created_at>NOW()-INTERVAL '10 minutes' LIMIT 5`;
