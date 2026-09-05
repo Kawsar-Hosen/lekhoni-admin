@@ -340,7 +340,7 @@ export default {
             bookId = existingBook[0].id;
             await sql`UPDATE books SET display_status=${s.display_status||''},writer_status=${s.writer_status||''},hide_title_on_cover=${s.hide_title_on_cover||false} WHERE id=${bookId}`;
           } else {
-            const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status,writer_status,hide_title_on_cover) VALUES (${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published',${s.display_status||''},${s.writer_status||''},${s.hide_title_on_cover||false}) RETURNING id`;
+                const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name) VALUES (${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published',${s.display_status||''},${s.writer_status||''},${s.hide_title_on_cover||false},${s.pdf_url||''},${s.dedication||''},${s.author_name||''}) RETURNING id`;
             bookId = bk[0]?.id || null;
           }
           if (bookId) {
@@ -639,9 +639,21 @@ export default {
         }
         return json({ error: 'Provide ids array or all:true' }, 400);
       }
-      // --- Admin: Writer Stories (all writers' stories for approval) ---
+         // --- Admin: Writer Stories (all writers' stories for approval) ---
+      if (url.pathname === '/api/admin/set-book-author' && request.method === 'POST') {
+        const b = await request.json() as { book_id?: string; author_name?: string };
+        if (!b.book_id || b.author_name === undefined) return json({ error: 'book_id and author_name required' }, 400);
+        await sql`UPDATE books SET author_name=${b.author_name} WHERE id=${b.book_id}`;
+        return json({ ok: true });
+      }
+      if (url.pathname === '/api/admin/resync-author-names' && request.method === 'POST') {
+        const r = await sql`UPDATE books SET author_name=s.author_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE books.title=s.title AND books.author=w.writer_name AND (books.author_name IS NULL OR books.author_name='') AND s.author_name IS NOT NULL AND s.author_name!=''`;
+        // Also fix stories that have empty author_name but books have it
+        const r2 = await sql`UPDATE stories SET author_name=books.author_name FROM books WHERE stories.title=books.title AND (stories.author_name IS NULL OR stories.author_name='') AND books.author_name IS NOT NULL AND books.author_name!=''`;
+        return json({ updated_books: r.rowCount, updated_stories: r2.rowCount });
+      }
       if (url.pathname === '/api/admin/stories' && request.method === 'GET')
-        return json(await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,s.chapters_count,s.review_note,s.created_at,s.updated_at,w.writer_name,w.username FROM stories s LEFT JOIN writers w ON s.writer_id=w.id ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 ELSE 2 END,s.updated_at DESC`);
+        return json(await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,s.chapters_count,s.review_note,s.author_name,s.created_at,s.updated_at,w.writer_name,w.username FROM stories s LEFT JOIN writers w ON s.writer_id=w.id ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 ELSE 2 END,s.updated_at DESC`);
       const adminStoryMatch = url.pathname.match(/^\/api\/admin\/stories\/([^/]+)$/);
       if (adminStoryMatch && request.method === 'PUT') {
         if (!uuid(adminStoryMatch[1])) return json({ error: 'Invalid ID' }, 400);
@@ -1654,12 +1666,13 @@ export default {
 
         // --- Writer Dashboard Stats ---
         if (url.pathname === '/api/writer/dashboard' && request.method === 'GET') {
-          const [storyCount, totalViews, followerCount, publishedCount, pendingCount] = await Promise.all([
+          const [storyCount, totalViews, followerCount, publishedCount, pendingCount, totalLikesAgg] = await Promise.all([
             sql`SELECT COUNT(*)::int AS n FROM stories WHERE writer_id=${writerId}`,
             sql`SELECT COALESCE(SUM(b.views),0)::int AS n FROM books b INNER JOIN stories s ON b.title = s.title WHERE s.writer_id=${writerId}`,
             sql`SELECT COUNT(*)::int AS n FROM follows WHERE writer_id=${writerId}`,
             sql`SELECT COUNT(*)::int AS n FROM stories WHERE writer_id=${writerId} AND status='published'`,
             sql`SELECT COUNT(*)::int AS n FROM stories WHERE writer_id=${writerId} AND status='pending'`,
+            sql`SELECT COALESCE(SUM(b.likes),0)::int AS n FROM books b INNER JOIN stories s ON b.title = s.title WHERE s.writer_id=${writerId}`,
           ]);
           const publishedStories = await sql`
             SELECT s.id,s.title,COALESCE((SELECT SUM(b2.views) FROM books b2 WHERE b2.title=s.title),0)::int AS views,s.cover_url,s.created_at,s.updated_at,
@@ -1671,6 +1684,7 @@ export default {
           const monthViews = await sql`SELECT COALESCE(SUM(b.views),0)::int AS n FROM books b INNER JOIN stories s ON b.title = s.title WHERE s.writer_id=${writerId} AND s.updated_at >= CURRENT_DATE - INTERVAL '30 days'`;
           return json({
             stories: storyCount[0].n, totalViews: totalViews[0].n, followers: followerCount[0].n,
+            totalLikes: totalLikesAgg[0].n,
             published: publishedCount[0].n, pending: pendingCount[0].n,
             publishedStories, todayViews: todayViews[0].n, weekViews: weekViews[0].n, monthViews: monthViews[0].n
           });
