@@ -270,11 +270,18 @@ function App() {
   // Terms page route
   if (window.location.pathname === '/terms') return <TermsWebPage />;
 
-  const saveSecret = () => {
+  const [verifying, setVerifying] = useState(false);
+  const saveSecret = async () => {
     const v = secretInput.trim();
     if (!v) { setSecretErr('Enter the admin secret'); return; }
+    setVerifying(true); setSecretErr('');
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/analytics`, { headers: { 'Authorization': 'Bearer ' + v } });
+      if (res.status === 401) { setSecretErr('ভুল secret — আবার যত্ন করে বসাও'); setVerifying(false); return; }
+      if (!res.ok) { setSecretErr('Server error (' + res.status + ') — পরে চেষ্টা করো'); setVerifying(false); return; }
+    } catch { setSecretErr('Network error — সংযোগ চেক করো'); setVerifying(false); return; }
     try { localStorage.setItem('lekhoni_admin_secret', v); } catch {}
-    setSecret(v); setSecretInput(''); setSecretErr('');
+    setSecret(v); setSecretInput(''); setSecretErr(''); setVerifying(false);
   };
   const clearSecret = () => { try { localStorage.removeItem('lekhoni_admin_secret'); } catch {} setSecret(''); };
 
@@ -326,7 +333,7 @@ function App() {
       setPendingNotifications(list.length);
     }).catch(() => {});
     return () => clearInterval(interval);
-  }, []);
+  }, [secret]);
 
   // Clear notification badge when on Notifications page
   useEffect(() => {
@@ -346,7 +353,7 @@ function App() {
         <p style={{ opacity: 0.7 }}>Enter the ADMIN_SECRET to manage Lekhoni Kahini.</p>
         <input type="password" value={secretInput} onChange={e => setSecretInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') saveSecret(); }} placeholder="Admin secret" style={{ width: '100%', padding: '10px 12px', margin: '12px 0', borderRadius: 8, border: '1px solid #ccc' }} />
         {secretErr && <p style={{ color: 'red' }}>{secretErr}</p>}
-        <button onClick={saveSecret} style={{ width: '100%', padding: '10px', borderRadius: 8, cursor: 'pointer' }}>Unlock</button>
+        <button onClick={saveSecret} disabled={verifying} style={{ width: '100%', padding: '10px', borderRadius: 8, cursor: 'pointer', opacity: verifying ? 0.6 : 1 }}>{verifying ? 'যাচাই হচ্ছে…' : 'Unlock'}</button>
       </div>
     </div>
   );
