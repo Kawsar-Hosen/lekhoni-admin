@@ -1207,6 +1207,7 @@ export default {
         const ip = request.headers.get('cf-connecting-ip') || '';
         const recent = await sql`SELECT COUNT(*)::int AS c FROM deletion_requests WHERE (contact=${contact} OR ip=${ip}) AND created_at > NOW() - INTERVAL '1 hour'`;
         if ((recent[0]?.c || 0) >= 3) return json({ error: 'too_many_attempts' }, 429);
+        await sql`CREATE TABLE IF NOT EXISTS deletion_requests (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), contact TEXT NOT NULL, identifier TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', ip TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`INSERT INTO deletion_requests (contact,identifier,details,ip) VALUES (${contact},${identifier},${details},${ip})`;
         return json({ ok: true }, 201);
       }
