@@ -1195,7 +1195,7 @@ export default {
             throw e;
           }
         } catch (e: any) {
-          return json({ error: 'Google auth failed [diag:' + String(e && e.message || 'unknown').slice(0, 120) + ']' }, 500);
+          return json({ error: 'Google auth failed' }, 500);
         }
       }
 
