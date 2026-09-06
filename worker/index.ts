@@ -15,7 +15,14 @@ function newCode(): string { const a = new Uint32Array(1); crypto.getRandomValue
 async function sendVerificationMail(env: Env, to: string, code: string, kind?: string): Promise<boolean> {
   const url = env.MAIL_WEBHOOK_URL, secret = env.MAIL_WEBHOOK_SECRET;
   if (!url) return false;
-  try { const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to, code, kind: kind || 'signup', secret: secret || '' }) }); return r.ok; } catch { return false; }
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to, code, kind: kind || 'signup', secret: secret || '' }), signal: controller.signal });
+      return r.ok;
+    } finally { clearTimeout(timer); }
+  } catch { return false; }
 }
 
 function uuid(id: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id); }
