@@ -87,6 +87,7 @@ export default {
         await sql`CREATE TABLE IF NOT EXISTS user_state (device_key TEXT PRIMARY KEY, settings JSONB NOT NULL DEFAULT '{}', favorites JSONB NOT NULL DEFAULT '[]', downloads JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]', positions JSONB NOT NULL DEFAULT '{}', bookmarks JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`CREATE TABLE IF NOT EXISTS about_content (id INT PRIMARY KEY DEFAULT 1, content JSONB NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`CREATE TABLE IF NOT EXISTS story_reports (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), book_id TEXT NOT NULL, device_id TEXT DEFAULT '', reporter_name TEXT DEFAULT 'Anonymous', reason TEXT NOT NULL, details TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', admin_note TEXT DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        await sql`CREATE TABLE IF NOT EXISTS deletion_requests (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), contact TEXT NOT NULL, identifier TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', ip TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS report_id UUID DEFAULT NULL`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS story_title TEXT DEFAULT ''`;
@@ -1195,6 +1196,34 @@ export default {
         }
       }
 
+      // --- Public: Account Deletion Request (web form, no login required) ---
+      if (url.pathname === '/api/public/deletion-requests' && request.method === 'POST') {
+        const b = await request.json() as { contact?: string; identifier?: string; details?: string };
+        const contact = (b.contact || '').trim().slice(0, 254);
+        const identifier = (b.identifier || '').trim().slice(0, 100);
+        const details = (b.details || '').trim().slice(0, 1000);
+        if (!contact || !identifier) return json({ error: 'contact and identifier required' }, 400);
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(contact) && identifier.length < 2) return json({ error: 'valid contact required' }, 400);
+        const ip = request.headers.get('cf-connecting-ip') || '';
+        const recent = await sql`SELECT COUNT(*)::int AS c FROM deletion_requests WHERE (contact=${contact} OR ip=${ip}) AND created_at > NOW() - INTERVAL '1 hour'`;
+        if ((recent[0]?.c || 0) >= 3) return json({ error: 'too_many_attempts' }, 429);
+        await sql`INSERT INTO deletion_requests (contact,identifier,details,ip) VALUES (${contact},${identifier},${details},${ip})`;
+        return json({ ok: true }, 201);
+      }
+      // --- Admin: List Deletion Requests ---
+      if (url.pathname === '/api/admin/deletion-requests' && request.method === 'GET') {
+        const status = url.searchParams.get('status') || 'pending';
+        return json(await sql`SELECT id,contact,identifier,details,status,created_at FROM deletion_requests WHERE status=${status} ORDER BY created_at DESC LIMIT 100`);
+      }
+      // --- Admin: Resolve Deletion Request ---
+      const delReqMatch = url.pathname.match(/^\/api\/admin\/deletion-requests\/([^/]+)$/);
+      if (delReqMatch && request.method === 'POST') {
+        if (!uuid(delReqMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        const b = await request.json() as { status?: string };
+        if (!b.status || !['done','rejected'].includes(b.status)) return json({ error: 'status must be done or rejected' }, 400);
+        await sql`UPDATE deletion_requests SET status=${b.status} WHERE id=${delReqMatch[1]}`;
+        return json({ ok: true });
+      }
       // --- Reader self-delete: erase all server data for a device_key ---
       if (url.pathname === '/api/public/account' && request.method === 'DELETE') {
         const b = await request.json() as { device_key?: string };
