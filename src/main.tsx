@@ -277,18 +277,6 @@ function App() {
     setSecret(v); setSecretInput(''); setSecretErr('');
   };
   const clearSecret = () => { try { localStorage.removeItem('lekhoni_admin_secret'); } catch {} setSecret(''); };
-  if (!secret) return (
-    <div className="shell" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
-      <div style={{ maxWidth: 360, width: '100%', padding: 24, textAlign: 'center' }}>
-        <div className="mark" style={{ margin: '0 auto 12px' }}>ল</div>
-        <h2>Admin Login</h2>
-        <p style={{ opacity: 0.7 }}>Enter the ADMIN_SECRET to manage Lekhoni Kahini.</p>
-        <input type="password" value={secretInput} onChange={e => setSecretInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') saveSecret(); }} placeholder="Admin secret" style={{ width: '100%', padding: '10px 12px', margin: '12px 0', borderRadius: 8, border: '1px solid #ccc' }} />
-        {secretErr && <p style={{ color: 'red' }}>{secretErr}</p>}
-        <button onClick={saveSecret} style={{ width: '100%', padding: '10px', borderRadius: 8, cursor: 'pointer' }}>Unlock</button>
-      </div>
-    </div>
-  );
 
   // Request browser notification permission
   useEffect(() => {
@@ -349,6 +337,19 @@ function App() {
   const openEdit = (type: string, item: any) => { setEditItem(item); setModal(type); };
   const closeModal = () => { setModal(null); setEditItem(null); };
   const showToast = (msg: string) => setToast(msg);
+
+  if (!secret) return (
+    <div className="shell" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+      <div style={{ maxWidth: 360, width: '100%', padding: 24, textAlign: 'center' }}>
+        <div className="mark" style={{ margin: '0 auto 12px' }}>ল</div>
+        <h2>Admin Login</h2>
+        <p style={{ opacity: 0.7 }}>Enter the ADMIN_SECRET to manage Lekhoni Kahini.</p>
+        <input type="password" value={secretInput} onChange={e => setSecretInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') saveSecret(); }} placeholder="Admin secret" style={{ width: '100%', padding: '10px 12px', margin: '12px 0', borderRadius: 8, border: '1px solid #ccc' }} />
+        {secretErr && <p style={{ color: 'red' }}>{secretErr}</p>}
+        <button onClick={saveSecret} style={{ width: '100%', padding: '10px', borderRadius: 8, cursor: 'pointer' }}>Unlock</button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="shell">
