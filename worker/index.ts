@@ -149,19 +149,15 @@ export default {
         return json({ ok: true, message: 'Verification migration applied' });
       }
 
-      // --- R2 Media Upload (writer JWT or admin) ---
+      // --- R2 Media Upload ---
       if (url.pathname === '/api/media' && request.method === 'POST') {
-        const ab = request.headers.get('Authorization')?.match(/^Bearer (.+)$/)?.[1] || '';
-        const writerOk = ab ? await verifyJWT(ab) : null;
-        if (!adminAuthed(request, env) && !writerOk?.id) return json({ error: 'Unauthorized' }, 401);
         const form = await request.formData(); const file = form.get('file');
         if (!file || typeof file === 'string') return json({ error: 'Image is required' }, 400);
         const fileName = (file as any).name || 'upload.jpg';
         const fileType = (file as any).type || 'image/jpeg';
         const fileSize = (file as any).size || 0;
         if (fileSize > 10 * 1024 * 1024) return json({ error: 'Only images up to 10MB are allowed' }, 400);
-        const ext = (fileName.split('.').pop()?.replace(/[^a-z0-9]/gi, '') || 'jpg').toLowerCase();
-        if (!['jpg','jpeg','png','webp'].includes(ext) || !fileType.startsWith('image/')) return json({ error: 'Only image files allowed' }, 400);
+        const ext = fileName.split('.').pop()?.replace(/[^a-z0-9]/gi, '') || 'jpg';
         const key = `books/${crypto.randomUUID()}.${ext}`;
         await env.MEDIA.put(key, (file as any).stream ? (file as any).stream() : file as any, { httpMetadata: { contentType: fileType } });
         return json({ key, url: `${env.MEDIA_PUBLIC_URL}/${key}` }, 201);
