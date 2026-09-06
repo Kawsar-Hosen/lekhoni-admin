@@ -1,7 +1,7 @@
 import { neon } from '@neondatabase/serverless';
 
 export interface Env { DATABASE_URL: string; MEDIA: R2Bucket; ALLOWED_ORIGIN: string; MEDIA_PUBLIC_URL: string; MAIL_WEBHOOK_URL?: string; MAIL_WEBHOOK_SECRET?: string; JWT_SECRET?: string; ADMIN_SECRET?: string }
-const corsHeaders = (origin: string) => ({ 'content-type': 'application/json', 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type', 'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS' });
+const corsHeaders = (origin: string) => ({ 'content-type': 'application/json', 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type, authorization', 'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS' });
 const json = (data: unknown, status = 200, origin = '*') => new Response(JSON.stringify(data), { status, headers: corsHeaders(origin) });
 
 const TEMP_MAIL_DOMAINS = ['mailinator.com','10minutemail.com','guerrillamail.com','yopmail.com','tempmail.com','throwawaymail.com','fakemail.net','trashmail.com','maildrop.cc','getnada.com','mohmal.com','sharklasers.com'];
