@@ -1225,6 +1225,30 @@ export default {
         await sql`UPDATE deletion_requests SET status=${b.status} WHERE id=${delReqMatch[1]}`;
         return json({ ok: true });
       }
+      // --- Public: Latest app version (update prompt) ---
+      if (url.pathname === '/api/public/app-version' && request.method === 'GET') {
+        await sql`CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        const rows = await sql`SELECT key,value FROM app_config WHERE key IN ('androidVersionCode','androidVersionName','forceUpdate')`;
+        const m: Record<string, string> = {};
+        for (const r of rows as any[]) m[r.key] = r.value;
+        return json({ androidVersionCode: parseInt(m.androidVersionCode || '0', 10) || 0, androidVersionName: m.androidVersionName || '', force: m.forceUpdate === '1' });
+      }
+      // --- Admin: Get/Set app version ---
+      if (url.pathname === '/api/admin/app-version' && request.method === 'GET') {
+        await sql`CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        const rows = await sql`SELECT key,value FROM app_config`;
+        const m: Record<string, string> = {};
+        for (const r of rows as any[]) m[r.key] = r.value;
+        return json(m);
+      }
+      if (url.pathname === '/api/admin/app-version' && (request.method === 'PUT' || request.method === 'POST')) {
+        const b = await request.json() as { androidVersionCode?: number; androidVersionName?: string; forceUpdate?: boolean };
+        await sql`CREATE TABLE IF NOT EXISTS app_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        if (b.androidVersionCode !== undefined) await sql`INSERT INTO app_config (key,value,updated_at) VALUES ('androidVersionCode',${String(Math.max(0, Math.floor(b.androidVersionCode)))},NOW()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()`;
+        if (b.androidVersionName !== undefined) await sql`INSERT INTO app_config (key,value,updated_at) VALUES ('androidVersionName',${String(b.androidVersionName).slice(0, 20)},NOW()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()`;
+        await sql`INSERT INTO app_config (key,value,updated_at) VALUES ('forceUpdate',${b.forceUpdate ? '1' : '0'},NOW()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()`;
+        return json({ ok: true });
+      }
       // --- Reader self-delete: erase all server data for a device_key ---
       if (url.pathname === '/api/public/account' && request.method === 'DELETE') {
         const b = await request.json() as { device_key?: string };
