@@ -27,6 +27,34 @@ async function sendVerificationMail(env: Env, to: string, code: string, kind?: s
 
 function uuid(id: string): boolean { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id); }
 
+// Short public book IDs: 8 chars, unambiguous alphabet (no 0/o/1/l).
+const SHORT_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
+function randomShortId(): string {
+  const buf = new Uint8Array(8);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => SHORT_ALPHABET[b % SHORT_ALPHABET.length]).join('');
+}
+// Mint a collision-free short_id for books (retry loop, 32^8 space).
+async function mintShortId(sql: any): Promise<string> {
+  for (let i = 0; i < 10; i++) {
+    const sid = randomShortId();
+    const ex = await sql`SELECT 1 FROM books WHERE short_id=${sid} LIMIT 1`;
+    if (!ex.length) return sid;
+  }
+  return randomShortId() + Date.now().toString(36).slice(-2);
+}
+// Resolve a public book key (short_id or UUID) to the internal UUID. Null if unknown.
+async function resolveBookId(sql: any, key: string): Promise<string | null> {
+  if (!key) return null;
+  if (uuid(key)) {
+    const r = await sql`SELECT id FROM books WHERE id=${key} LIMIT 1`;
+    return r.length ? (r[0].id as string) : null;
+  }
+  if (!/^[a-z0-9]{8}$/.test(key)) return null;
+  const r = await sql`SELECT id FROM books WHERE short_id=${key} LIMIT 1`;
+  return r.length ? (r[0].id as string) : null;
+}
+
 // Admin auth: constant-time Bearer comparison. Fail-closed: no secret => deny all.
 function adminAuthed(request: Request, env: Env): boolean {
   const s = (env as any).ADMIN_SECRET as string | undefined;
@@ -53,9 +81,23 @@ export default {
         if (!adminAuthed(request, env)) return json({ error: 'Unauthorized' }, 401);
       }
       // --- DB Migration (run once) ---
+      if (url.pathname === '/api/admin/migrate-shortid' && request.method === 'POST') {
+        if (!env.DATABASE_URL) return json({ error: 'No DB' }, 503);
+        const sql = neon(env.DATABASE_URL);
+        await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS short_id TEXT UNIQUE`;
+        // Single-statement backfill: md5(uuid) is unique per book (hex, 8 chars).
+        const r = await sql`UPDATE books SET short_id=substring(md5(id::text) from 1 for 8) WHERE short_id IS NULL`;
+        return json({ ok: true, backfilled: (r as unknown as { rowCount?: number }).rowCount ?? null });
+      }
       if (url.pathname === '/api/admin/migrate' && request.method === 'POST') {
         if (!env.DATABASE_URL) return json({ error: 'No DB' }, 503);
         const sql = neon(env.DATABASE_URL);
+        await sql`CREATE TABLE IF NOT EXISTS referrals (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), code TEXT UNIQUE NOT NULL, writer_id UUID UNIQUE REFERENCES writers(id) ON DELETE CASCADE, uses INT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        await sql`CREATE TABLE IF NOT EXISTS quiz_scores (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), who TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', xp INT NOT NULL DEFAULT 0, day DATE NOT NULL DEFAULT CURRENT_DATE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+        await sql`CREATE UNIQUE INDEX IF NOT EXISTS quiz_scores_who_uidx ON quiz_scores (who)`;
+        await sql`CREATE TABLE IF NOT EXISTS quiz_answers (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), who TEXT NOT NULL, qid TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(who, qid))`;
+        await sql`ALTER TABLE writers ADD COLUMN IF NOT EXISTS referred_by UUID DEFAULT NULL`;
+        await sql`ALTER TABLE writers ADD COLUMN IF NOT EXISTS referral_counted BOOLEAN NOT NULL DEFAULT FALSE`;
         await sql`ALTER TABLE categories ADD COLUMN IF NOT EXISTS cover_url TEXT`;
         await sql`ALTER TABLE chapters ADD COLUMN IF NOT EXISTS minutes INT NOT NULL DEFAULT 5`;
         await sql`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS url TEXT NOT NULL DEFAULT ''`;
@@ -82,6 +124,13 @@ export default {
         await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`ALTER TABLE home_settings ADD COLUMN IF NOT EXISTS comments_approval BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`ALTER TABLE comments ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`;
+        await sql`ALTER TABLE stories ADD COLUMN IF NOT EXISTS visible_on TEXT NOT NULL DEFAULT 'both'`;
+        await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS visible_on TEXT NOT NULL DEFAULT 'both'`;
+        await sql`ALTER TABLE categories ADD COLUMN IF NOT EXISTS visible_on TEXT NOT NULL DEFAULT 'both'`;
+        await sql`ALTER TABLE categories ADD COLUMN IF NOT EXISTS requested_by UUID DEFAULT NULL`;
+        await sql`ALTER TABLE stories ADD COLUMN IF NOT EXISTS is_new BOOLEAN NOT NULL DEFAULT FALSE`;
+        await sql`ALTER TABLE stories ADD COLUMN IF NOT EXISTS story_type TEXT NOT NULL DEFAULT 'episodes'`;
+        await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS story_type TEXT NOT NULL DEFAULT 'episodes'`;
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS home_section TEXT`;
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS views_visible BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`CREATE TABLE IF NOT EXISTS user_state (device_key TEXT PRIMARY KEY, settings JSONB NOT NULL DEFAULT '{}', favorites JSONB NOT NULL DEFAULT '[]', downloads JSONB NOT NULL DEFAULT '[]', history JSONB NOT NULL DEFAULT '[]', positions JSONB NOT NULL DEFAULT '{}', bookmarks JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
@@ -110,6 +159,15 @@ export default {
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS pdf_reward_ad BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`ALTER TABLE chapters ADD COLUMN IF NOT EXISTS reward_ad BOOLEAN NOT NULL DEFAULT FALSE`;
         await sql`ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token TEXT DEFAULT ''`;
+        await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS short_id TEXT UNIQUE`;
+        // Backfill short public IDs for existing books (8 chars).
+        try {
+          const missing = await sql`SELECT id FROM books WHERE short_id IS NULL`;
+          for (const row of missing as { id: string }[]) {
+            const sid = await mintShortId(sql);
+            await sql`UPDATE books SET short_id=${sid} WHERE id=${row.id} AND short_id IS NULL`;
+          }
+        } catch (e) { console.error('backfill short_id error', e); }
         // Backfill: sync hide_title_on_cover from stories to their books
         try {
           await sql`UPDATE books SET hide_title_on_cover = s.hide_title_on_cover FROM stories s JOIN writers w ON s.writer_id=w.id WHERE books.title = s.title AND books.author = w.writer_name AND s.hide_title_on_cover = true`;
@@ -187,7 +245,7 @@ export default {
 
       // --- Categories CRUD ---
       if (url.pathname === '/api/admin/categories' && request.method === 'GET')
-        return json(await sql`SELECT id,name,icon,color,cover_url,position,is_active,created_at FROM categories ORDER BY position,created_at DESC`);
+        return json(await sql`SELECT id,name,icon,color,cover_url,position,is_active,COALESCE(visible_on,'both') AS visible_on,requested_by,created_at FROM categories ORDER BY position,created_at DESC`);
       if (url.pathname === '/api/admin/categories' && request.method === 'POST') {
         const b = await request.json() as { name?: string; icon?: string; color?: string; cover_url?: string; position?: number };
         if (!b.name) return json({ error: 'name required' }, 400);
@@ -209,6 +267,7 @@ export default {
       }
       if (catMatch && request.method === 'DELETE') {
         if (!uuid(catMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        try { await sql`UPDATE books SET category_id=NULL WHERE category_id=${catMatch[1]}`; } catch(e) {}
         await sql`DELETE FROM categories WHERE id=${catMatch[1]}`;
         return json({ ok: true });
       }
@@ -219,7 +278,8 @@ export default {
       if (url.pathname === '/api/admin/books' && request.method === 'POST') {
         const b = await request.json() as { title?: string; author?: string; category_id?: string; cover_url?: string; color?: string; accent?: string; description?: string; status?: string; is_new?: boolean; featured?: boolean; home_section?: string; pdf_url?: string; dedication?: string; author_name?: string; show_ads?: boolean };
         if (!b.title) return json({ error: 'title required' }, 400);
-        const r = await sql`INSERT INTO books (title,author,category_id,cover_url,color,accent,description,status,is_new,featured,home_section,pdf_url,dedication,author_name,show_ads,pdf_reward_ad) VALUES (${b.title as string},${b.author as string},${b.category_id||null},${b.cover_url||null},${b.color||'#123E39'},${b.accent||'#F5C660'},${b.description||''},${b.status||'draft'},${Boolean(b.is_new)},${Boolean(b.featured)},${(b.home_section||null) as string|null},${b.pdf_url||''},${b.dedication||''},${b.author_name||''},${b.show_ads!==false},${b.pdf_reward_ad!==false}) RETURNING id,title,author,status,created_at`;
+        const __sid1 = await mintShortId(sql);
+        const r = await sql`INSERT INTO books (title,author,category_id,cover_url,color,accent,description,status,is_new,featured,home_section,pdf_url,dedication,author_name,show_ads,pdf_reward_ad,short_id) VALUES (${b.title as string},${b.author as string},${b.category_id||null},${b.cover_url||null},${b.color||'#123E39'},${b.accent||'#F5C660'},${b.description||''},${b.status||'draft'},${Boolean(b.is_new)},${Boolean(b.featured)},${(b.home_section||null) as string|null},${b.pdf_url||''},${b.dedication||''},${b.author_name||''},${b.show_ads!==false},${b.pdf_reward_ad!==false},${__sid1}) RETURNING id,title,author,status,created_at`;
         return json(r[0], 201);
       }
       const bookMatch = url.pathname.match(/^\/api\/admin\/books\/([^/]+)$/);
@@ -233,8 +293,8 @@ export default {
       if (bookMatch && request.method === 'PUT') {
         if (!uuid(bookMatch[1])) return json({ error: 'Invalid ID' }, 400);
         const b = await request.json() as Record<string, unknown>;
-        if (b.title !== undefined || b.author !== undefined || b.description !== undefined || b.category_id !== undefined || b.cover_url !== undefined || b.color !== undefined || b.accent !== undefined || b.status !== undefined || b.is_new !== undefined || b.featured !== undefined || b.home_section !== undefined || b.views_visible !== undefined || b.pdf_url !== undefined || b.dedication !== undefined || b.author_name !== undefined || b.show_ads !== undefined || b.pdf_reward_ad !== undefined) {
-          await sql`UPDATE books SET title=COALESCE(${b.title as string||null},title),author=COALESCE(${b.author as string||null},author),description=COALESCE(${b.description as string||null},description),category_id=COALESCE(${b.category_id as string||null},category_id),cover_url=COALESCE(${b.cover_url as string||null},cover_url),color=COALESCE(${b.color as string||null},color),accent=COALESCE(${b.accent as string||null},accent),status=COALESCE(${b.status as string||null},status),is_new=COALESCE(${b.is_new as boolean||null},is_new),featured=COALESCE(${b.featured as boolean||null},featured),home_section=COALESCE(${b.home_section as string||null},home_section),views_visible=COALESCE(${b.views_visible as boolean||null},views_visible),pdf_url=COALESCE(${b.pdf_url as string||null},pdf_url),dedication=COALESCE(${b.dedication as string||null},dedication),author_name=COALESCE(${b.author_name as string||null},author_name),show_ads=COALESCE(${b.show_ads as boolean||null},show_ads),pdf_reward_ad=COALESCE(${b.pdf_reward_ad as boolean||null},pdf_reward_ad),updated_at=NOW() WHERE id=${bookMatch[1]}`;
+        if (b.title !== undefined || b.author !== undefined || b.description !== undefined || b.category_id !== undefined || b.cover_url !== undefined || b.color !== undefined || b.accent !== undefined || b.status !== undefined || b.is_new !== undefined || b.featured !== undefined || b.home_section !== undefined || b.views_visible !== undefined || b.pdf_url !== undefined || b.dedication !== undefined || b.author_name !== undefined || b.show_ads !== undefined || b.pdf_reward_ad !== undefined || b.display_status !== undefined || b.writer_status !== undefined) {
+          await sql`UPDATE books SET title=COALESCE(${b.title as string||null},title),author=COALESCE(${b.author as string||null},author),description=COALESCE(${b.description as string||null},description),category_id=COALESCE(${b.category_id as string||null},category_id),cover_url=COALESCE(${b.cover_url as string||null},cover_url),color=COALESCE(${b.color as string||null},color),accent=COALESCE(${b.accent as string||null},accent),status=COALESCE(${b.status as string||null},status),is_new=COALESCE(${b.is_new as boolean||null},is_new),featured=COALESCE(${b.featured as boolean||null},featured),home_section=COALESCE(${b.home_section as string||null},home_section),views_visible=COALESCE(${b.views_visible as boolean||null},views_visible),pdf_url=COALESCE(${b.pdf_url as string||null},pdf_url),dedication=COALESCE(${b.dedication as string||null},dedication),author_name=COALESCE(${b.author_name as string||null},author_name),show_ads=COALESCE(${b.show_ads as boolean||null},show_ads),pdf_reward_ad=COALESCE(${b.pdf_reward_ad as boolean||null},pdf_reward_ad),display_status=COALESCE(${b.display_status as string||null},display_status),writer_status=COALESCE(${b.writer_status as string||null},writer_status),updated_at=NOW() WHERE id=${bookMatch[1]}`;
         }
         const r = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.home_section,b.views_visible,b.category_id,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,b.updated_at,COALESCE(c.name,'') AS category_name FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookMatch[1]}`;
         return json(r[0] || { error: 'Not found' }, r.length ? 200 : 404);
@@ -370,9 +430,10 @@ export default {
           const existingBook = await sql`SELECT id FROM books WHERE title=${s.title} AND author=${s.writer_name} LIMIT 1`;
           if (existingBook.length) {
             bookId = existingBook[0].id;
-            await sql`UPDATE books SET display_status=${s.display_status||''},writer_status=${s.writer_status||''},hide_title_on_cover=${s.hide_title_on_cover||false} WHERE id=${bookId}`;
+            await sql`UPDATE books SET display_status=${s.display_status||''},writer_status=${s.writer_status||''},hide_title_on_cover=${s.hide_title_on_cover||false},visible_on=(SELECT visible_on FROM stories WHERE id=${s.id}),story_type=(SELECT story_type FROM stories WHERE id=${s.id}) WHERE id=${bookId}`;
           } else {
-                const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name) VALUES (${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published',${s.display_status||''},${s.writer_status||''},${s.hide_title_on_cover||false},${s.pdf_url||''},${s.dedication||''},${s.author_name||''}) RETURNING id`;
+                const __sid2 = await mintShortId(sql);
+                const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,visible_on,story_type,short_id) VALUES (${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published',${s.display_status||''},${s.writer_status||''},${s.hide_title_on_cover||false},${s.pdf_url||''},${s.dedication||''},${s.author_name||''},(SELECT visible_on FROM stories WHERE id=${s.id}),(SELECT story_type FROM stories WHERE id=${s.id}),${__sid2}) RETURNING id`;
             bookId = bk[0]?.id || null;
           }
           if (bookId) {
@@ -380,7 +441,7 @@ export default {
             const have = new Set(existingChs.map((e: any) => (e.title || '').trim()));
             for (const c of chapters) {
               if (have.has((c.title || '').trim())) continue;
-              try { await sql`INSERT INTO chapters (book_id,title,body,position,status,reward_ad) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published')`; } catch (e) { console.error('chapter insert failed', e); }
+              try { await sql`INSERT INTO chapters (book_id,title,body,position,status,reward_ad) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published',false)`; } catch (e) { console.error('chapter insert failed', e); }
             }
           }
           const actData = JSON.stringify({ story_id: s.id, title: s.title });
@@ -709,11 +770,12 @@ export default {
             let bookId: string | null = null;
             const existingBook = await sql`SELECT id FROM books WHERE title=${st.title} AND author=${st.writer_name} LIMIT 1`;
             if (existingBook.length) { bookId = existingBook[0].id; await sql`UPDATE books SET hide_title_on_cover=${st.hide_title_on_cover||false} WHERE id=${bookId}`; }
-            else { const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,hide_title_on_cover) VALUES (${st.title},${st.writer_name},${catId},${st.cover_url||null},${st.description||''},'published',${st.hide_title_on_cover||false}) RETURNING id`; bookId = bk[0]?.id || null; }
+            else { const __sid3 = await mintShortId(sql);
+                const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,hide_title_on_cover,short_id) VALUES (${st.title},${st.writer_name},${catId},${st.cover_url||null},${st.description||''},'published',${st.hide_title_on_cover||false},${__sid3}) RETURNING id`; bookId = bk[0]?.id || null; }
             if (bookId) {
               const existingChs = await sql`SELECT title FROM chapters WHERE book_id=${bookId}`;
               const have = new Set(existingChs.map((e: any) => (e.title || '').trim()));
-              for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status,reward_ad) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published')`; } catch (e) { console.error('chapter insert failed', e); } }
+              for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status,reward_ad) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published',false)`; } catch (e) { console.error('chapter insert failed', e); } }
             }
           } catch (e) { console.error('stories publish sync failed', e); }
         }
@@ -774,10 +836,16 @@ export default {
         return json({ ok: true, synced, total: allBooks.length });
       }
 
-      if (url.pathname === '/api/public/categories' && request.method === 'GET')
-        return json(await sql`SELECT id,name,icon,color,cover_url FROM categories WHERE is_active=true ORDER BY position`);
-      if (url.pathname === '/api/public/books' && request.method === 'GET')
-        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
+      // scope=all (website) sees everything; default (app) hides website-only items.
+      const scopeAll = url.searchParams.get('scope') === 'all';
+      if (url.pathname === '/api/public/categories' && request.method === 'GET') {
+        if (scopeAll) return json(await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true ORDER BY position`);
+        return json(await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true AND COALESCE(visible_on,'both')!='website' ORDER BY position`);
+      }
+      if (url.pathname === '/api/public/books' && request.method === 'GET') {
+        if (scopeAll) return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
+        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website' ORDER BY b.updated_at DESC`);
+      }
       if (url.pathname === '/api/public/chapters' && request.method === 'GET')
         return json(await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE status='published' ORDER BY position`);
 
@@ -800,7 +868,9 @@ export default {
         const titleOf = (k: string) => { const s = savedCfg.find((x) => x.key === k); return (s && s.title) ? s.title : ''; };
         const isEnabled = (k: string) => { const s = savedCfg.find((x) => x.key === k); return !s || s.enabled !== false; };
         const now = Date.now();
-        const allBooks = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,b.category_id::text AS category_id,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,b.created_at,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published'`;
+        const allBooks = scopeAll
+          ? await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,b.category_id::text AS category_id,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.story_type,'episodes') AS story_type,b.created_at,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published'`
+          : await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,b.category_id::text AS category_id,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.story_type,'episodes') AS story_type,b.created_at,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website'`;
         const fn = (id: string | null) => (id ? `${id}` : '');
         const fmt = (b: any) => ({ id: fn(b.id), title: b.title, author: b.author, cover_url: b.cover_url, views: `${b.views}`, likes: b.likes, description: b.description, category: b.category, color: b.color, accent: b.accent, is_new: b.is_new, featured: b.featured, home_section: b.home_section || '', views_visible: b.views_visible !== false, display_status: b.display_status || '', writer_status: b.writer_status || '', hide_title_on_cover: b.hide_title_on_cover || false, show_ads: b.show_ads !== false, pdf_reward_ad: b.pdf_reward_ad !== false, pdf_url: b.pdf_url || '', dedication: b.dedication || '', author_name: b.author_name || '' });
         const byViews = (a: any, b: any) => +b.views - +a.views;
@@ -835,8 +905,11 @@ export default {
 
       const pubBookMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)$/);
       if (pubBookMatch && request.method === 'GET') {
-        const bookId = pubBookMatch[1];
-        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookId} AND b.status='published'`;
+        const bookId = await resolveBookId(sql, pubBookMatch[1]);
+        if (!bookId) return json({ error: 'Not found' }, 404);
+        const rows = scopeAll
+          ? await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookId} AND b.status='published'`
+          : await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookId} AND b.status='published' AND COALESCE(b.visible_on,'both')!='website'`;
         if (!rows.length) return json({ error: 'Not found' }, 404);
         const chs = await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE book_id=${bookId} AND status='published' ORDER BY position`;
         return json({ ...rows[0], chapters: chs });
@@ -845,6 +918,9 @@ export default {
       if (url.pathname === '/api/public/events' && request.method === 'POST') {
         const b = await request.json() as { device_id?: string; book_id?: string; event_type?: string };
         if (!b.device_id || !b.book_id || !b.event_type) return json({ error: 'device_id, book_id, event_type required' }, 400);
+        const __eb = await resolveBookId(sql, b.book_id);
+        if (!__eb) return json({ error: 'Book not found' }, 404);
+        b.book_id = __eb;
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
         const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
         if (!deviceRow.length) return json({ error: 'Device registration failed' }, 500);
@@ -874,10 +950,31 @@ export default {
       }
 
       const pubComMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)\/comments$/);
-      if (pubComMatch && request.method === 'GET')
-        return json(await sql`SELECT id,book_id,display_name,body,status,created_at,avatar_url FROM comments WHERE book_id=${pubComMatch[1]} AND status='approved' ORDER BY created_at DESC LIMIT 50`);
+      if (pubComMatch && request.method === 'GET') {
+        const __cb = await resolveBookId(sql, pubComMatch[1]);
+        if (!__cb) return json([]);
+        return json(await sql`SELECT id,book_id,display_name,body,status,created_at,avatar_url FROM comments WHERE book_id=${__cb} AND status='approved' ORDER BY created_at DESC LIMIT 50`);
+      }
+      const pubComOneMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)\/comments\/([^/]+)$/);
+      if (pubComOneMatch && (request.method === 'PUT' || request.method === 'DELETE')) {
+        const b1 = await request.json().catch(() => ({})) as { device_id?: string; body?: string };
+        if (!b1.device_id) return json({ error: 'device_id required' }, 400);
+        const __cb1 = await resolveBookId(sql, pubComOneMatch[1]);
+        if (!__cb1) return json({ error: 'Not found' }, 404);
+        const own = await sql`SELECT c.id FROM comments c JOIN devices d ON d.id=c.device_id WHERE c.id=${pubComOneMatch[2]} AND c.book_id=${__cb1} AND d.device_key=${b1.device_id} LIMIT 1`;
+        if (!own.length) return json({ error: 'Not found' }, 404);
+        if (request.method === 'DELETE') {
+          await sql`UPDATE comments SET status='deleted' WHERE id=${pubComOneMatch[2]}`;
+          return json({ ok: true });
+        }
+        const nbody = (b1.body || '').slice(0, 1000).trim();
+        if (!nbody) return json({ error: 'Empty comment' }, 400);
+        await sql`UPDATE comments SET body=${nbody},status='pending' WHERE id=${pubComOneMatch[2]}`;
+        return json({ ok: true, needs_approval: true });
+      }
       if (pubComMatch && request.method === 'POST') {
-        const bookId = pubComMatch[1];
+        const bookId = await resolveBookId(sql, pubComMatch[1]);
+        if (!bookId) return json({ error: 'Book not found' }, 404);
         const b = await request.json() as { device_id?: string; name?: string; body?: string; avatar_url?: string };
         if (!b.device_id || !b.name || !b.body) return json({ error: 'device_id, name, body required' }, 400);
         const bkExists = await sql`SELECT id FROM books WHERE id=${bookId} LIMIT 1`;
@@ -886,6 +983,8 @@ export default {
         if (!cname.trim() || !cbody.trim()) return json({ error: 'Empty comment' }, 400);
         const recent = await sql`SELECT id FROM comments WHERE book_id=${bookId} AND device_id=(SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1) AND created_at>NOW()-INTERVAL '10 minutes' LIMIT 5`;
         if (recent.length >= 5) return json({ error: 'Too many comments — try later' }, 429);
+        const already = await sql`SELECT id FROM comments WHERE book_id=${bookId} AND device_id=(SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1) AND status<>'deleted' LIMIT 1`;
+        if (already.length) return json({ error: 'already_commented' }, 409);
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
         const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
         const dId = deviceRow.length ? deviceRow[0].id : null;
@@ -911,7 +1010,8 @@ export default {
 
       const pubLikeMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)\/like$/);
       if (pubLikeMatch && request.method === 'POST') {
-        const bookId = pubLikeMatch[1];
+        const bookId = await resolveBookId(sql, pubLikeMatch[1]);
+        if (!bookId) return json({ error: 'Book not found' }, 404);
         const b = await request.json() as { device_id?: string; value?: boolean; display_name?: string };
         if (!b.device_id || typeof b.value !== 'boolean') return json({ error: 'device_id and value required' }, 400);
         await sql`INSERT INTO devices (device_key, last_seen_at) VALUES (${b.device_id},NOW()) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=NOW()`;
@@ -1019,7 +1119,7 @@ export default {
 
       // --- Writer Signup (email verification required) ---
       if (url.pathname === '/api/public/writers/signup' && request.method === 'POST') {
-        const b = await request.json() as { username?: string; writer_name?: string; email?: string; password?: string };
+        const b = await request.json() as { username?: string; writer_name?: string; email?: string; password?: string; ref?: string };
         if (!b.username || !b.writer_name || !b.email || !b.password) return json({ error: 'All fields required' }, 400);
         const uname = validateUsername(b.username);
         if (!uname) return json({ error: 'invalid_username' }, 400);
@@ -1033,8 +1133,16 @@ export default {
         if ((recentEmail[0]?.c || 0) >= 5) return json({ error: 'too_many_attempts' }, 429);
         if (ip) { const recentIp = await sql`SELECT COUNT(*)::int AS c FROM verification_codes WHERE ip=${ip} AND purpose='writer_signup' AND created_at > NOW() - INTERVAL '1 hour'`; if ((recentIp[0]?.c || 0) >= 20) return json({ error: 'too_many_attempts' }, 429); }
         const { hash, salt } = await hashPassword(b.password);
+        let referrerId: string | null = null;
         try {
-          await sql`INSERT INTO writers (username,writer_name,email,password_hash,salt,email_verified) VALUES (${uname},${wname},${email},${hash},${salt},false)`;
+          const refCode = (b.ref || '').trim().toLowerCase();
+          if (refCode) {
+            const rf = await sql`SELECT writer_id FROM referrals WHERE code=${refCode} LIMIT 1`;
+            if (rf.length) referrerId = rf[0].writer_id;
+          }
+        } catch {}
+        try {
+          await sql`INSERT INTO writers (username,writer_name,email,password_hash,salt,email_verified,referred_by) VALUES (${uname},${wname},${email},${hash},${salt},false,${referrerId})`;
         } catch (e: any) {
           if (e.message?.includes('writers_username')) return json({ error: 'username_taken' }, 409);
           if (e.message?.includes('writers_email')) { const ex = await sql`SELECT email_verified FROM writers WHERE email=${email}`; if (ex.length && !ex[0].email_verified) { /* unverified: fall through to resend a fresh code */ } else return json({ error: 'email_taken' }, 409); }
@@ -1108,6 +1216,13 @@ export default {
         if (codeHash !== row.code_hash) { await sql`UPDATE verification_codes SET attempts=attempts+1 WHERE id=${row.id}`; return json({ error: 'code_invalid', attempts_left: Math.max(0, 4 - (row.attempts || 0)) }, 400); }
         await sql`UPDATE verification_codes SET consumed=true WHERE id=${row.id}`;
         await sql`UPDATE writers SET email_verified=true WHERE email=${email}`;
+        try {
+          const nw = await sql`SELECT id,referred_by,referral_counted FROM writers WHERE email=${email} LIMIT 1`;
+          if (nw.length && nw[0].referred_by && !nw[0].referral_counted) {
+            await sql`UPDATE referrals SET uses=uses+1 WHERE writer_id=${nw[0].referred_by}`;
+            await sql`UPDATE writers SET referral_counted=true WHERE id=${nw[0].id}`;
+          }
+        } catch (e) { console.error('referral credit failed', e); }
         const w = await sql`SELECT id,username,writer_name,email,bio,avatar_url,follower_count,created_at FROM writers WHERE email=${email}`;
         if (!w.length) return json({ error: 'Writer not found' }, 404);
         const token = await createJWT({ id: w[0].id, username: w[0].username });
@@ -1152,7 +1267,7 @@ export default {
 
       // --- Google Auth (sign up + login) ---
       if (url.pathname === '/api/public/writers/google' && request.method === 'POST') {
-        const b = await request.json() as { credential?: string };
+        const b = await request.json() as { credential?: string; ref?: string };
         if (!b.credential) return json({ error: 'Google credential required' }, 400);
         try {
           const resp = await fetch('https://oauth2.googleapis.com/tokeninfo', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'id_token=' + encodeURIComponent(b.credential) });
@@ -1177,8 +1292,24 @@ export default {
           const uname = email.split('@')[0].replace(/[^a-z0-9_]/g, '').slice(0, 20) || 'user' + Date.now();
           const randomPass = crypto.randomUUID();
           const { hash, salt } = await hashPassword(randomPass);
+          let gReferrer: string | null = null;
+          try {
+            const gRef = (b.ref || '').trim().toLowerCase();
+            if (gRef) {
+              const grf = await sql`SELECT writer_id FROM referrals WHERE code=${gRef} LIMIT 1`;
+              if (grf.length) gReferrer = grf[0].writer_id;
+            }
+          } catch {}
+          const creditGoogleRef = async (newId: string) => {
+            if (!gReferrer) return;
+            try {
+              await sql`UPDATE referrals SET uses=uses+1 WHERE writer_id=${gReferrer}`;
+              await sql`UPDATE writers SET referred_by=${gReferrer},referral_counted=true WHERE id=${newId}`;
+            } catch (e) { console.error('google ref credit failed', e); }
+          };
           try {
             const r = await sql`INSERT INTO writers (username,writer_name,email,password_hash,salt,avatar_url) VALUES (${uname},${writerName},${email},${hash},${salt},${avatarUrl}) RETURNING id,username,writer_name,email,avatar_url,bio,follower_count,created_at`;
+            await creditGoogleRef(r[0].id);
             const token = await createJWT({ id: r[0].id, username: r[0].username });
             return json({ writer: r[0], token }, 201);
           } catch (e: any) {
@@ -1186,6 +1317,7 @@ export default {
             if (e.message?.includes('writers_username')) {
               const fallback = uname + Math.floor(Math.random() * 9999);
               const r = await sql`INSERT INTO writers (username,writer_name,email,password_hash,salt,avatar_url) VALUES (${fallback},${writerName},${email},${hash},${salt},${avatarUrl}) RETURNING id,username,writer_name,email,avatar_url,bio,follower_count,created_at`;
+              await creditGoogleRef(r[0].id);
               const token = await createJWT({ id: r[0].id, username: r[0].username });
               return json({ writer: r[0], token }, 201);
             }
@@ -1196,7 +1328,115 @@ export default {
         }
       }
 
-      // --- Public: Account Deletion Request (web form, no login required) ---
+        // --- Public: Affiliate Application ---
+        if (url.pathname === '/api/public/affiliate-apply' && request.method === 'POST') {
+          const b = await request.json() as { platform?: string; username?: string; followers?: number; contact?: string };
+          const platform = (b.platform || '').trim().slice(0, 20);
+          const uname = (b.username || '').trim().slice(0, 60);
+          const followers = Math.max(0, Math.floor(Number(b.followers) || 0));
+          const contact = (b.contact || '').trim().slice(0, 254);
+          if (!platform || !uname || !contact) return json({ error: 'platform, username and contact required' }, 400);
+          if (!['tiktok', 'facebook', 'youtube', 'instagram', 'other'].includes(platform)) return json({ error: 'invalid platform' }, 400);
+          const ip = request.headers.get('cf-connecting-ip') || '';
+          await sql`CREATE TABLE IF NOT EXISTS affiliate_apps (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), platform TEXT NOT NULL, username TEXT NOT NULL, followers INT NOT NULL DEFAULT 0, contact TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', ip TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+          const dup = await sql`SELECT id FROM affiliate_apps WHERE platform=${platform} AND LOWER(username)=${uname.toLowerCase()} LIMIT 1`;
+          if (dup.length) return json({ error: 'already_applied' }, 409);
+          const r = await sql`INSERT INTO affiliate_apps (platform,username,followers,contact,ip) VALUES (${platform},${uname},${followers},${contact},${ip}) RETURNING id`;
+          return json({ ok: true, id: r[0].id }, 201);
+        }
+
+        // --- Public: Quiz ---
+        type QuizQ = { id: string; cat: string; q: string; options: string[]; answer: number };
+        const QUIZ_BANK: QuizQ[] = [
+          { id: "lit1", cat: "literature", q: "বাংলা সাহিত্যের প্রথম সার্থক উপন্যাস কোনটি?", options: ["দুর্গেশনন্দিনী", "কপালকুণ্ডলা", "বিষবৃক্ষ", "কৃষ্ণকান্তের উইল"], answer: 0 },
+          { id: "lit2", cat: "literature", q: "‘গীতাঞ্জলি’-র রচয়িতা কে?", options: ["কাজী নজরুল ইসলাম", "রবীন্দ্রনাথ ঠাকুর", "জসীমউদ্দীন", "সুকান্ত ভট্টাচার্য"], answer: 1 },
+          { id: "lit3", cat: "literature", q: "‘পথের পাঁচালী’ উপন্যাসের লেখক কে?", options: ["বিভূতিভূষণ বন্দ্যোপাধ্যায়", "তারাশঙ্কর বন্দ্যোপাধ্যায়", "মানিক বন্দ্যোপাধ্যায়", "শরৎচন্দ্র চট্টোপাধ্যায়"], answer: 0 },
+          { id: "lit4", cat: "literature", q: "‘বিদ্রোহী’ কবিতার কবি কে?", options: ["জীবনানন্দ দাশ", "কাজী নজরুল ইসলাম", "ফররুখ আহমদ", "আহসান হাবীব"], answer: 1 },
+          { id: "lit5", cat: "literature", q: "‘শেষের কবিতা’ কী ধরনের রচনা?", options: ["নাটক", "উপন্যাস", "প্রবন্ধ", "ছোটগল্প"], answer: 1 },
+          { id: "gk1", cat: "gk", q: "বাংলাদেশের জাতীয় ফল কোনটি?", options: ["আম", "কাঁঠাল", "লিচু", "কলা"], answer: 1 },
+          { id: "gk2", cat: "gk", q: "বাংলাদেশের মুদ্রার নাম কী?", options: ["রুপি", "টাকা", "ডলার", "দিনার"], answer: 1 },
+          { id: "gk3", cat: "gk", q: "পদ্মা সেতুর দৈর্ঘ্য কত?", options: ["৫.৫ কিমি", "৬.১৫ কিমি", "৭ কিমি", "৪.৮ কিমি"], answer: 1 },
+          { id: "gk4", cat: "gk", q: "সুন্দরবন কোন দুটি দেশে অবস্থিত?", options: ["বাংলাদেশ-ভারত", "বাংলাদেশ-মিয়ানমার", "ভারত-নেপাল", "বাংলাদেশ-ভুটান"], answer: 0 },
+          { id: "gk5", cat: "gk", q: "বাংলাদেশের জাতীয় সংগীতের রচয়িতা কে?", options: ["কাজী নজরুল ইসলাম", "রবীন্দ্রনাথ ঠাকুর", "দ্বিজেন্দ্রলাল রায়", "অতুলপ্রসাদ সেন"], answer: 1 },
+          { id: "wr1", cat: "writers", q: "‘নকশী কাঁথার মাঠ’-এর কবি কে?", options: ["জসীমউদ্দীন", "জীবনানন্দ দাশ", "বুদ্ধদেব বসু", "বিষ্ণু দে"], answer: 0 },
+          { id: "wr2", cat: "writers", q: "হুমায়ূন আহমেদের সৃষ্ট চরিত্র কোনটি?", options: ["হিমু", "ফেলুদা", "ব্যোমকেশ", "শবর"], answer: 0 },
+          { id: "wr3", cat: "writers", q: "‘বনলতা সেন’ কবিতার কবি কে?", options: ["সুধীন্দ্রনাথ দত্ত", "জীবনানন্দ দাশ", "অমিয় চক্রবর্তী", "প্রেমেন্দ্র মিত্র"], answer: 1 },
+          { id: "wr4", cat: "writers", q: "শরৎচন্দ্রের ‘দেবদাস’ উপন্যাসের নায়িকা কে?", options: ["পার্বতী", "চন্দ্রমুখী", "বিরাজ", "ষোড়শী"], answer: 0 },
+          { id: "wr5", cat: "writers", q: "‘আগুনের পরশমণি’ লেখক কে?", options: ["হুমায়ূন আহমেদ", "জাফর ইকবাল", "আনিসুল হক", "শীর্ষেন্দু"], answer: 0 },
+          { id: "his1", cat: "history", q: "বাংলাদেশ স্বাধীন হয় কত সালে?", options: ["১৯৪৭", "১৯৫২", "১৯৭১", "১৯৭৫"], answer: 2 },
+          { id: "his2", cat: "history", q: "ভাষা আন্দোলন হয় কত সালে?", options: ["১৯৪৭", "১৯৫২", "১৯৬৯", "১৯৭১"], answer: 1 },
+          { id: "his3", cat: "history", q: "মুক্তিযুদ্ধে মুক্তিবাহিনীর সর্বাধিনায়ক কে ছিলেন?", options: ["জিয়াউর রহমান", "এম এ জি ওসমানী", "তাজউদ্দীন আহমদ", "সৈয়দ নজরুল ইসলাম"], answer: 1 },
+          { id: "his4", cat: "history", q: "৭ই মার্চের ভাষণ কে দিয়েছিলেন?", options: ["তাজউদ্দীন আহমদ", "সৈয়দ নজরুল ইসলাম", "শেখ মুজিবুর রহমান", "কামারুজ্জামান"], answer: 2 },
+          { id: "his5", cat: "history", q: "বাংলাদেশের প্রথম রাষ্ট্রপতি কে?", options: ["জিয়াউর রহমান", "শেখ মুজিবুর রহমান", "আবু সাঈদ চৌধুরী", "মোহাম্মদউল্লাহ"], answer: 1 },
+          { id: "wld1", cat: "world", q: "বিশ্বের বৃহত্তম মরুভূমি কোনটি?", options: ["সাহারা", "গোবি", "কালাহারি", "থর"], answer: 0 },
+          { id: "wld2", cat: "world", q: "সবচেয়ে লম্বা নদী কোনটি?", options: ["আমাজন", "নীল", "ইয়াংসি", "মিসিসিপি"], answer: 1 },
+          { id: "wld3", cat: "world", q: "জাপানের মুদ্রার নাম কী?", options: ["ইউয়ান", "উওন", "ইয়েন", "রিঙ্গিত"], answer: 2 },
+          { id: "wld4", cat: "world", q: "অলিম্পিক গেমস কত বছর পর পর হয়?", options: ["২ বছর", "৩ বছর", "৪ বছর", "৫ বছর"], answer: 2 },
+          { id: "wld5", cat: "world", q: "বিশ্বের সবচেয়ে জনবহুল দেশ কোনটি?", options: ["চীন", "ভারত", "যুক্তরাষ্ট্র", "ইন্দোনেশিয়া"], answer: 1 },
+        ];
+        if (url.pathname === '/api/public/quiz/questions' && request.method === 'GET') {
+          const cat = url.searchParams.get('category') || '';
+          const pool = QUIZ_BANK.filter((q) => !cat || q.cat === cat);
+          const shuffled = [...pool].sort(() => Math.random() - 0.5).slice(0, 10);
+          return json(shuffled.map(({ answer, ...rest }) => rest));
+        }
+        if (url.pathname === '/api/public/quiz/submit' && request.method === 'POST') {
+          // Real accounts only — no guest play. Identity comes from the JWT, never the client.
+          const writerMatch = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
+          if (!writerMatch) return json({ error: 'Login required' }, 401);
+          const payload = await verifyJWT(writerMatch[1]);
+          if (!payload?.id) return json({ error: 'Invalid token' }, 401);
+          const wrows = await sql`SELECT id,writer_name FROM writers WHERE id=${payload.id} LIMIT 1`;
+          if (!wrows.length) return json({ error: 'Unknown writer' }, 401);
+          const who = wrows[0].id as string;
+          const name = (wrows[0].writer_name as string) || 'Writer';
+          const b = await request.json() as { qid?: string; answer?: number; streak?: number };
+          if (!b.qid || typeof b.answer !== 'number') return json({ error: 'qid and answer required' }, 400);
+          const q = QUIZ_BANK.find((x) => x.id === b.qid);
+          if (!q) return json({ error: 'Unknown question' }, 404);
+          const correct = q.answer === b.answer;
+          let xp = 0;
+          let counted = false;
+          if (correct) {
+            try {
+              await sql`INSERT INTO quiz_answers (who,qid) VALUES (${who},${q.id})`;
+              counted = true;
+            } catch { counted = false; }
+            if (counted) {
+              xp = 10;
+              const st = Math.max(0, Math.floor(Number(b.streak) || 0));
+              if (st >= 10) xp += 25; else if (st >= 5) xp += 10; else if (st >= 3) xp += 5;
+              await sql`INSERT INTO quiz_scores (who,name,xp) VALUES (${who},${name},${xp}) ON CONFLICT (who) DO UPDATE SET xp=quiz_scores.xp+EXCLUDED.xp,name=EXCLUDED.name,day=CURRENT_DATE,updated_at=NOW()`;
+            }
+          }
+          const tot = await sql`SELECT COALESCE(SUM(xp),0)::int AS n FROM quiz_scores WHERE who=${who}`;
+          return json({ correct, xp, counted, totalXp: tot[0]?.n || 0, answer: q.answer });
+        }
+        if (url.pathname === '/api/public/quiz/leaderboard' && request.method === 'GET') {
+          // Real writers only — JOIN hides legacy guest rows (dev-*), no delete needed.
+          const range = url.searchParams.get('range') || 'day';
+          let rows;
+          if (range === 'all') {
+            rows = await sql`SELECT q.who,w.writer_name AS name,SUM(q.xp)::int AS xp,COUNT(*)::int AS games FROM quiz_scores q JOIN writers w ON w.id=q.who AND w.is_active=true GROUP BY q.who,w.writer_name ORDER BY xp DESC LIMIT 20`;
+          } else if (range === 'week') {
+            rows = await sql`SELECT q.who,w.writer_name AS name,SUM(q.xp)::int AS xp FROM quiz_scores q JOIN writers w ON w.id=q.who AND w.is_active=true WHERE q.created_at >= CURRENT_DATE - INTERVAL '7 days' GROUP BY q.who,w.writer_name ORDER BY xp DESC LIMIT 20`;
+          } else if (range === 'month') {
+            const mrows = await sql`SELECT q.who,w.writer_name AS name,SUM(q.xp)::int AS n FROM quiz_scores q JOIN writers w ON w.id=q.who AND w.is_active=true WHERE q.created_at >= CURRENT_DATE - INTERVAL '30 days' GROUP BY q.who,w.writer_name ORDER BY n DESC LIMIT 20`;
+            rows = mrows.map((r: Record<string, unknown>) => ({ who: r.who, name: r.name, xp: r.n }));
+          } else {
+            rows = await sql`SELECT q.who,w.writer_name AS name,SUM(q.xp)::int AS xp FROM quiz_scores q JOIN writers w ON w.id=q.who AND w.is_active=true WHERE q.day=CURRENT_DATE GROUP BY q.who,w.writer_name ORDER BY xp DESC LIMIT 20`;
+          }
+          return json(rows);
+        }
+        if (url.pathname === '/api/admin/quiz/scores' && request.method === 'DELETE') {
+          const b = await request.json().catch(() => ({})) as { who?: string };
+          if (!b.who) return json({ error: 'who required' }, 400);
+          await sql`DELETE FROM quiz_answers WHERE who=${b.who}`;
+          await sql`DELETE FROM quiz_scores WHERE who=${b.who}`;
+          return json({ ok: true });
+        }
+
+        // --- Public: Account Deletion Request (web form, no login required) ---
       if (url.pathname === '/api/public/deletion-requests' && request.method === 'POST') {
         const b = await request.json() as { contact?: string; identifier?: string; details?: string };
         const contact = (b.contact || '').trim().slice(0, 254);
@@ -1387,9 +1627,40 @@ export default {
         return json({ ok: true });
       }
 
+      // --- Writer notifications (website bell) ---
+      if (url.pathname === '/api/writer/notifications' && request.method === 'GET') {
+        const nm = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
+        if (!nm) return json({ error: 'Unauthorized' }, 401);
+        const payload = await verifyJWT(nm[1]);
+        if (!payload?.id) return json({ error: 'Invalid token' }, 401);
+        const rows = await sql`SELECT id,title,body,type,story_id,url,avatar_url,story_title,story_cover,is_read,created_at FROM writer_notifications WHERE writer_id=${payload.id} ORDER BY created_at DESC LIMIT 30`;
+        const unread = await sql`SELECT COUNT(*)::int AS n FROM writer_notifications WHERE writer_id=${payload.id} AND is_read=false`;
+        return json({ notifications: rows, unread: unread[0]?.n || 0 });
+      }
+      if (url.pathname === '/api/writer/notifications/read' && request.method === 'POST') {
+        const nm = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
+        if (!nm) return json({ error: 'Unauthorized' }, 401);
+        const payload = await verifyJWT(nm[1]);
+        if (!payload?.id) return json({ error: 'Invalid token' }, 401);
+        const b = await request.json().catch(() => ({})) as { ids?: string[]; all?: boolean };
+        if (b.all) {
+          await sql`UPDATE writer_notifications SET is_read=true WHERE writer_id=${payload.id}`;
+        } else if (Array.isArray(b.ids) && b.ids.length) {
+          await sql`UPDATE writer_notifications SET is_read=true WHERE writer_id=${payload.id} AND id = ANY(${b.ids})`;
+        }
+        return json({ ok: true });
+      }
+      if (url.pathname === '/api/writer/notifications' && request.method === 'DELETE') {
+        const nm = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
+        if (!nm) return json({ error: 'Unauthorized' }, 401);
+        const payload = await verifyJWT(nm[1]);
+        if (!payload?.id) return json({ error: 'Invalid token' }, 401);
+        await sql`DELETE FROM writer_notifications WHERE writer_id=${payload.id}`;
+        return json({ ok: true });
+      }
+
       // --- Writer followers list ---
-      if (url.pathname === '/api/writer/followers' && request.method === 'GET') {
-        const writerUserMatch = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
+      if (url.pathname === '/api/writer/followers' && request.method === 'GET') {        const writerUserMatch = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
         if (!writerUserMatch) return json({ error: 'Unauthorized' }, 401);
         const payload = await verifyJWT(writerUserMatch[1]);
         if (!payload?.id) return json({ error: 'Invalid token' }, 401);
@@ -1454,13 +1725,15 @@ export default {
 
         // --- Writer Stories CRUD ---
         if (url.pathname === '/api/writer/stories' && request.method === 'GET') {
-          const stories = await sql`SELECT id,title,description,status,cover_url,category,views,likes,chapters_count,display_status,writer_status,pdf_url,dedication,author_name,created_at,updated_at FROM stories WHERE writer_id=${writerId} ORDER BY updated_at DESC`;
+          const stories = await sql`SELECT id,title,description,status,cover_url,category,views,likes,chapters_count,display_status,writer_status,pdf_url,dedication,author_name,COALESCE(visible_on,'both') AS visible_on,COALESCE(story_type,'episodes') AS story_type,COALESCE(is_new,false) AS is_new,created_at,updated_at FROM stories WHERE writer_id=${writerId} ORDER BY updated_at DESC`;
           return json(stories);
         }
         if (url.pathname === '/api/writer/stories' && request.method === 'POST') {
-          const b = await request.json() as { title?: string; description?: string; category?: string; cover_url?: string; display_status?: string; writer_status?: string; hide_title_on_cover?: boolean; pdf_url?: string; dedication?: string; author_name?: string };
+          const b = await request.json() as { title?: string; description?: string; category?: string; cover_url?: string; display_status?: string; writer_status?: string; hide_title_on_cover?: boolean; pdf_url?: string; dedication?: string; author_name?: string; visible_on?: string; story_type?: string };
           if (!b.title) return json({ error: 'Title required' }, 400);
-          const r = await sql`INSERT INTO stories (writer_id,title,description,category,cover_url,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name) VALUES (${writerId},${b.title},${b.description||''},${b.category||''},${b.cover_url||null},${b.display_status||''},${b.writer_status||''},${b.hide_title_on_cover||false},${b.pdf_url||''},${b.dedication||''},${b.author_name||''}) RETURNING id,title,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,created_at`;
+          const vis = ['app', 'website', 'both'].includes(b.visible_on || '') ? b.visible_on : 'both';
+          const stype = b.story_type === 'complete' ? 'complete' : 'episodes';
+          const r = await sql`INSERT INTO stories (writer_id,title,description,category,cover_url,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,visible_on,story_type) VALUES (${writerId},${b.title},${b.description||''},${b.category||''},${b.cover_url||null},${b.display_status||''},${b.writer_status||''},${b.hide_title_on_cover||false},${b.pdf_url||''},${b.dedication||''},${b.author_name||''},${vis},${stype}) RETURNING id,title,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,created_at`;
           await sql`INSERT INTO writer_activities (writer_id,type,data) VALUES (${writerId},'story_created',${JSON.stringify({ story_id: r[0].id, title: b.title })}::jsonb)`;
           return json(r[0], 201);
         }
@@ -1473,7 +1746,7 @@ export default {
           if (!owned.length) return json({ error: 'Not found' }, 404);
 
           if (request.method === 'GET') {
-            const story = await sql`SELECT id,title,description,status,cover_url,category,views,likes,chapters_count,pdf_url,dedication,author_name,created_at,updated_at FROM stories WHERE id=${storyId}`;
+            const story = await sql`SELECT id,title,description,status,cover_url,category,views,likes,chapters_count,pdf_url,dedication,author_name,COALESCE(visible_on,'both') AS visible_on,COALESCE(writer_status,'complete') AS writer_status,COALESCE(is_new,false) AS is_new,COALESCE(story_type,'episodes') AS story_type,created_at,updated_at FROM stories WHERE id=${storyId}`;
             if (story.length && story[0].status === 'published') {
               try {
                 const stRow4 = await sql`SELECT w.writer_name,s.title FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}`;
@@ -1490,15 +1763,17 @@ export default {
             return json({ ...story[0], chapters });
           }
           if (request.method === 'PUT') {
-            const b = await request.json() as { title?: string; description?: string; status?: string; category?: string; display_status?: string; writer_status?: string; cover_url?: string; dedication?: string; author_name?: string; pdf_url?: string };
+            const b = await request.json() as { title?: string; description?: string; status?: string; category?: string; display_status?: string; writer_status?: string; cover_url?: string; dedication?: string; author_name?: string; pdf_url?: string; visible_on?: string; hide_title_on_cover?: boolean; is_new?: boolean; story_type?: string };
             const oldRow = await sql`SELECT title FROM stories WHERE id=${storyId}`;
             const oldTitle = oldRow.length ? oldRow[0].title : '';
-            await sql`UPDATE stories SET title=COALESCE(${b.title},title),description=COALESCE(${b.description},description),status=COALESCE(${b.status},status),category=COALESCE(${b.category},category),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),cover_url=COALESCE(${b.cover_url},cover_url),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),updated_at=NOW() WHERE id=${storyId}`;
+            const visU = ['app', 'website', 'both'].includes(b.visible_on || '') ? b.visible_on : null;
+            const visType = b.story_type === 'complete' || b.story_type === 'episodes' ? b.story_type : null;
+            await sql`UPDATE stories SET title=COALESCE(${b.title},title),description=COALESCE(${b.description},description),status=COALESCE(${b.status},status),category=COALESCE(${b.category},category),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),cover_url=COALESCE(${b.cover_url},cover_url),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),visible_on=COALESCE(${visU},visible_on),hide_title_on_cover=COALESCE(${b.hide_title_on_cover},hide_title_on_cover),is_new=COALESCE(${b.is_new},is_new),story_type=COALESCE(${visType},story_type),updated_at=NOW() WHERE id=${storyId}`;
             const newTitle = b.title || oldTitle;
             if (oldTitle) {
               const bkMatch = await sql`SELECT id FROM books WHERE title=${oldTitle} AND author=(SELECT writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyId}) LIMIT 1`;
               if (bkMatch.length) {
-                await sql`UPDATE books SET title=${newTitle},description=COALESCE(${b.description},description),cover_url=COALESCE(${b.cover_url},cover_url),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),updated_at=NOW() WHERE id=${bkMatch[0].id}`;
+                await sql`UPDATE books SET title=${newTitle},description=COALESCE(${b.description},description),cover_url=COALESCE(${b.cover_url},cover_url),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),visible_on=(SELECT visible_on FROM stories WHERE id=${storyId}),hide_title_on_cover=(SELECT hide_title_on_cover FROM stories WHERE id=${storyId}),writer_status=(SELECT writer_status FROM stories WHERE id=${storyId}),is_new=(SELECT is_new FROM stories WHERE id=${storyId}),story_type=(SELECT story_type FROM stories WHERE id=${storyId}),updated_at=NOW() WHERE id=${bkMatch[0].id}`;
               }
             }
             if (b.status === 'published') {
@@ -1621,6 +1896,29 @@ export default {
           return json({ ok: true });
         }
 
+        // --- Writer Referral Code + Stats ---
+        if (url.pathname === '/api/writer/referral' && request.method === 'GET') {
+          let row = await sql`SELECT code,uses FROM referrals WHERE writer_id=${writerId} LIMIT 1`;
+          if (!row.length) {
+            const w = await sql`SELECT username FROM writers WHERE id=${writerId} LIMIT 1`;
+            const base = ((w.length && w[0].username) || 'user').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'user';
+            const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+            let code = '';
+            for (let i = 0; i < 8; i++) {
+              const suffix = Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+              code = `${base}-${suffix}`;
+              try {
+                await sql`INSERT INTO referrals (code,writer_id) VALUES (${code},${writerId})`;
+                break;
+              } catch { code = ''; }
+            }
+            if (!code) return json({ error: 'Could not create code' }, 500);
+            row = await sql`SELECT code,uses FROM referrals WHERE writer_id=${writerId} LIMIT 1`;
+          }
+          const uses = row[0].uses || 0;
+          return json({ code: row[0].code, uses, earnings: uses * 10 });
+        }
+
         // --- Writer: Request Account-Delete Code ---
         if (url.pathname === '/api/writer/account/code' && request.method === 'POST') {
           const w = await sql`SELECT email FROM writers WHERE id=${writerId} LIMIT 1`;
@@ -1735,24 +2033,26 @@ export default {
           const newStatus = needsApproval ? 'pending' : 'published';
           await sql`UPDATE stories SET status=${newStatus},review_note='',updated_at=NOW() WHERE id=${storySubmitMatch[1]}`;
           if (!needsApproval) {
-            const sRow = await sql`SELECT s.title,s.description,s.category,s.cover_url,s.display_status,s.writer_status,s.hide_title_on_cover,s.pdf_url,s.dedication,s.author_name,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storySubmitMatch[1]}`;
+            const sRow = await sql`SELECT s.title,s.description,s.category,s.cover_url,s.display_status,s.writer_status,s.hide_title_on_cover,s.pdf_url,s.dedication,s.author_name,s.visible_on,s.story_type,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storySubmitMatch[1]}`;
             if (sRow.length) {
               const catRow = await sql`SELECT id FROM categories WHERE name=${sRow[0].category} LIMIT 1`;
               const catId = catRow.length ? catRow[0].id : null;
+              const visS = sRow[0].visible_on || 'both';
               let bookId: string | null = null;
               const existing = await sql`SELECT id FROM books WHERE title=${sRow[0].title} AND author=${sRow[0].writer_name} LIMIT 1`;
               if (existing.length) {
                 bookId = existing[0].id;
-                await sql`UPDATE books SET hide_title_on_cover=${sRow[0].hide_title_on_cover||false},pdf_url=${sRow[0].pdf_url||''},dedication=${sRow[0].dedication||''},author_name=${sRow[0].author_name||''} WHERE id=${bookId}`;
+                await sql`UPDATE books SET hide_title_on_cover=${sRow[0].hide_title_on_cover||false},pdf_url=${sRow[0].pdf_url||''},dedication=${sRow[0].dedication||''},author_name=${sRow[0].author_name||''},visible_on=${visS},story_type=${sRow[0].story_type||'episodes'} WHERE id=${bookId}`;
               } else {
-                const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,show_ads,pdf_reward_ad) VALUES (${sRow[0].title},${sRow[0].writer_name},${catId},${sRow[0].cover_url||null},${sRow[0].description||''},'published',${sRow[0].display_status||''},${sRow[0].writer_status||''},${sRow[0].hide_title_on_cover||false},${sRow[0].pdf_url||''},${sRow[0].dedication||''},${sRow[0].author_name||sRow[0].writer_name},true,true) RETURNING id`;
+                const __sid4 = await mintShortId(sql);
+                const bk = await sql`INSERT INTO books (title,author,category_id,cover_url,description,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,show_ads,pdf_reward_ad,visible_on,story_type,short_id) VALUES (${sRow[0].title},${sRow[0].writer_name},${catId},${sRow[0].cover_url||null},${sRow[0].description||''},'published',${sRow[0].display_status||''},${sRow[0].writer_status||''},${sRow[0].hide_title_on_cover||false},${sRow[0].pdf_url||''},${sRow[0].dedication||''},${sRow[0].author_name||sRow[0].writer_name},true,true,${visS},${sRow[0].story_type||'episodes'},${__sid4}) RETURNING id`;
                 bookId = bk[0]?.id || null;
               }
               if (bookId) {
                 const chapters = await sql`SELECT title,body,position FROM story_chapters WHERE story_id=${storySubmitMatch[1]} ORDER BY position`;
                 const existingChs = await sql`SELECT title FROM chapters WHERE book_id=${bookId}`;
                 const have = new Set(existingChs.map((e: any) => (e.title || '').trim()));
-                for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status,reward_ad) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published')`; } catch (e) { console.error('auto-approve chapter insert failed', e); } }
+                for (const c of chapters) { if (have.has((c.title || '').trim())) continue; try { await sql`INSERT INTO chapters (book_id,title,body,position,status,reward_ad) VALUES (${bookId},${c.title},${c.body||''},${c.position},'published',false)`; } catch (e) { console.error('auto-approve chapter insert failed', e); } }
               }
               // Notify all followers about new story
               try {
@@ -1782,6 +2082,38 @@ export default {
             }
           }
           return json({ ok: true, status: newStatus });
+        }
+
+        // --- Writer: Delete Own Story ---
+        const storyDeleteMatch = url.pathname.match(/^\/api\/writer\/stories\/([^/]+)$/);
+        if (storyDeleteMatch && request.method === 'DELETE') {
+          if (!uuid(storyDeleteMatch[1])) return json({ error: 'Invalid ID' }, 400);
+          const s = await sql`SELECT s.id,s.title,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${storyDeleteMatch[1]} AND s.writer_id=${writerId}`;
+          if (!s.length) return json({ error: 'Not found' }, 404);
+          const books = await sql`SELECT id FROM books WHERE title=${s[0].title} AND author=${s[0].writer_name}`;
+          for (const bk of books) {
+            try { await sql`DELETE FROM comments WHERE book_id=${bk.id}`; } catch(e) {}
+            try { await sql`DELETE FROM story_reports WHERE book_id=${bk.id}`; } catch(e) {}
+            try { await sql`DELETE FROM likes WHERE book_id=${bk.id}`; } catch(e) {}
+            try { await sql`DELETE FROM bookmarks WHERE book_id=${bk.id}`; } catch(e) {}
+            try { await sql`DELETE FROM chapters WHERE book_id=${bk.id}`; } catch(e) {}
+            try { await sql`DELETE FROM books WHERE id=${bk.id}`; } catch(e) {}
+          }
+          try { await sql`DELETE FROM story_chapters WHERE story_id=${storyDeleteMatch[1]}`; } catch(e) {}
+          await sql`DELETE FROM stories WHERE id=${storyDeleteMatch[1]}`;
+          return json({ ok: true });
+        }
+
+        // --- Writer: Request Website-Only Category (needs admin approval) ---
+        if (url.pathname === '/api/writer/categories' && request.method === 'POST') {
+          const b = await request.json() as { name?: string; icon?: string; color?: string };
+          const cname = (b.name || '').trim().slice(0, 40);
+          if (!cname) return json({ error: 'Name required' }, 400);
+          const dup = await sql`SELECT id FROM categories WHERE LOWER(name)=${cname.toLowerCase()} LIMIT 1`;
+          if (dup.length) return json({ error: 'Category already exists' }, 409);
+          const maxPos = await sql`SELECT COALESCE(MAX(position),0)+1 AS n FROM categories`;
+          const r = await sql`INSERT INTO categories (name,icon,color,visible_on,position,is_active,requested_by) VALUES (${cname},${b.icon||'book-open'},${b.color||'#DDF5EC'},'website',${maxPos[0].n},false,${writerId}) RETURNING id,name`;
+          return json({ ...r[0], pending: true }, 201);
         }
 
         // --- Writer Dashboard Stats ---

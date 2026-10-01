@@ -865,6 +865,10 @@ function ChaptersPage({ onToast }: { onToast: (m: string) => void }) {
 function CategoriesPage({ onEdit, onToast }: { onEdit: (c: Category) => void; onToast: (m: string) => void }) {
   const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState<'all' | 'requests'>('all');
+
+  const pending = categories.filter(c => !c.is_active && (c as any).requested_by);
+  const shown = tab === 'requests' ? pending : categories;
 
   const load = useCallback(() => {
     setLoading(true);
@@ -887,6 +891,16 @@ function CategoriesPage({ onEdit, onToast }: { onEdit: (c: Category) => void; on
     }
   };
 
+  const approveCategory = async (cat: Category) => {
+    try {
+      await api(`/api/admin/categories/${cat.id}`, { method: 'PUT', body: JSON.stringify({ is_active: true }) });
+      setCategories(prev => prev.map(c => c.id === cat.id ? { ...c, is_active: true } : c));
+      onToast(`"${cat.name}" approved`);
+    } catch {
+      onToast('Failed to approve category');
+    }
+  };
+
   return (
     <div className="content">
       <div className="resource-head">
@@ -901,29 +915,48 @@ function CategoriesPage({ onEdit, onToast }: { onEdit: (c: Category) => void; on
             <Search size={17} />
             <input placeholder="Search categories..." />
           </label>
+          <div style={{ display: 'flex', gap: 8, marginLeft: 'auto' }}>
+            <button
+              onClick={() => setTab('all')}
+              style={{ background: tab === 'all' ? '#18342d' : 'none', border: '1px solid #2a3f3a', color: tab === 'all' ? '#7fe0b2' : '#8fa19c', cursor: 'pointer', padding: '6px 14px', borderRadius: 8, fontSize: 13, fontWeight: 700 }}
+            >
+              All ({categories.length})
+            </button>
+            <button
+              onClick={() => setTab('requests')}
+              style={{ background: tab === 'requests' ? '#4a2c10' : 'none', border: '1px solid #2a3f3a', color: tab === 'requests' ? '#fbbf24' : '#8fa19c', cursor: 'pointer', padding: '6px 14px', borderRadius: 8, fontSize: 13, fontWeight: 700 }}
+            >
+              ⏳ Requests ({pending.length})
+            </button>
+          </div>
         </div>
         {loading ? (
           <div className="empty"><Loader2 size={35} className="spin" /><h3>Loading categories...</h3></div>
-        ) : categories.length === 0 ? (
+        ) : shown.length === 0 ? (
           <div className="empty">
             <CloudUpload size={35} />
-            <h3>No categories yet</h3>
-            <p>Create categories to organize books.</p>
+            <h3>{tab === 'requests' ? 'No pending requests' : 'No categories yet'}</h3>
+            <p>{tab === 'requests' ? 'Writer category requests will appear here.' : 'Create categories to organize books.'}</p>
           </div>
         ) : (
           <div className="table">
-            {categories.map(cat => (
+            {shown.map(cat => (
               <div className="tr" key={cat.id}>
                 <span className="book-cell">
                   <i style={{ background: cat.color || '#18342d' }}>{cat.cover_url ? <img src={cat.cover_url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 'inherit' }} /> : ''}</i>
                   <em>
                     <b>{cat.name}</b>
-                    <small>Position: {cat.position}</small>
+                    <small>Position: {cat.position}{(cat as any).requested_by && !(cat as any).is_active ? ' · ⏳ writer request' : ''}{(cat as any).visible_on === 'website' ? ' · website-only' : ''}</small>
                   </em>
                 </span>
                 <span>{cat.books_count ?? 0} books</span>
                 <span><u>{cat.color || '#DDF5EC'}</u></span>
                 <span style={{ display: 'flex', gap: 4 }}>
+                  {!cat.is_active && (
+                    <button style={{ background: '#18342d', border: 'none', color: '#7fe0b2', cursor: 'pointer', padding: '4px 10px', borderRadius: 8, fontSize: 12, fontWeight: 700 }} onClick={() => approveCategory(cat)} title="Approve">
+                      Approve
+                    </button>
+                  )}
                   <button style={{ background: 'none', border: 'none', color: '#8fa19c', cursor: 'pointer', padding: 2 }} onClick={() => onEdit(cat)} title="Edit">
                     <Edit3 size={14} />
                   </button>
@@ -1992,6 +2025,8 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
   const [summary, setSummary] = useState(editItem?.summary || '');
   const [categoryId, setCategoryId] = useState(editItem?.category_id || '');
   const [status, setStatus] = useState<string>(editItem?.status || 'draft');
+  const [writerStatus, setWriterStatus] = useState<string>((editItem as any)?.writer_status || 'complete');
+  const [isNew, setIsNew] = useState<boolean>((editItem as any)?.is_new || false);
   const [coverFile, setCoverFile] = useState<File | null>(null);
   const [coverPreview, setCoverPreview] = useState(editItem?.cover_url || '');
   const [categories, setCategories] = useState<Category[]>([]);
@@ -2050,6 +2085,8 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
         dedication: dedication.trim(),
         show_ads: showAds,
         pdf_reward_ad: pdfRewardAd,
+        writer_status: writerStatus,
+        is_new: isNew,
       };
 
       if (editItem) {
@@ -2120,7 +2157,22 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
               <option value="published">Published</option>
             </select>
           </label>
-          <div />
+          <label>
+            Story state <small style={{ color: '#6B7280' }}>(চলমান/সমাপ্ত)</small>
+            <select value={writerStatus} onChange={e => setWriterStatus(e.target.value)}>
+              <option value="complete">সমাপ্ত (Complete)</option>
+              <option value="ongoing">চলমান (Ongoing)</option>
+            </select>
+          </label>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0', borderTop: '1px solid #E5E7EB', marginTop: 8 }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>Mark as New</div>
+            <div style={{ fontSize: 12, color: '#6B7280' }}>Shows নতুন badge on website</div>
+          </div>
+          <button type="button" onClick={() => setIsNew(!isNew)} style={{ width: 48, height: 26, borderRadius: 13, border: 'none', background: isNew ? '#3B82F6' : '#D1D5DB', cursor: 'pointer', position: 'relative', transition: 'background 0.2s' }}>
+            <span style={{ position: 'absolute', top: 3, left: isNew ? 25 : 3, width: 20, height: 20, borderRadius: 10, background: '#fff', transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
+          </button>
         </div>
         <label>
           Summary
