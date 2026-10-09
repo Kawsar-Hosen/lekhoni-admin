@@ -1902,7 +1902,101 @@ function SettingsPage({ onToast }: { onToast?: (m: string) => void }) {
           </button>
         </div>
       </div>
+      <AppVersionEditor onToast={onToast || ((m: string) => {})} />
       <AboutContentEditor onToast={onToast || ((m: string) => {})} />
+    </div>
+  );
+}
+
+function AppVersionEditor({ onToast }: { onToast: (m: string) => void }) {
+  const [code, setCode] = useState('');
+  const [name, setName] = useState('');
+  const [force, setForce] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  const load = () => {
+    setLoading(true);
+    api('/api/admin/app-version')
+      .then((d: any) => {
+        if (d) {
+          setCode(d.androidVersionCode || '');
+          setName(d.androidVersionName || '');
+          setForce(d.forceUpdate === '1');
+        }
+      })
+      .catch(() => onToast('Failed to load version'))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const save = async () => {
+    const n = parseInt(String(code), 10);
+    if (!Number.isFinite(n) || n < 0) { onToast('Enter a valid version code'); return; }
+    setSaving(true);
+    try {
+      await api('/api/admin/app-version', {
+        method: 'PUT',
+        body: JSON.stringify({
+          androidVersionCode: n,
+          androidVersionName: name.trim(),
+          forceUpdate: force,
+        }),
+      });
+      onToast('App version saved');
+      load();
+    } catch {
+      onToast('Failed to save version');
+    }
+    setSaving(false);
+  };
+
+  return (
+    <div className="panel" style={{ maxWidth: 600, marginTop: 20 }}>
+      <h3 style={{ marginBottom: 6 }}>App version (Android)</h3>
+      <p style={{ fontSize: 12, color: '#6f827d', marginBottom: 16 }}>
+        Set the latest Play Store version code. The app checks this on open and shows an
+        update prompt when the installed version is older.
+      </p>
+      <label>
+        Version code (versionCode)
+        <input
+          type="number"
+          value={code}
+          onChange={e => setCode(e.target.value)}
+          placeholder="e.g. 7"
+          disabled={loading}
+        />
+      </label>
+      <label>
+        Version name
+        <input
+          value={name}
+          onChange={e => setName(e.target.value)}
+          placeholder="e.g. 1.3.0"
+          disabled={loading}
+        />
+      </label>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', marginBottom: 14 }}>
+        <input
+          type="checkbox"
+          checked={force}
+          onChange={e => setForce(e.target.checked)}
+          style={{ width: 18, height: 18 }}
+        />
+        <span>Force update (no "Later" button)</span>
+      </label>
+      <p style={{ fontSize: 12, color: '#6f827d', marginTop: -8, marginBottom: 16 }}>
+        {force
+          ? 'ON — users cannot dismiss the update popup'
+          : 'OFF — users can tap "Later" and keep using the app'}
+      </p>
+      <div className="modal-actions">
+        <button className="primary" onClick={save} disabled={saving || loading}>
+          {saving ? 'Saving...' : 'Save version'}
+        </button>
+      </div>
     </div>
   );
 }
