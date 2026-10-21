@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
-  Activity, BarChart3, Bell, BookOpen, ChevronDown, CloudUpload,
+  Activity, BarChart3, Bell, BookOpen, ChevronDown, ChevronUp, CloudUpload,
   Eye, EyeOff, FileEdit, Image, LayoutDashboard, Menu, MessageSquare,
   MoreHorizontal, Plus, Search, Settings, Users, X, Trash2,
   Check, Ban, Send, Loader2, AlertTriangle, Shield, Filter,
@@ -255,6 +255,7 @@ function TermsWebPage() {
 
 function App() {
   const [page, setPage] = useState<Page>('Dashboard');
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [secret, setSecret] = useState<string>(() => { try { return localStorage.getItem('lekhoni_admin_secret') || ''; } catch { return ''; } });
   const [secretInput, setSecretInput] = useState('');
   const [secretErr, setSecretErr] = useState('');
@@ -266,6 +267,18 @@ function App() {
   const [editItem, setEditItem] = useState<any>(null);
   const lastNotifCount = useRef(0);
   const notifAudio = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMobileNavOpen(false); };
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [mobileNavOpen]);
 
   // Terms page route
   if (window.location.pathname === '/terms') return <TermsWebPage />;
@@ -283,7 +296,7 @@ function App() {
     try { localStorage.setItem('lekhoni_admin_secret', v); } catch {}
     setSecret(v); setSecretInput(''); setSecretErr(''); setVerifying(false);
   };
-  const clearSecret = () => { try { localStorage.removeItem('lekhoni_admin_secret'); } catch {} setSecret(''); };
+  const clearSecret = () => { try { localStorage.removeItem('lekhoni_admin_secret'); } catch {} setSecret(''); setMobileNavOpen(false); };
 
   // Request browser notification permission
   useEffect(() => {
@@ -360,15 +373,16 @@ function App() {
 
   return (
     <div className="shell">
-      <aside>
+      <aside className={mobileNavOpen ? 'open' : ''}>
         <div className="brand">
           <div className="mark">ল</div>
           <div><strong>Lekhoni</strong><small>CONTENT STUDIO</small></div>
           <button onClick={clearSecret} title="Lock admin" style={{ marginLeft: 'auto', cursor: 'pointer', background: 'none', border: 'none', fontSize: 16 }}>🔒</button>
+          <button className="nav-close" onClick={() => setMobileNavOpen(false)} title="Close menu" aria-label="Close menu"><X size={18} /></button>
         </div>
         <nav>
           {nav.map(([label, Icon]) => (
-            <button key={label} className={page === label ? 'active' : ''} onClick={() => setPage(label)}>
+            <button key={label} title={label} className={page === label ? 'active' : ''} onClick={() => { setPage(label); setMobileNavOpen(false); }}>
               <Icon size={18} />
               <span>{label}</span>
               {label === 'Comments' && pendingComments > 0 && <b>{pendingComments}</b>}
@@ -383,9 +397,10 @@ function App() {
           <ChevronDown size={15} />
         </div>
       </aside>
+      {mobileNavOpen && <div className="nav-backdrop" onClick={() => setMobileNavOpen(false)} />}
       <main>
         <header>
-          <button className="mobile"><Menu /></button>
+          <button className="mobile" onClick={() => setMobileNavOpen(v => !v)} aria-label="Open menu"><Menu /></button>
           <div>
             <p className="kicker">LEKHONI KAHINI</p>
             <h1>{page}</h1>
@@ -670,7 +685,7 @@ function BooksPage({ onEdit, onToast, onRefreshPending }: { onEdit: (b: Book) =>
             <p>Create your first book to get started.</p>
           </div>
         ) : (
-          <div className="table">
+          <div className="table cards-mobile">
             {filtered.map(b => (
               <div className="tr" key={b.id}>
                 <span className="book-cell">
@@ -814,7 +829,7 @@ function ChaptersPage({ onToast }: { onToast: (m: string) => void }) {
             <p>Add chapters to your books.</p>
           </div>
         ) : (
-          <div className="table">
+          <div className="table cards-mobile">
             {filtered.map(ch => (
               <div className="tr" key={ch.id}>
                 <span className="book-cell">
@@ -939,7 +954,7 @@ function CategoriesPage({ onEdit, onToast }: { onEdit: (c: Category) => void; on
             <p>{tab === 'requests' ? 'Writer category requests will appear here.' : 'Create categories to organize books.'}</p>
           </div>
         ) : (
-          <div className="table">
+          <div className="table cards-mobile">
             {shown.map(cat => (
               <div className="tr" key={cat.id}>
                 <span className="book-cell">
@@ -1056,7 +1071,7 @@ function CommentsPage({ onToast, onRefreshPending }: { onToast: (m: string) => v
             <p>Comments from readers will appear here.</p>
           </div>
         ) : (
-          <div className="table">
+          <div className="table cards-mobile">
             {filtered.map(c => (
               <div className="tr" key={c.id} style={{ gridTemplateColumns: '1fr 100px 100px 120px 30px' }}>
                 <span className="book-cell">
@@ -1173,7 +1188,7 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
         ) : users.length === 0 ? (
           <div className="empty"><Users size={35} /><h3>No writers yet</h3><p>Writer accounts will appear here.</p></div>
         ) : (
-          <div className="table">
+          <div className="table writers-table">
             {users.map((u: any) => (
               <div className="tr" key={u.id} style={{ gridTemplateColumns: '52px 1fr 100px 90px 90px 80px 80px', cursor: 'pointer' }} onClick={() => openDetail(u.id)}>
                 <span className="book-cell">
@@ -1319,7 +1334,7 @@ function UsersPage({ onToast }: { onToast: (m: string) => void }) {
   const formatDateTime = (s: string) => s ? new Date(s).toLocaleString('bn-BD', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '-';
 
   return (
-    <div>
+    <div className="content">
       <div style={{ display: 'flex', gap: 10, marginBottom: 16, alignItems: 'center' }}>
         <div style={{ flex: 1, position: 'relative' }}>
           <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', opacity: 0.4 }} />
@@ -1335,7 +1350,7 @@ function UsersPage({ onToast }: { onToast: (m: string) => void }) {
       ) : (
         <div style={{ display: 'grid', gap: 10 }}>
           {filtered.map(u => (
-            <div key={u.id} style={{ background: 'var(--card)', border: '1px solid var(--line)', borderRadius: 12, padding: 14, display: 'flex', alignItems: 'center', gap: 14 }}>
+            <div key={u.id} style={{ background: 'var(--card)', border: '1px solid var(--line)', borderRadius: 12, padding: 14, display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
               {u.avatar_url ? (
                 <img src={u.avatar_url} alt="" style={{ width: 44, height: 44, borderRadius: 22, objectFit: 'cover' }} />
               ) : (
@@ -1346,14 +1361,14 @@ function UsersPage({ onToast }: { onToast: (m: string) => void }) {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontWeight: 700, fontSize: 14, color: 'var(--ink)' }}>{u.user_name || u.display_name || 'Anonymous'}</div>
                 {u.user_bio && <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.user_bio}</div>}
-                <div style={{ display: 'flex', gap: 12, marginTop: 6, fontSize: 11, color: 'var(--muted)' }}>
+                <div style={{ display: 'flex', gap: 12, marginTop: 6, fontSize: 11, color: 'var(--muted)', flexWrap: 'wrap' }}>
                   <span>Joined: {formatDate(u.last_active || u.last_seen_at)}</span>
                   <span>Favorites: {u.favorites_count || 0}</span>
                   <span>Bookmarks: {u.bookmarks_count || 0}</span>
                   <span>Comments: {u.comments_count || 0}</span>
                 </div>
               </div>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginLeft: 'auto' }}>
                 <span style={{ fontSize: 10, padding: '3px 8px', borderRadius: 6, background: u.language === 'bn' ? '#10B98122' : u.language === 'hi' ? '#F59E0B22' : '#3B82F622', color: u.language === 'bn' ? '#10B981' : u.language === 'hi' ? '#F59E0B' : '#3B82F6', fontWeight: 600 }}>
                   {u.language === 'bn' ? 'বাংলা' : u.language === 'hi' ? 'हिन्दी' : 'English'}
                 </span>
@@ -1367,8 +1382,8 @@ function UsersPage({ onToast }: { onToast: (m: string) => void }) {
       )}
 
       {deleteId && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
-          <div style={{ background: 'var(--card)', borderRadius: 18, padding: 28, width: 360, textAlign: 'center', border: '1px solid var(--line)' }}>
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999, padding: 16 }}>
+          <div style={{ background: 'var(--card)', borderRadius: 18, padding: 28, width: 'min(360px, calc(100vw - 32px))', textAlign: 'center', border: '1px solid var(--line)' }}>
             <div style={{ width: 52, height: 52, borderRadius: 26, background: '#FEE2E2', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
               <AlertTriangle size={26} color="#EF4444" />
             </div>
@@ -1429,6 +1444,17 @@ function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
   };
   const onDragEnd = () => { setDragIdx(null); setOverIdx(null); };
 
+  const moveSection = (index: number, direction: -1 | 1) => {
+    setSections((current) => {
+      const target = index + direction;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      const [moved] = next.splice(index, 1);
+      next.splice(target, 0, moved);
+      return next;
+    });
+  };
+
   const save = () => {
     setSaving(true);
     api('/api/admin/home-config', { method: 'PUT', body: JSON.stringify({ sections }) })
@@ -1484,10 +1510,16 @@ function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
                   />
                   <span>{meta?.desc}</span>
                 </div>
-                <button className="hc-toggle" onClick={() => toggle(s.key)} title={s.enabled ? 'Visible' : 'Hidden'}>
-                  <span className={`hc-toggle-text ${s.enabled ? 'on' : ''}`}>{s.enabled ? 'On' : 'Off'}</span>
-                  {s.enabled ? <ToggleRight size={26} /> : <ToggleLeft size={26} />}
-                </button>
+                <div className="hc-controls">
+                  <div className="hc-move">
+                    <button type="button" onClick={() => moveSection(i, -1)} disabled={i === 0} title="Move up" aria-label="Move up"><ChevronUp size={15} /></button>
+                    <button type="button" onClick={() => moveSection(i, 1)} disabled={i === sections.length - 1} title="Move down" aria-label="Move down"><ChevronDown size={15} /></button>
+                  </div>
+                  <button className="hc-toggle" onClick={() => toggle(s.key)} title={s.enabled ? 'Visible' : 'Hidden'}>
+                    <span className={`hc-toggle-text ${s.enabled ? 'on' : ''}`}>{s.enabled ? 'On' : 'Off'}</span>
+                    {s.enabled ? <ToggleRight size={26} /> : <ToggleLeft size={26} />}
+                  </button>
+                </div>
               </div>
             );
           })}
@@ -1555,7 +1587,7 @@ function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
             <p>Create notifications to reach your readers.</p>
           </div>
         ) : (
-          <div className="table">
+          <div className="table cards-mobile">
             {notifications.map(n => {
               const IconComp = iconMap[n.icon] || Bell;
               return (
@@ -1782,7 +1814,7 @@ function ReportsPage({ onToast }: { onToast: (m: string, t?: string) => void }) 
       }
       {selected && (
         <div className="modal-overlay" onClick={() => { setSelected(null); setActionNote(''); }}>
-          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+          <div className="modal report-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
             <h3 style={{ margin: 0, marginBottom: 12 }}>Report Details</h3>
             <div style={{ marginBottom: 16 }}>
               <div style={{ display: 'grid', gridTemplateColumns: '100px 1fr', gap: '6px 12px', fontSize: 14 }}>
@@ -1797,16 +1829,16 @@ function ReportsPage({ onToast }: { onToast: (m: string, t?: string) => void }) 
             {selected.book_id && (
               <div style={{ marginBottom: 16 }}>
                 <h4 style={{ margin: '0 0 8px', fontSize: 14 }}>Story Preview</h4>
-                <div style={{ padding: 12, background: '#F9FAFB', borderRadius: 8, border: '1px solid #E5E7EB', fontSize: 13 }}>
+                <div style={{ padding: 12, background: '#F9FAFB', borderRadius: 8, border: '1px solid #E5E7EB', fontSize: 13, color: '#374151' }}>
                   <p style={{ margin: 0, fontWeight: 600 }}>{selected.book_title}</p>
                   <p style={{ margin: '4px 0 0', color: '#6B7280' }}>by {selected.book_author}</p>
                 </div>
               </div>
             )}
-            <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 4 }}>Admin Note (optional)</label>
-            <textarea value={actionNote} onChange={e => setActionNote(e.target.value)} rows={2} style={{ width: '100%', padding: 8, borderRadius: 6, border: '1px solid #D1D5DB', fontSize: 13, resize: 'vertical', marginBottom: 16 }} placeholder="Reason for action..." />
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <button onClick={() => handleAction('dismiss')} disabled={processing} style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid #D1D5DB', background: '#fff', cursor: 'pointer', fontWeight: 600, fontSize: 13 }}>Dismiss</button>
+            <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#9fb0ab', marginBottom: 4 }}>Admin Note (optional)</label>
+            <textarea value={actionNote} onChange={e => setActionNote(e.target.value)} rows={2} style={{ width: '100%', padding: 8, borderRadius: 6, border: '1px solid #2d3e39', fontSize: 13, resize: 'vertical', marginBottom: 16, background: '#0e1614', color: '#e9f1ee' }} placeholder="Reason for action..." />
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+              <button onClick={() => handleAction('dismiss')} disabled={processing} style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid #D1D5DB', background: '#fff', color: '#374151', cursor: 'pointer', fontWeight: 600, fontSize: 13 }}>Dismiss</button>
               <button onClick={() => handleAction('warn')} disabled={processing} style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: '#F59E0B', color: '#fff', cursor: 'pointer', fontWeight: 600, fontSize: 13 }}>Warn Writer</button>
               <button onClick={() => handleAction('delete')} disabled={processing} style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: '#EF4444', color: '#fff', cursor: 'pointer', fontWeight: 600, fontSize: 13 }}>Delete Story</button>
             </div>
@@ -1858,7 +1890,7 @@ function SettingsPage({ onToast }: { onToast?: (m: string) => void }) {
           <p>Configure your admin panel and platform settings.</p>
         </div>
       </div>
-      <div className="panel" style={{ maxWidth: 600 }}>
+      <div className="panel settings-panel" style={{ maxWidth: 600 }}>
         <h3 style={{ marginBottom: 16 }}>General</h3>
         <label>
           Site name
@@ -1953,7 +1985,7 @@ function AppVersionEditor({ onToast }: { onToast: (m: string) => void }) {
   };
 
   return (
-    <div className="panel" style={{ maxWidth: 600, marginTop: 20 }}>
+    <div className="panel settings-panel" style={{ maxWidth: 600, marginTop: 20 }}>
       <h3 style={{ marginBottom: 6 }}>App version (Android)</h3>
       <p style={{ fontSize: 12, color: '#6f827d', marginBottom: 16 }}>
         Set the latest Play Store version code. The app checks this on open and shows an
@@ -2057,7 +2089,7 @@ function AboutContentEditor({ onToast }: { onToast: (m: string) => void }) {
   };
 
   return (
-    <div className="panel" style={{ maxWidth: 600, marginTop: 24 }}>
+    <div className="panel settings-panel" style={{ maxWidth: 600, marginTop: 24 }}>
       <h3 style={{ marginBottom: 16 }}>About App Content</h3>
       <p style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 16 }}>This content appears on the "About App" page. App shows permanent defaults if not saved.</p>
       {/* Language tabs */}
@@ -2092,7 +2124,7 @@ function AboutContentEditor({ onToast }: { onToast: (m: string) => void }) {
         </div>
       ))}
       <button onClick={addFeature} style={{ fontSize: 12, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', marginBottom: 16 }}>+ Add feature</button>
-      <div style={{ display: 'flex', gap: 12 }}>
+      <div className="settings-row" style={{ display: 'flex', gap: 12 }}>
         <label style={{ flex: 1 }}>
           Version
           <input value={version} onChange={e => setVersion(e.target.value)} placeholder="1.0.0" />
