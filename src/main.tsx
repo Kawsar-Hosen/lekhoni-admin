@@ -122,7 +122,9 @@ interface Analytics {
   daily_views: { date: string; views: number }[];
 }
 
-type Page = 'Dashboard' | 'Books' | 'Chapters' | 'Categories' | 'Comments' | 'Writers' | 'Users' | 'Home Control' | 'Notifications' | 'Analytics' | 'Settings' | 'Reports';
+type Page = 'Dashboard' | 'Books' | 'Chapters' | 'Categories' | 'Comments' | 'Writers' | 'Users' | 'Home Control' | 'Notifications' | 'Moderators' | 'Analytics' | 'Settings' | 'Reports';
+
+type ModeratorUser = { id?: string; username?: string; displayName?: string; display_name?: string; role?: string };
 
 const API_BASE = 'https://lekhoni-admin-api.smdkawsar2.workers.dev';
 
@@ -136,6 +138,7 @@ const nav: [Page, React.ElementType][] = [
   ['Users', UserCheck],
   ['Home Control', Sparkles],
   ['Notifications', Bell],
+  ['Moderators', Shield],
   ['Reports', Flag],
   ['Analytics', BarChart3],
   ['Settings', Settings],
@@ -150,7 +153,7 @@ async function api<T = any>(path: string, options: RequestInit = {}): Promise<T>
     headers['Content-Type'] = 'application/json';
   }
   try {
-    const s = localStorage.getItem('lekhoni_admin_secret');
+    const s = localStorage.getItem('lekhoni_moderator_token') || localStorage.getItem('lekhoni_admin_secret');
     if (s) headers['Authorization'] = 'Bearer ' + s;
   } catch {}
   const res = await fetch(url, { ...options, headers: { ...headers, ...options.headers as Record<string, string> } });
@@ -254,9 +257,21 @@ function TermsWebPage() {
 // ─── App ────────────────────────────────────────────────────────────────
 
 function App() {
-  const [page, setPage] = useState<Page>('Dashboard');
+  const [page, setPage] = useState<Page>(() => { try { return localStorage.getItem('lekhoni_moderator_token') ? 'Books' : 'Dashboard'; } catch { return 'Dashboard'; } });
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [secret, setSecret] = useState<string>(() => { try { return localStorage.getItem('lekhoni_admin_secret') || ''; } catch { return ''; } });
+  const [role, setRole] = useState<'admin' | 'moderator'>(() => { try { return localStorage.getItem('lekhoni_moderator_token') ? 'moderator' : 'admin'; } catch { return 'admin'; } });
+  const [moderator, setModerator] = useState<ModeratorUser | null>(() => { try { const raw = localStorage.getItem('lekhoni_moderator_user'); return raw ? JSON.parse(raw) as ModeratorUser : null; } catch { return null; } });
+  const [secret, setSecret] = useState<string>(() => { try { return localStorage.getItem('lekhoni_moderator_token') || localStorage.getItem('lekhoni_admin_secret') || ''; } catch { return ''; } });
+  const [loginMode, setLoginMode] = useState<'admin' | 'moderator'>(() => {
+    try {
+      if (window.location.hostname === 'lekhoni-admin.pages.dev') return 'moderator';
+      return new URLSearchParams(window.location.search).has('moderator') ? 'moderator' : 'admin';
+    } catch { return 'admin'; }
+  });
+  const [modUsername, setModUsername] = useState('');
+  const [modPassword, setModPassword] = useState('');
+  const [modErr, setModErr] = useState('');
+  const [modVerifying, setModVerifying] = useState(false);
   const [secretInput, setSecretInput] = useState('');
   const [secretErr, setSecretErr] = useState('');
   const [modal, setModal] = useState<string | null>(null);
@@ -293,10 +308,65 @@ function App() {
       if (res.status === 401) { setSecretErr('ভুল secret — আবার যত্ন করে বসাও'); setVerifying(false); return; }
       if (!res.ok) { setSecretErr('Server error (' + res.status + ') — পরে চেষ্টা করো'); setVerifying(false); return; }
     } catch { setSecretErr('Network error — সংযোগ চেক করো'); setVerifying(false); return; }
-    try { localStorage.setItem('lekhoni_admin_secret', v); } catch {}
+    try { localStorage.setItem('lekhoni_admin_secret', v); localStorage.removeItem('lekhoni_moderator_token'); localStorage.removeItem('lekhoni_moderator_user'); } catch {}
+    setRole('admin'); setModerator(null); setPage('Dashboard');
     setSecret(v); setSecretInput(''); setSecretErr(''); setVerifying(false);
   };
-  const clearSecret = () => { try { localStorage.removeItem('lekhoni_admin_secret'); } catch {} setSecret(''); setMobileNavOpen(false); };
+  const clearSecret = () => {
+    try {
+      localStorage.removeItem('lekhoni_admin_secret');
+      localStorage.removeItem('lekhoni_moderator_token');
+      localStorage.removeItem('lekhoni_moderator_user');
+    } catch {}
+    setSecret(''); setRole('admin'); setModerator(null); setPage('Dashboard');
+    setMobileNavOpen(false); setLoginMode('admin'); setModUsername(''); setModPassword(''); setModErr('');
+  };
+  const moderatorLogin = async () => {
+    const u = modUsername.trim().toLowerCase();
+    if (!u || !modPassword) { setModErr('Username and password দিন'); return; }
+    setModVerifying(true); setModErr('');
+    try {
+      const res = await fetch(`${API_BASE}/api/moderator/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: modPassword }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || !d.token) { setModErr(d.error || 'Login failed'); return; }
+      try {
+        localStorage.setItem('lekhoni_moderator_token', d.token);
+        localStorage.setItem('lekhoni_moderator_user', JSON.stringify(d.user || {}));
+        localStorage.removeItem('lekhoni_admin_secret');
+      } catch {}
+      setRole('moderator'); setModerator(d.user || null); setSecret(d.token); setPage('Books');
+      setModPassword(''); setModErr('');
+    } catch { setModErr('Network error — সংযোগ চেক করো'); }
+    finally { setModVerifying(false); }
+  };
+
+  // Moderator can only use the shared moderation pages.
+  useEffect(() => {
+    if (role === 'moderator' && !['Books', 'Writers', 'Notifications'].includes(page)) setPage('Books');
+  }, [role, page]);
+
+  // Validate a stored moderator session once on load.
+  useEffect(() => {
+    if (role !== 'moderator' || !secret) return;
+    let cancelled = false;
+    api<{ user: ModeratorUser }>('/api/moderator/me')
+      .then(d => {
+        if (cancelled || !d?.user) return;
+        setModerator(d.user);
+        try { localStorage.setItem('lekhoni_moderator_user', JSON.stringify(d.user)); } catch {}
+      })
+      .catch(() => {
+        if (cancelled) return;
+        try { localStorage.removeItem('lekhoni_moderator_token'); localStorage.removeItem('lekhoni_moderator_user'); } catch {}
+        setRole('admin'); setModerator(null); setPage('Dashboard'); setSecret('');
+      });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Request browser notification permission
   useEffect(() => {
@@ -357,16 +427,39 @@ function App() {
   const openEdit = (type: string, item: any) => { setEditItem(item); setModal(type); };
   const closeModal = () => { setModal(null); setEditItem(null); };
   const showToast = (msg: string) => setToast(msg);
+  const isModerator = role === 'moderator';
+  const visibleNav = isModerator ? nav.filter(([label]) => ['Books', 'Writers', 'Notifications'].includes(label)) : nav;
+  const profileName = isModerator ? (moderator?.displayName || moderator?.display_name || moderator?.username || 'Moderator') : 'Kawsar';
+  const profileRole = isModerator ? 'Moderator' : 'Administrator';
+  const avatarLetter = (profileName || 'M').charAt(0).toUpperCase();
 
   if (!secret) return (
-    <div className="shell" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
-      <div style={{ maxWidth: 360, width: '100%', padding: 24, textAlign: 'center' }}>
+    <div className="shell" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', padding: 16 }}>
+      <div style={{ maxWidth: 380, width: '100%', padding: 24, textAlign: 'center', background: '#121b1a', border: '1px solid #25332f', borderRadius: 14 }}>
         <div className="mark" style={{ margin: '0 auto 12px' }}>ল</div>
-        <h2>Admin Login</h2>
-        <p style={{ opacity: 0.7 }}>Enter the ADMIN_SECRET to manage Lekhoni Kahini.</p>
-        <input type="password" value={secretInput} onChange={e => setSecretInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') saveSecret(); }} placeholder="Admin secret" style={{ width: '100%', padding: '10px 12px', margin: '12px 0', borderRadius: 8, border: '1px solid #ccc' }} />
-        {secretErr && <p style={{ color: 'red' }}>{secretErr}</p>}
-        <button onClick={saveSecret} disabled={verifying} style={{ width: '100%', padding: '10px', borderRadius: 8, cursor: 'pointer', opacity: verifying ? 0.6 : 1 }}>{verifying ? 'যাচাই হচ্ছে…' : 'Unlock'}</button>
+        <h2 style={{ marginBottom: 6 }}>{loginMode === 'admin' ? 'Admin Login' : 'Moderator Login'}</h2>
+        <p style={{ opacity: 0.7, fontSize: 12, marginBottom: 16 }}>
+          {loginMode === 'admin' ? 'Enter the ADMIN_SECRET to manage Lekhoni Kahini.' : 'আপনার username ও password দিয়ে লগইন করুন।'}
+        </p>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+          <button type="button" onClick={() => { setLoginMode('admin'); setModErr(''); setSecretErr(''); }} style={{ flex: 1, padding: '9px 12px', borderRadius: 8, border: '1px solid ' + (loginMode === 'admin' ? '#4bc8a5' : '#2a3935'), background: loginMode === 'admin' ? '#173a31' : 'transparent', color: loginMode === 'admin' ? '#56d5b1' : '#8fa19c', cursor: 'pointer', fontWeight: 700, fontSize: 12 }}>Admin</button>
+          <button type="button" onClick={() => { setLoginMode('moderator'); setModErr(''); setSecretErr(''); }} style={{ flex: 1, padding: '9px 12px', borderRadius: 8, border: '1px solid ' + (loginMode === 'moderator' ? '#4bc8a5' : '#2a3935'), background: loginMode === 'moderator' ? '#173a31' : 'transparent', color: loginMode === 'moderator' ? '#56d5b1' : '#8fa19c', cursor: 'pointer', fontWeight: 700, fontSize: 12 }}>Moderator</button>
+        </div>
+        {loginMode === 'admin' ? (
+          <>
+            <input type="password" value={secretInput} onChange={e => setSecretInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') saveSecret(); }} placeholder="Admin secret" style={{ width: '100%', padding: '11px 12px', margin: '4px 0 12px', borderRadius: 8, border: '1px solid #2a3935', background: '#0e1614', color: '#eaf4f0', outline: 'none', fontSize: 16 }} />
+            {secretErr && <p style={{ color: '#ff8a7a', fontSize: 12, margin: '0 0 12px' }}>{secretErr}</p>}
+            <button onClick={saveSecret} disabled={verifying} style={{ width: '100%', padding: '11px', borderRadius: 8, border: 0, cursor: 'pointer', background: '#4bc8a5', color: '#09221c', fontWeight: 800, opacity: verifying ? 0.6 : 1 }}>{verifying ? 'যাচাই হচ্ছে…' : 'Unlock'}</button>
+          </>
+        ) : (
+          <>
+            <input autoComplete="username" value={modUsername} onChange={e => setModUsername(e.target.value)} placeholder="Username" style={{ width: '100%', padding: '11px 12px', margin: '4px 0 8px', borderRadius: 8, border: '1px solid #2a3935', background: '#0e1614', color: '#eaf4f0', outline: 'none', fontSize: 16 }} />
+            <input autoComplete="current-password" type="password" value={modPassword} onChange={e => setModPassword(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') moderatorLogin(); }} placeholder="Password" style={{ width: '100%', padding: '11px 12px', margin: '0 0 12px', borderRadius: 8, border: '1px solid #2a3935', background: '#0e1614', color: '#eaf4f0', outline: 'none', fontSize: 16 }} />
+            {modErr && <p style={{ color: '#ff8a7a', fontSize: 12, margin: '0 0 12px' }}>{modErr}</p>}
+            <button onClick={moderatorLogin} disabled={modVerifying} style={{ width: '100%', padding: '11px', borderRadius: 8, border: 0, cursor: 'pointer', background: '#4bc8a5', color: '#09221c', fontWeight: 800, opacity: modVerifying ? 0.6 : 1 }}>{modVerifying ? 'লগইন হচ্ছে…' : 'Login as Moderator'}</button>
+            <p style={{ color: '#71837e', fontSize: 10, margin: '14px 0 0', lineHeight: 1.6 }}>Limited access: Books, Writers and Notifications only.</p>
+          </>
+        )}
       </div>
     </div>
   );
@@ -377,11 +470,11 @@ function App() {
         <div className="brand">
           <div className="mark">ল</div>
           <div><strong>Lekhoni</strong><small>CONTENT STUDIO</small></div>
-          <button onClick={clearSecret} title="Lock admin" style={{ marginLeft: 'auto', cursor: 'pointer', background: 'none', border: 'none', fontSize: 16 }}>🔒</button>
+          <button onClick={clearSecret} title={isModerator ? 'Logout moderator' : 'Lock admin'} style={{ marginLeft: 'auto', cursor: 'pointer', background: 'none', border: 'none', fontSize: 16 }}>🔒</button>
           <button className="nav-close" onClick={() => setMobileNavOpen(false)} title="Close menu" aria-label="Close menu"><X size={18} /></button>
         </div>
         <nav>
-          {nav.map(([label, Icon]) => (
+          {visibleNav.map(([label, Icon]) => (
             <button key={label} title={label} className={page === label ? 'active' : ''} onClick={() => { setPage(label); setMobileNavOpen(false); }}>
               <Icon size={18} />
               <span>{label}</span>
@@ -392,8 +485,8 @@ function App() {
           ))}
         </nav>
         <div className="admin">
-          <div className="avatar">K</div>
-          <div><strong>Kawsar</strong><small>Administrator</small></div>
+          <div className="avatar">{avatarLetter}</div>
+          <div><strong>{profileName}</strong><small>{profileRole}</small></div>
           <ChevronDown size={15} />
         </div>
       </aside>
@@ -411,24 +504,25 @@ function App() {
               <input placeholder="Search anything..." />
             </label>
             <button className="icon"><Bell size={19} /><i /></button>
-            {(page === 'Books') && <button className="primary" onClick={() => openCreate('book')}><Plus size={17} /> New book</button>}
-            {page === 'Chapters' && <button className="primary" onClick={() => openCreate('chapter')}><Plus size={17} /> New chapter</button>}
-            {page === 'Categories' && <button className="primary" onClick={() => openCreate('category')}><Plus size={17} /> New category</button>}
+            {(page === 'Books' && !isModerator) && <button className="primary" onClick={() => openCreate('book')}><Plus size={17} /> New book</button>}
+            {page === 'Chapters' && !isModerator && <button className="primary" onClick={() => openCreate('chapter')}><Plus size={17} /> New chapter</button>}
+            {page === 'Categories' && !isModerator && <button className="primary" onClick={() => openCreate('category')}><Plus size={17} /> New category</button>}
             {page === 'Notifications' && <button className="primary" onClick={() => openCreate('notification')}><Plus size={17} /> New notification</button>}
           </div>
         </header>
-        {page === 'Dashboard' && <Dashboard onCreate={() => openCreate('book')} onToast={showToast} />}
-        {page === 'Books' && <BooksPage onEdit={(b: Book) => openEdit('book', b)} onToast={showToast} onRefreshPending={setPendingComments} />}
-        {page === 'Chapters' && <ChaptersPage onToast={showToast} />}
-        {page === 'Categories' && <CategoriesPage onEdit={(c: Category) => openEdit('category', c)} onToast={showToast} />}
-        {page === 'Comments' && <CommentsPage onToast={showToast} onRefreshPending={setPendingComments} />}
-            {page === 'Writers' && <WritersPage onToast={showToast} onRefreshPending={setPendingWriters} />}
-            {page === 'Users' && <UsersPage onToast={showToast} />}
-            {page === 'Home Control' && <HomeControlPage onToast={showToast} />}
-            {page === 'Notifications' && <NotificationsPage onToast={showToast} />}
-        {page === 'Analytics' && <AnalyticsPage />}
-        {page === 'Reports' && <ReportsPage onToast={showToast} />}
-        {page === 'Settings' && <SettingsPage onToast={showToast} />}
+        {page === 'Dashboard' && !isModerator && <Dashboard onCreate={() => openCreate('book')} onToast={showToast} />}
+        {page === 'Books' && <BooksPage isModerator={isModerator} onEdit={(b: Book) => openEdit('book', b)} onToast={showToast} onRefreshPending={setPendingComments} />}
+        {page === 'Chapters' && !isModerator && <ChaptersPage onToast={showToast} />}
+        {page === 'Categories' && !isModerator && <CategoriesPage onEdit={(c: Category) => openEdit('category', c)} onToast={showToast} />}
+        {page === 'Comments' && !isModerator && <CommentsPage onToast={showToast} onRefreshPending={setPendingComments} />}
+            {page === 'Writers' && <WritersPage isModerator={isModerator} onToast={showToast} onRefreshPending={setPendingWriters} />}
+            {page === 'Users' && !isModerator && <UsersPage onToast={showToast} />}
+            {page === 'Home Control' && !isModerator && <HomeControlPage onToast={showToast} />}
+            {page === 'Notifications' && <NotificationsPage canDelete={!isModerator} onToast={showToast} />}
+        {page === 'Moderators' && !isModerator && <ModeratorsPage onToast={showToast} />}
+        {page === 'Analytics' && !isModerator && <AnalyticsPage />}
+        {page === 'Reports' && !isModerator && <ReportsPage onToast={showToast} />}
+        {page === 'Settings' && !isModerator && <SettingsPage onToast={showToast} />}
       </main>
       {modal === 'book' && <BookModal editItem={editItem} close={closeModal} onToast={showToast} />}
       {modal === 'chapter' && <ChapterModal close={closeModal} onToast={showToast} />}
@@ -588,7 +682,7 @@ function Dashboard({ onCreate, onToast }: { onCreate: () => void; onToast: (m: s
 
 // ─── Books Page ─────────────────────────────────────────────────────────
 
-function BooksPage({ onEdit, onToast, onRefreshPending }: { onEdit: (b: Book) => void; onToast: (m: string) => void; onRefreshPending?: (n: number) => void }) {
+function BooksPage({ onEdit, onToast, onRefreshPending, isModerator = false }: { onEdit: (b: Book) => void; onToast: (m: string) => void; onRefreshPending?: (n: number) => void; isModerator?: boolean }) {
   const [books, setBooks] = useState<Book[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -664,8 +758,8 @@ function BooksPage({ onEdit, onToast, onRefreshPending }: { onEdit: (b: Book) =>
     <div className="content">
       <div className="resource-head">
         <div>
-          <h2>Manage books</h2>
-          <p>Everything published here syncs safely with the mobile app.</p>
+          <h2>{isModerator ? 'Review stories' : 'Manage books'}</h2>
+          <p>{isModerator ? 'Publish, unpublish or delete stories. Editing is restricted to admins.' : 'Everything published here syncs safely with the mobile app.'}</p>
         </div>
       </div>
       <div className="panel resource">
@@ -682,7 +776,7 @@ function BooksPage({ onEdit, onToast, onRefreshPending }: { onEdit: (b: Book) =>
           <div className="empty">
             <CloudUpload size={35} />
             <h3>No books yet</h3>
-            <p>Create your first book to get started.</p>
+            <p>{isModerator ? 'No stories found to review.' : 'Create your first book to get started.'}</p>
           </div>
         ) : (
           <div className="table cards-mobile">
@@ -708,28 +802,36 @@ function BooksPage({ onEdit, onToast, onRefreshPending }: { onEdit: (b: Book) =>
                 <span>{b.chapters_count ?? 0} ch.</span>
                 <span>{formatNumber(b.views)} views</span>
                 <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <select
-                    value={b.home_section || ''}
-                    onChange={e => setHomeSection(b, e.target.value)}
-                    style={{ background: 'transparent', color: '#8fa19c', border: '1px solid #ffffff22', borderRadius: 6, padding: '2px 4px', fontSize: 11 }}
-                    title="Home section override"
-                  >
-                    <option value="">Auto</option>
-                    <option value="ongoing">চলমান (new)</option>
-                    <option value="weekly">সাপ্তাহিক</option>
-                    <option value="monthly">মাসিক</option>
-                    <option value="featured">বিশেষ (Featured)</option>
-                  </select>
-                  <button style={{ background: 'none', border: 'none', color: '#8fa19c', cursor: 'pointer', padding: 2, display: 'inline-flex', alignItems: 'center', gap: 4 }} onClick={() => toggleViewsVisible(b)} title={b.views_visible === false ? 'Views OFF — click to show in app' : 'Views ON — click to hide in app'}>
-                    {b.views_visible === false ? <EyeOff size={15} /> : <Eye size={15} />}
-                    <span style={{ fontSize: 10, fontWeight: 800, color: b.views_visible === false ? '#e15e4e' : '#2aa876' }}>{b.views_visible === false ? 'OFF' : 'ON'}</span>
-                  </button>
-                  <button style={{ background: 'none', border: 'none', color: b.featured ? '#f5c660' : '#8fa19c', cursor: 'pointer', padding: 2 }} onClick={() => toggleFeature(b)} title={b.featured ? 'Remove from Featured' : 'Add to Featured'}>
-                    <Star size={15} fill={b.featured ? '#f5c660' : 'none'} />
-                  </button>
-                  <button style={{ background: 'none', border: 'none', color: '#8fa19c', cursor: 'pointer', padding: 2 }} onClick={() => onEdit(b)} title="Edit">
-                    <Edit3 size={14} />
-                  </button>
+                  {!isModerator && (
+                    <select
+                      value={b.home_section || ''}
+                      onChange={e => setHomeSection(b, e.target.value)}
+                      style={{ background: 'transparent', color: '#8fa19c', border: '1px solid #ffffff22', borderRadius: 6, padding: '2px 4px', fontSize: 11 }}
+                      title="Home section override"
+                    >
+                      <option value="">Auto</option>
+                      <option value="ongoing">চলমান (new)</option>
+                      <option value="weekly">সাপ্তাহিক</option>
+                      <option value="monthly">মাসিক</option>
+                      <option value="featured">বিশেষ (Featured)</option>
+                    </select>
+                  )}
+                  {!isModerator && (
+                    <button style={{ background: 'none', border: 'none', color: '#8fa19c', cursor: 'pointer', padding: 2, display: 'inline-flex', alignItems: 'center', gap: 4 }} onClick={() => toggleViewsVisible(b)} title={b.views_visible === false ? 'Views OFF — click to show in app' : 'Views ON — click to hide in app'}>
+                      {b.views_visible === false ? <EyeOff size={15} /> : <Eye size={15} />}
+                      <span style={{ fontSize: 10, fontWeight: 800, color: b.views_visible === false ? '#e15e4e' : '#2aa876' }}>{b.views_visible === false ? 'OFF' : 'ON'}</span>
+                    </button>
+                  )}
+                  {!isModerator && (
+                    <button style={{ background: 'none', border: 'none', color: b.featured ? '#f5c660' : '#8fa19c', cursor: 'pointer', padding: 2 }} onClick={() => toggleFeature(b)} title={b.featured ? 'Remove from Featured' : 'Add to Featured'}>
+                      <Star size={15} fill={b.featured ? '#f5c660' : 'none'} />
+                    </button>
+                  )}
+                  {!isModerator && (
+                    <button style={{ background: 'none', border: 'none', color: '#8fa19c', cursor: 'pointer', padding: 2 }} onClick={() => onEdit(b)} title="Edit">
+                      <Edit3 size={14} />
+                    </button>
+                  )}
                   <button style={{ background: 'none', border: 'none', color: '#e15e4e', cursor: 'pointer', padding: 2 }} onClick={() => deleteBook(b)} title="Delete">
                     <Trash2 size={14} />
                   </button>
@@ -1125,7 +1227,7 @@ function CommentsPage({ onToast, onRefreshPending }: { onToast: (m: string) => v
 
 // ─── Writers Page ───────────────────────────────────────────────────────
 
-function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => void; onRefreshPending?: (n: number) => void }) {
+function WritersPage({ onToast, onRefreshPending, isModerator = false }: { onToast: (m: string) => void; onRefreshPending?: (n: number) => void; isModerator?: boolean }) {
   const [users, setUsers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [sel, setSel] = useState<any>(null);
@@ -1172,7 +1274,7 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
       <div className="resource-head">
         <div>
           <h2>All writers</h2>
-          <p>Check each writer — how many stories they've published and their details.</p>
+          <p>{isModerator ? 'Review pending stories and give verified badges to trusted writers.' : 'Check each writer — how many stories they\'ve published and their details.'}</p>
         </div>
       </div>
       <div className="panel resource">
@@ -1202,12 +1304,16 @@ function WritersPage({ onToast, onRefreshPending }: { onToast: (m: string) => vo
                   </em>
                 </span>
                 <span onClick={(e) => e.stopPropagation()}>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
-                    <div onClick={(e) => toggleApproval(u, u.approval_required !== false, e)} style={{ width: 38, height: 20, borderRadius: 10, background: u.approval_required !== false ? '#10B981' : '#94a3b8', position: 'relative', transition: 'background 0.2s' }}>
-                      <div style={{ width: 16, height: 16, borderRadius: 8, background: '#fff', position: 'absolute', top: 2, left: u.approval_required !== false ? 20 : 2, transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
-                    </div>
-                    <small style={{ color: '#6f827d', fontSize: 10 }}>{u.approval_required !== false ? 'On' : 'Off'}</small>
-                  </label>
+                  {isModerator ? (
+                    <small style={{ color: '#5f716c', fontSize: 10 }}>—</small>
+                  ) : (
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                      <div onClick={(e) => toggleApproval(u, u.approval_required !== false, e)} style={{ width: 38, height: 20, borderRadius: 10, background: u.approval_required !== false ? '#10B981' : '#94a3b8', position: 'relative', transition: 'background 0.2s' }}>
+                        <div style={{ width: 16, height: 16, borderRadius: 8, background: '#fff', position: 'absolute', top: 2, left: u.approval_required !== false ? 20 : 2, transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
+                      </div>
+                      <small style={{ color: '#6f827d', fontSize: 10 }}>{u.approval_required !== false ? 'On' : 'Off'}</small>
+                    </label>
+                  )}
                 </span>
                 <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                   <b>{u.published_stories ?? 0} published</b>
@@ -1404,6 +1510,166 @@ function UsersPage({ onToast }: { onToast: (m: string) => void }) {
   );
 }
 
+// ─── Moderators Page ───────────────────────────────────────────────────
+
+function ModeratorsPage({ onToast }: { onToast: (m: string) => void }) {
+  const [mods, setMods] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [username, setUsername] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [password, setPassword] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [resetId, setResetId] = useState<string | null>(null);
+  const [resetPassword, setResetPassword] = useState('');
+  const [savingReset, setSavingReset] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api<any[]>('/api/admin/moderators')
+      .then(d => setMods(Array.isArray(d) ? d : []))
+      .catch(() => onToast('Failed to load moderators'))
+      .finally(() => setLoading(false));
+  }, [onToast]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const createModerator = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!username.trim() || !password) { onToast('Username and password required'); return; }
+    setCreating(true);
+    try {
+      await api('/api/admin/moderators', {
+        method: 'POST',
+        body: JSON.stringify({ username: username.trim().toLowerCase(), display_name: displayName.trim(), password }),
+      });
+      setUsername(''); setDisplayName(''); setPassword('');
+      onToast('Moderator account created');
+      load();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message.replace(/^API \d+: /, '') : 'Failed to create moderator');
+    } finally { setCreating(false); }
+  };
+
+  const toggleActive = async (m: any) => {
+    try {
+      await api(`/api/admin/moderators/${m.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_active: !m.is_active }),
+      });
+      setMods(prev => prev.map(x => x.id === m.id ? { ...x, is_active: !m.is_active } : x));
+      onToast(!m.is_active ? 'Moderator enabled' : 'Moderator disabled');
+    } catch { onToast('Failed to update moderator'); }
+  };
+
+  const saveReset = async (m: any) => {
+    if (resetPassword.length < 8) { onToast('Password must be at least 8 characters'); return; }
+    setSavingReset(true);
+    try {
+      await api(`/api/admin/moderators/${m.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ password: resetPassword }),
+      });
+      setResetId(null); setResetPassword('');
+      onToast('Password reset — moderator must login again');
+    } catch (err) {
+      onToast(err instanceof Error ? err.message.replace(/^API \d+: /, '') : 'Failed to reset password');
+    } finally { setSavingReset(false); }
+  };
+
+  const removeModerator = async (m: any) => {
+    if (!confirm(`Delete moderator "${m.username}"?`)) return;
+    try {
+      await api(`/api/admin/moderators/${m.id}`, { method: 'DELETE' });
+      setMods(prev => prev.filter(x => x.id !== m.id));
+      onToast('Moderator deleted');
+    } catch { onToast('Failed to delete moderator'); }
+  };
+
+  return (
+    <div className="content">
+      <div className="resource-head">
+        <div>
+          <h2>Moderators</h2>
+          <p>Create simple username/password accounts for trusted team members. Admin access stays unchanged.</p>
+        </div>
+      </div>
+
+      <div className="panel settings-panel" style={{ marginBottom: 16 }}>
+        <h3 style={{ marginTop: 0, marginBottom: 6 }}>Create moderator</h3>
+        <p style={{ color: '#71837e', fontSize: 11, lineHeight: 1.6, margin: '0 0 16px' }}>
+          Moderators can publish/unpublish stories, approve writer stories, give verified badges, delete stories and send notifications.
+        </p>
+        <form onSubmit={createModerator}>
+          <div className="form-grid">
+            <label>
+              Username
+              <input value={username} onChange={e => setUsername(e.target.value)} placeholder="e.g. moderator1" autoComplete="off" />
+            </label>
+            <label>
+              Display name
+              <input value={displayName} onChange={e => setDisplayName(e.target.value)} placeholder="e.g. Content Team" autoComplete="off" />
+            </label>
+            <label>
+              Password
+              <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="8+ chars, letter + number" autoComplete="new-password" />
+            </label>
+          </div>
+          <button className="primary" type="submit" disabled={creating} style={{ opacity: creating ? 0.6 : 1 }}>
+            {creating ? <Loader2 size={16} className="spin" /> : <Shield size={16} />} Create moderator
+          </button>
+        </form>
+      </div>
+
+      <div className="panel resource">
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <div>
+            <h3 style={{ margin: 0 }}>Moderator accounts</h3>
+            <p style={{ margin: '4px 0 0', color: '#71837e', fontSize: 11 }}>Disable an account to immediately invalidate its sessions.</p>
+          </div>
+          <span style={{ color: '#71837e', fontSize: 11 }}>{mods.length} accounts</span>
+        </div>
+
+        {loading ? (
+          <div className="empty"><Loader2 size={35} className="spin" /><h3>Loading moderators...</h3></div>
+        ) : mods.length === 0 ? (
+          <div className="empty"><Shield size={35} /><h3>No moderators yet</h3><p>Create their account above.</p></div>
+        ) : (
+          <div style={{ display: 'grid', gap: 10, marginTop: 16 }}>
+            {mods.map(m => (
+              <div key={m.id} style={{ border: '1px solid #25332f', borderRadius: 11, padding: 14, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', background: '#0f1816' }}>
+                <div style={{ width: 40, height: 40, borderRadius: 12, background: m.is_active ? '#18342d' : '#2a2118', color: m.is_active ? '#4fd0ac' : '#e1a74b', display: 'grid', placeItems: 'center', fontWeight: 800 }}>
+                  {(m.display_name || m.username || '?').charAt(0).toUpperCase()}
+                </div>
+                <div style={{ flex: '1 1 220px', minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <b style={{ fontSize: 13 }}>{m.display_name || m.username}</b>
+                    <span style={{ fontSize: 9, padding: '2px 7px', borderRadius: 10, background: m.is_active ? '#173a31' : '#40241f', color: m.is_active ? '#4fd0ac' : '#ff9a8a', fontWeight: 700 }}>{m.is_active ? 'ACTIVE' : 'DISABLED'}</span>
+                  </div>
+                  <div style={{ color: '#71837e', fontSize: 10, marginTop: 4 }}>
+                    @{m.username} · Created {m.created_at ? new Date(m.created_at).toLocaleDateString() : '—'} · Last login {m.last_login_at ? timeAgo(m.last_login_at) : 'never'}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
+                  <button onClick={() => toggleActive(m)} style={{ border: '1px solid #30413d', background: 'transparent', color: m.is_active ? '#e1a74b' : '#4fd0ac', borderRadius: 7, padding: '6px 10px', fontSize: 10, fontWeight: 700, cursor: 'pointer' }}>{m.is_active ? 'Disable' : 'Enable'}</button>
+                  <button onClick={() => { setResetId(resetId === m.id ? null : m.id); setResetPassword(''); }} style={{ border: '1px solid #30413d', background: 'transparent', color: '#8fa19c', borderRadius: 7, padding: '6px 10px', fontSize: 10, fontWeight: 700, cursor: 'pointer' }}>Reset password</button>
+                  <button onClick={() => removeModerator(m)} style={{ border: '1px solid #5a302a', background: '#2a1715', color: '#ff8a7a', borderRadius: 7, padding: '6px 10px', fontSize: 10, fontWeight: 700, cursor: 'pointer' }}>Delete</button>
+                </div>
+                {resetId === m.id && (
+                  <div style={{ flex: '1 1 100%', display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', borderTop: '1px solid #22302d', paddingTop: 10 }}>
+                    <input type="password" value={resetPassword} onChange={e => setResetPassword(e.target.value)} placeholder="New password (8+ chars, letter + number)" autoComplete="new-password" style={{ flex: '1 1 220px', minWidth: 0, border: '1px solid #2d3e39', background: '#0e1614', borderRadius: 8, padding: '9px 11px', color: '#e9f1ee', outline: 'none' }} />
+                    <button onClick={() => saveReset(m)} disabled={savingReset} style={{ border: 0, background: '#4bc8a5', color: '#09221c', borderRadius: 8, padding: '9px 13px', fontSize: 11, fontWeight: 800, cursor: 'pointer', opacity: savingReset ? 0.6 : 1 }}>{savingReset ? 'Saving…' : 'Save'}</button>
+                    <button onClick={() => { setResetId(null); setResetPassword(''); }} style={{ border: '1px solid #30413d', background: 'transparent', color: '#8fa19c', borderRadius: 8, padding: '9px 13px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>Cancel</button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
   const [sections, setSections] = useState<{ key: string; enabled: boolean; title?: string }[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1531,7 +1797,7 @@ function HomeControlPage({ onToast }: { onToast: (m: string) => void }) {
 
 // ─── Notifications Page ─────────────────────────────────────────────────
 
-function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
+function NotificationsPage({ onToast, canDelete = true }: { onToast: (m: string) => void; canDelete?: boolean }) {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -1568,7 +1834,7 @@ function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
       <div className="resource-head">
         <div>
           <h2>Manage notifications</h2>
-          <p>Send and manage push notifications to your readers.</p>
+          <p>{canDelete ? 'Send and manage push notifications to your readers.' : 'Send push notifications to readers or writers.'}</p>
         </div>
       </div>
       <div className="panel resource">
@@ -1606,13 +1872,15 @@ function NotificationsPage({ onToast }: { onToast: (m: string) => void }) {
                   <span>{n.target && <small style={{ padding: '2px 8px', borderRadius: 6, fontSize: 9, fontWeight: 700, background: n.target === 'writer' ? '#6366F1' : '#18342d', color: n.target === 'writer' ? '#c4b5fd' : '#4dca9f' }}>{n.target === 'writer' ? `Writer${(n as any).writer_count > 1 ? ` (${(n as any).writer_count})` : ''}` : 'Reader'}</small>}</span>
                   <span><small style={{ color: '#5f716c', fontSize: 9 }}>{timeAgo(n.created_at)}</small></span>
                   <span>
-                  <button
-                    style={{ background: 'none', border: 'none', color: '#e15e4e', cursor: 'pointer', padding: 2 }}
-                    onClick={() => deleteNotification(n)}
-                    title="Delete"
-                  >
-                    <Trash2 size={14} />
-                  </button>
+                  {canDelete && (
+                    <button
+                      style={{ background: 'none', border: 'none', color: '#e15e4e', cursor: 'pointer', padding: 2 }}
+                      onClick={() => deleteNotification(n)}
+                      title="Delete"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  )}
                 </span>
               </div>
               );

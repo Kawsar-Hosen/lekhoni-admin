@@ -30,3 +30,11 @@ CREATE TABLE IF NOT EXISTS writer_submissions (
 CREATE TABLE IF NOT EXISTS admin_activity (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(), action TEXT NOT NULL, target_type TEXT, target_id UUID, metadata JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS moderators (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL, salt TEXT NOT NULL, is_active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_login_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS moderator_sessions (
+  token_hash TEXT PRIMARY KEY, moderator_id UUID NOT NULL REFERENCES moderators(id) ON DELETE CASCADE, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_moderator_sessions_moderator ON moderator_sessions(moderator_id);

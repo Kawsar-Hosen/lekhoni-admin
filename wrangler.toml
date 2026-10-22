@@ -7,7 +7,9 @@ binding = "MEDIA"
 bucket_name = "lekhoni-media"
 
 [vars]
-ALLOWED_ORIGIN = "https://admin.xyteee.com"
+# Admin stays on the Access-protected custom domain; moderators use the
+# public Pages URL because Cloudflare Access is not part of the app login.
+ALLOWED_ORIGIN = "https://admin.xyteee.com,https://lekhoni-admin.pages.dev"
 
 # Keep the Neon URL in a Worker secret:
 # wrangler secret put DATABASE_URL

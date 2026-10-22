@@ -69,15 +69,90 @@ function adminAuthed(request: Request, env: Env): boolean {
   return d === 0;
 }
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+type AdminAuth = { role: 'admin' } | { role: 'moderator'; id: string; username: string; displayName: string };
+
+function bearerToken(request: Request): string {
+  const m = (request.headers.get('Authorization') || '').match(/^Bearer (.+)$/);
+  return m ? m[1] : '';
+}
+
+function randomHex(bytes = 32): string {
+  const a = new Uint8Array(bytes);
+  crypto.getRandomValues(a);
+  return Array.from(a).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.length % 2 ? '0' + hex : hex;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+async function moderatorHashPassword(password: string, saltHex?: string): Promise<{ hash: string; salt: string }> {
+  const salt = saltHex || randomHex(16);
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), { name: 'PBKDF2' } as any, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: hexToBytes(salt) as any, iterations: 100000, hash: 'SHA-256' }, key, 256);
+  const hash = Array.from(new Uint8Array(bits)).map(x => x.toString(16).padStart(2, '0')).join('');
+  return { hash, salt };
+}
+
+async function moderatorPasswordMatches(password: string, hash: string, salt: string): Promise<boolean> {
+  const got = await moderatorHashPassword(password, salt);
+  if (!hash || got.hash.length !== hash.length) return false;
+  let diff = 0;
+  for (let i = 0; i < got.hash.length; i++) diff |= got.hash.charCodeAt(i) ^ hash.charCodeAt(i);
+  return diff === 0;
+}
+
+let moderatorTablesReady = false;
+async function ensureModeratorTables(sql: any): Promise<void> {
+  if (moderatorTablesReady) return;
+  await sql`CREATE TABLE IF NOT EXISTS moderators (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL, salt TEXT NOT NULL, is_active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_login_at TIMESTAMPTZ)`;
+  await sql`CREATE TABLE IF NOT EXISTS moderator_sessions (token_hash TEXT PRIMARY KEY, moderator_id UUID NOT NULL REFERENCES moderators(id) ON DELETE CASCADE, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_moderator_sessions_moderator ON moderator_sessions(moderator_id)`;
+  moderatorTablesReady = true;
+}
+
+async function resolveAuth(request: Request, env: Env, sql: any): Promise<AdminAuth | null> {
+  if (adminAuthed(request, env)) return { role: 'admin' };
+  const token = bearerToken(request);
+  if (!token) return null;
+  await ensureModeratorTables(sql);
+  const tokenHash = await sha256Hex(token);
+  const rows = await sql`SELECT m.id,m.username,m.display_name FROM moderator_sessions s JOIN moderators m ON m.id=s.moderator_id WHERE s.token_hash=${tokenHash} AND s.expires_at > NOW() AND m.is_active=true LIMIT 1`;
+  if (!rows.length) return null;
+  return {
+    role: 'moderator',
+    id: rows[0].id as string,
+    username: rows[0].username as string,
+    displayName: (rows[0].display_name || rows[0].username) as string,
+  };
+}
+
+// Server-side allowlist: moderators can only do the shared moderation tasks.
+function moderatorAllowed(method: string, pathname: string): boolean {
+  if (pathname === '/api/admin/analytics' && method === 'GET') return true;
+  if (pathname === '/api/admin/notifications' && (method === 'GET' || method === 'POST')) return true;
+  if (pathname === '/api/admin/writers' && method === 'GET') return true;
+  if (pathname === '/api/admin/writer-notifications/send' && method === 'POST') return true;
+  if (pathname === '/api/admin/books' && method === 'GET') return true;
+  if (/^\/api\/admin\/books\/[^/]+$/.test(pathname) && (method === 'GET' || method === 'PUT' || method === 'DELETE')) return true;
+  if (pathname === '/api/admin/writer-users' && method === 'GET') return true;
+  if (/^\/api\/admin\/writer-users\/[^/]+$/.test(pathname) && (method === 'GET' || method === 'PATCH')) return true;
+  if (/^\/api\/admin\/writers\/[^/]+$/.test(pathname) && method === 'PUT') return true;
+  return false;
+}
+
+async function handleRequest(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(env.ALLOWED_ORIGIN || '*') });
     if (url.pathname === '/api/health') return json({ ok: true, service: 'lekhoni-admin-api', database: Boolean(env.DATABASE_URL) }, 200, env.ALLOWED_ORIGIN);
 
     try {
-      // Admin gate FIRST: every /api/admin/* (incl. migrations) requires ADMIN_SECRET.
-      if (url.pathname === '/api/admin/migrate' || url.pathname === '/api/admin/migrate-verification' || url.pathname.startsWith('/api/admin/')) {
+      // Admin migrations are always admin-secret only. Other /api/admin/*
+      // routes are resolved below so moderator sessions can access them too.
+      if (url.pathname.startsWith('/api/admin/migrate')) {
         if (!adminAuthed(request, env)) return json({ error: 'Unauthorized' }, 401);
       }
       // --- DB Migration (run once) ---
@@ -195,6 +270,7 @@ export default {
         try {
           await sql`UPDATE writers SET follower_count = (SELECT COUNT(*)::int FROM follows WHERE follows.writer_id = writers.id)`;
         } catch (e) { console.error('follower_count recalc error', e); }
+        await ensureModeratorTables(sql);
         return json({ ok: true, message: 'Migration applied' });
       }
 
@@ -240,8 +316,61 @@ export default {
       if (!env.DATABASE_URL) return json({ error: 'Neon DATABASE_URL is not configured' }, 503);
       const sql = neon(env.DATABASE_URL);
 
+      // ==================== MODERATOR AUTH ====================
+      // Login is public; the issued session token is accepted by /api/admin/*.
+      if (url.pathname === '/api/moderator/login' && request.method === 'POST') {
+        const b = await request.json().catch(() => ({})) as { username?: string; password?: string };
+        const uname = (b.username || '').trim().toLowerCase();
+        const password = b.password || '';
+        if (!uname || !password) return json({ error: 'Username and password required' }, 400, env.ALLOWED_ORIGIN);
+        await ensureModeratorTables(sql);
+        await sql`DELETE FROM moderator_sessions WHERE expires_at < NOW()`;
+        const rows = await sql`SELECT id,username,display_name,password_hash,salt,is_active FROM moderators WHERE username=${uname} LIMIT 1`;
+        if (!rows.length || rows[0].is_active !== true) return json({ error: 'Invalid username or password' }, 401, env.ALLOWED_ORIGIN);
+        const ok = await moderatorPasswordMatches(password, rows[0].password_hash as string, rows[0].salt as string);
+        if (!ok) return json({ error: 'Invalid username or password' }, 401, env.ALLOWED_ORIGIN);
+        const token = randomHex(32);
+        const tokenHash = await sha256Hex(token);
+        await sql`INSERT INTO moderator_sessions (token_hash,moderator_id,expires_at) VALUES (${tokenHash},${rows[0].id},NOW()+INTERVAL '7 days')`;
+        await sql`UPDATE moderators SET last_login_at=NOW() WHERE id=${rows[0].id}`;
+        return json({
+          token,
+          user: { id: rows[0].id, username: rows[0].username, displayName: rows[0].display_name || rows[0].username, role: 'moderator' },
+        }, 200, env.ALLOWED_ORIGIN);
+      }
+
+      if (url.pathname === '/api/moderator/logout' && request.method === 'POST') {
+        const token = bearerToken(request);
+        if (token) {
+          await ensureModeratorTables(sql);
+          await sql`DELETE FROM moderator_sessions WHERE token_hash=${await sha256Hex(token)}`;
+        }
+        return json({ ok: true }, 200, env.ALLOWED_ORIGIN);
+      }
+
+      if (url.pathname === '/api/moderator/me' && request.method === 'GET') {
+        const who = await resolveAuth(request, env, sql);
+        if (!who) return json({ error: 'Unauthorized' }, 401, env.ALLOWED_ORIGIN);
+        return json({
+          user: who.role === 'admin'
+            ? { role: 'admin' }
+            : { id: who.id, username: who.username, displayName: who.displayName, role: 'moderator' },
+        }, 200, env.ALLOWED_ORIGIN);
+      }
+
+      // Resolve admin secret OR moderator session for every admin API route.
+      let auth: AdminAuth | null = null;
+      if (url.pathname.startsWith('/api/admin/')) {
+        auth = await resolveAuth(request, env, sql);
+        if (!auth) return json({ error: 'Unauthorized' }, 401, env.ALLOWED_ORIGIN);
+        if (auth.role === 'moderator' && !moderatorAllowed(request.method, url.pathname)) {
+          return json({ error: 'Forbidden — moderator access is limited' }, 403, env.ALLOWED_ORIGIN);
+        }
+      }
+
       // ==================== ADMIN ROUTES ====================
-      // (gated at top of try: all /api/admin/* require ADMIN_SECRET)
+      // (auth resolved above: admin secret has full access; moderator sessions
+      // are limited by the server-side allowlist.)
 
       // --- Categories CRUD ---
       if (url.pathname === '/api/admin/categories' && request.method === 'GET')
@@ -293,6 +422,11 @@ export default {
       if (bookMatch && request.method === 'PUT') {
         if (!uuid(bookMatch[1])) return json({ error: 'Invalid ID' }, 400);
         const b = await request.json() as Record<string, unknown>;
+        if (auth?.role === 'moderator') {
+          const keys = Object.keys(b);
+          if (!keys.length || keys.some(k => k !== 'status')) return json({ error: 'Moderators can only publish or unpublish stories' }, 403);
+          if (b.status !== 'published' && b.status !== 'draft') return json({ error: 'Moderators can only set published or draft' }, 400);
+        }
         if (b.title !== undefined || b.author !== undefined || b.description !== undefined || b.category_id !== undefined || b.cover_url !== undefined || b.color !== undefined || b.accent !== undefined || b.status !== undefined || b.is_new !== undefined || b.featured !== undefined || b.home_section !== undefined || b.views_visible !== undefined || b.pdf_url !== undefined || b.dedication !== undefined || b.author_name !== undefined || b.show_ads !== undefined || b.pdf_reward_ad !== undefined || b.display_status !== undefined || b.writer_status !== undefined) {
           await sql`UPDATE books SET title=COALESCE(${b.title as string||null},title),author=COALESCE(${b.author as string||null},author),description=COALESCE(${b.description as string||null},description),category_id=COALESCE(${b.category_id as string||null},category_id),cover_url=COALESCE(${b.cover_url as string||null},cover_url),color=COALESCE(${b.color as string||null},color),accent=COALESCE(${b.accent as string||null},accent),status=COALESCE(${b.status as string||null},status),is_new=COALESCE(${b.is_new as boolean||null},is_new),featured=COALESCE(${b.featured as boolean||null},featured),home_section=COALESCE(${b.home_section as string||null},home_section),views_visible=COALESCE(${b.views_visible as boolean||null},views_visible),pdf_url=COALESCE(${b.pdf_url as string||null},pdf_url),dedication=COALESCE(${b.dedication as string||null},dedication),author_name=COALESCE(${b.author_name as string||null},author_name),show_ads=COALESCE(${b.show_ads as boolean||null},show_ads),pdf_reward_ad=COALESCE(${b.pdf_reward_ad as boolean||null},pdf_reward_ad),display_status=COALESCE(${b.display_status as string||null},display_status),writer_status=COALESCE(${b.writer_status as string||null},writer_status),updated_at=NOW() WHERE id=${bookMatch[1]}`;
         }
@@ -509,6 +643,60 @@ export default {
             await sql`DELETE FROM writer_notifications WHERE title=${wNotifs[0].title} AND body=${wNotifs[0].body} AND COALESCE(url,'')=${wNotifs[0].url || ''}`;
           }
         }
+        return json({ ok: true });
+      }
+
+      // --- Moderator Accounts (admin only) ---
+      if (url.pathname === '/api/admin/moderators' && request.method === 'GET') {
+        if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
+        await ensureModeratorTables(sql);
+        return json(await sql`SELECT id,username,display_name,is_active,created_at,last_login_at FROM moderators ORDER BY created_at DESC`);
+      }
+      if (url.pathname === '/api/admin/moderators' && request.method === 'POST') {
+        if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
+        const b = await request.json().catch(() => ({})) as { username?: string; password?: string; display_name?: string };
+        const uname = validateUsername(b.username || '');
+        if (!uname) return json({ error: 'Username must be 3-20 characters: a-z, 0-9, _' }, 400);
+        if (!validatePassword(b.password || '')) return json({ error: 'Password must be 8-128 characters and contain a letter and a number' }, 400);
+        const displayName = (b.display_name || '').trim().slice(0, 60) || uname;
+        await ensureModeratorTables(sql);
+        const exists = await sql`SELECT id FROM moderators WHERE username=${uname} LIMIT 1`;
+        if (exists.length) return json({ error: 'Username already exists' }, 409);
+        const { hash, salt } = await moderatorHashPassword(b.password as string);
+        const r = await sql`INSERT INTO moderators (username,display_name,password_hash,salt,is_active) VALUES (${uname},${displayName},${hash},${salt},true) RETURNING id,username,display_name,is_active,created_at,last_login_at`;
+        return json(r[0], 201);
+      }
+      const moderatorMatch = url.pathname.match(/^\/api\/admin\/moderators\/([^/]+)$/);
+      if (moderatorMatch && request.method === 'PATCH') {
+        if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
+        if (!uuid(moderatorMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        const b = await request.json().catch(() => ({})) as { display_name?: string; is_active?: boolean; password?: string };
+        await ensureModeratorTables(sql);
+        const existing = await sql`SELECT id FROM moderators WHERE id=${moderatorMatch[1]} LIMIT 1`;
+        if (!existing.length) return json({ error: 'Not found' }, 404);
+        if (b.display_name !== undefined) {
+          const dn = (b.display_name || '').trim().slice(0, 60);
+          if (!dn) return json({ error: 'Display name cannot be empty' }, 400);
+          await sql`UPDATE moderators SET display_name=${dn} WHERE id=${moderatorMatch[1]}`;
+        }
+        if (typeof b.is_active === 'boolean') {
+          await sql`UPDATE moderators SET is_active=${b.is_active} WHERE id=${moderatorMatch[1]}`;
+          if (!b.is_active) await sql`DELETE FROM moderator_sessions WHERE moderator_id=${moderatorMatch[1]}`;
+        }
+        if (b.password !== undefined) {
+          if (!validatePassword(b.password)) return json({ error: 'Password must be 8-128 characters and contain a letter and a number' }, 400);
+          const { hash, salt } = await moderatorHashPassword(b.password);
+          await sql`UPDATE moderators SET password_hash=${hash},salt=${salt} WHERE id=${moderatorMatch[1]}`;
+          await sql`DELETE FROM moderator_sessions WHERE moderator_id=${moderatorMatch[1]}`;
+        }
+        const r = await sql`SELECT id,username,display_name,is_active,created_at,last_login_at FROM moderators WHERE id=${moderatorMatch[1]}`;
+        return json(r[0]);
+      }
+      if (moderatorMatch && request.method === 'DELETE') {
+        if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
+        if (!uuid(moderatorMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        await ensureModeratorTables(sql);
+        await sql`DELETE FROM moderators WHERE id=${moderatorMatch[1]}`;
         return json({ ok: true });
       }
 
@@ -2146,5 +2334,17 @@ export default {
       }
 
     } catch (error) { return json({ error: error instanceof Error ? error.message : 'Request failed' }, 500); }
-  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const response = await handleRequest(request, env);
+    const requestOrigin = request.headers.get('Origin') || '';
+    const allowed = (env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (requestOrigin && (allowed.includes('*') || allowed.includes(requestOrigin))) {
+      response.headers.set('Access-Control-Allow-Origin', requestOrigin);
+      response.headers.append('Vary', 'Origin');
+    }
+    return response;
+  },
 };
