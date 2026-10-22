@@ -159,7 +159,9 @@ async function api<T = any>(path: string, options: RequestInit = {}): Promise<T>
   const res = await fetch(url, { ...options, headers: { ...headers, ...options.headers as Record<string, string> } });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`API ${res.status}: ${text || res.statusText}`);
+    let message = text || res.statusText;
+    try { const parsed = JSON.parse(text); if (parsed?.error) message = parsed.error; } catch {}
+    throw new Error(message);
   }
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('json')) return res.json();
