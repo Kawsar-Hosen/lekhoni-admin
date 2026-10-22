@@ -301,6 +301,12 @@ function App() {
   if (window.location.pathname === '/terms') return <TermsWebPage />;
 
   const [verifying, setVerifying] = useState(false);
+  const revokeModeratorSession = () => {
+    try {
+      const token = localStorage.getItem('lekhoni_moderator_token');
+      if (token) fetch(`${API_BASE}/api/moderator/logout`, { method: 'POST', headers: { Authorization: 'Bearer ' + token } }).catch(() => {});
+    } catch {}
+  };
   const saveSecret = async () => {
     const v = secretInput.trim();
     if (!v) { setSecretErr('Enter the admin secret'); return; }
@@ -310,11 +316,13 @@ function App() {
       if (res.status === 401) { setSecretErr('ভুল secret — আবার যত্ন করে বসাও'); setVerifying(false); return; }
       if (!res.ok) { setSecretErr('Server error (' + res.status + ') — পরে চেষ্টা করো'); setVerifying(false); return; }
     } catch { setSecretErr('Network error — সংযোগ চেক করো'); setVerifying(false); return; }
+    revokeModeratorSession();
     try { localStorage.setItem('lekhoni_admin_secret', v); localStorage.removeItem('lekhoni_moderator_token'); localStorage.removeItem('lekhoni_moderator_user'); } catch {}
     setRole('admin'); setModerator(null); setPage('Dashboard');
     setSecret(v); setSecretInput(''); setSecretErr(''); setVerifying(false);
   };
   const clearSecret = () => {
+    revokeModeratorSession();
     try {
       localStorage.removeItem('lekhoni_admin_secret');
       localStorage.removeItem('lekhoni_moderator_token');
@@ -335,6 +343,7 @@ function App() {
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || !d.token) { setModErr(d.error || 'Login failed'); return; }
+      revokeModeratorSession();
       try {
         localStorage.setItem('lekhoni_moderator_token', d.token);
         localStorage.setItem('lekhoni_moderator_user', JSON.stringify(d.user || {}));
