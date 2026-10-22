@@ -112,7 +112,9 @@ interface Analytics {
   total_writers: number;
   pending_writers: number;
   total_categories: number;
+  total_chapters: number;
   active_readers: number;
+  unique_readers: number;
   views_today: number;
   views_this_week: number;
   views_this_month: number;
@@ -143,6 +145,8 @@ const nav: [Page, React.ElementType][] = [
   ['Analytics', BarChart3],
   ['Settings', Settings],
 ];
+
+const MODERATOR_PAGES: Page[] = ['Books', 'Chapters', 'Categories', 'Writers', 'Notifications', 'Reports', 'Analytics'];
 
 // ─── API Helper ─────────────────────────────────────────────────────────
 
@@ -355,9 +359,9 @@ function App() {
     finally { setModVerifying(false); }
   };
 
-  // Moderator can only use the shared moderation pages.
+  // Moderator can only use the shared moderation and insights pages.
   useEffect(() => {
-    if (role === 'moderator' && !['Books', 'Writers', 'Notifications'].includes(page)) setPage('Books');
+    if (role === 'moderator' && !MODERATOR_PAGES.includes(page)) setPage('Books');
   }, [role, page]);
 
   // Validate a stored moderator session once on load.
@@ -440,7 +444,7 @@ function App() {
   const closeModal = () => { setModal(null); setEditItem(null); };
   const showToast = (msg: string) => setToast(msg);
   const isModerator = role === 'moderator';
-  const visibleNav = isModerator ? nav.filter(([label]) => ['Books', 'Writers', 'Notifications'].includes(label)) : nav;
+  const visibleNav = isModerator ? nav.filter(([label]) => MODERATOR_PAGES.includes(label)) : nav;
   const profileName = isModerator ? (moderator?.displayName || moderator?.display_name || moderator?.username || 'Moderator') : 'Kawsar';
   const profileRole = isModerator ? 'Moderator' : 'Administrator';
   const avatarLetter = (profileName || 'M').charAt(0).toUpperCase();
@@ -469,7 +473,7 @@ function App() {
             <input autoComplete="current-password" type="password" value={modPassword} onChange={e => setModPassword(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') moderatorLogin(); }} placeholder="Password" style={{ width: '100%', padding: '11px 12px', margin: '0 0 12px', borderRadius: 8, border: '1px solid #2a3935', background: '#0e1614', color: '#eaf4f0', outline: 'none', fontSize: 16 }} />
             {modErr && <p style={{ color: '#ff8a7a', fontSize: 12, margin: '0 0 12px' }}>{modErr}</p>}
             <button onClick={moderatorLogin} disabled={modVerifying} style={{ width: '100%', padding: '11px', borderRadius: 8, border: 0, cursor: 'pointer', background: '#4bc8a5', color: '#09221c', fontWeight: 800, opacity: modVerifying ? 0.6 : 1 }}>{modVerifying ? 'লগইন হচ্ছে…' : 'Login as Moderator'}</button>
-            <p style={{ color: '#71837e', fontSize: 10, margin: '14px 0 0', lineHeight: 1.6 }}>Limited access: Books, Writers and Notifications only.</p>
+            <p style={{ color: '#71837e', fontSize: 10, margin: '14px 0 0', lineHeight: 1.6 }}>Limited access: Books, Chapters, Categories, Writers, Reports, Analytics and Notifications.</p>
           </>
         )}
       </div>
@@ -517,23 +521,23 @@ function App() {
             </label>
             <button className="icon"><Bell size={19} /><i /></button>
             {(page === 'Books' && !isModerator) && <button className="primary" onClick={() => openCreate('book')}><Plus size={17} /> New book</button>}
-            {page === 'Chapters' && !isModerator && <button className="primary" onClick={() => openCreate('chapter')}><Plus size={17} /> New chapter</button>}
-            {page === 'Categories' && !isModerator && <button className="primary" onClick={() => openCreate('category')}><Plus size={17} /> New category</button>}
+            {page === 'Chapters' && <button className="primary" onClick={() => openCreate('chapter')}><Plus size={17} /> New chapter</button>}
+            {page === 'Categories' && <button className="primary" onClick={() => openCreate('category')}><Plus size={17} /> New category</button>}
             {page === 'Notifications' && <button className="primary" onClick={() => openCreate('notification')}><Plus size={17} /> New notification</button>}
           </div>
         </header>
         {page === 'Dashboard' && !isModerator && <Dashboard onCreate={() => openCreate('book')} onToast={showToast} />}
         {page === 'Books' && <BooksPage isModerator={isModerator} onEdit={(b: Book) => openEdit('book', b)} onToast={showToast} onRefreshPending={setPendingComments} />}
-        {page === 'Chapters' && !isModerator && <ChaptersPage onToast={showToast} />}
-        {page === 'Categories' && !isModerator && <CategoriesPage onEdit={(c: Category) => openEdit('category', c)} onToast={showToast} />}
+        {page === 'Chapters' && <ChaptersPage onToast={showToast} />}
+        {page === 'Categories' && <CategoriesPage onEdit={(c: Category) => openEdit('category', c)} onToast={showToast} />}
         {page === 'Comments' && !isModerator && <CommentsPage onToast={showToast} onRefreshPending={setPendingComments} />}
             {page === 'Writers' && <WritersPage isModerator={isModerator} onToast={showToast} onRefreshPending={setPendingWriters} />}
             {page === 'Users' && !isModerator && <UsersPage onToast={showToast} />}
             {page === 'Home Control' && !isModerator && <HomeControlPage onToast={showToast} />}
             {page === 'Notifications' && <NotificationsPage canDelete={!isModerator} onToast={showToast} />}
         {page === 'Moderators' && !isModerator && <ModeratorsPage onToast={showToast} />}
-        {page === 'Analytics' && !isModerator && <AnalyticsPage />}
-        {page === 'Reports' && !isModerator && <ReportsPage onToast={showToast} />}
+        {page === 'Analytics' && <AnalyticsPage />}
+        {page === 'Reports' && <ReportsPage onToast={showToast} />}
         {page === 'Settings' && !isModerator && <SettingsPage onToast={showToast} />}
       </main>
       {modal === 'book' && <BookModal editItem={editItem} close={closeModal} onToast={showToast} />}
@@ -1909,19 +1913,36 @@ function NotificationsPage({ onToast, canDelete = true }: { onToast: (m: string)
 function AnalyticsPage() {
   const [data, setData] = useState<Analytics | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
 
-  useEffect(() => {
+  const load = useCallback(() => {
     setLoading(true);
-    api('/api/admin/analytics')
+    setError('');
+    api<Analytics>('/api/admin/analytics')
       .then(d => setData(d))
-      .catch(() => {})
+      .catch((e: any) => setError(e?.message || 'Failed to load analytics'))
       .finally(() => setLoading(false));
   }, []);
 
-  if (loading) {
+  useEffect(() => { load(); }, [load]);
+
+  if (loading && !data) {
     return (
       <div className="content">
-        <div className="empty"><Loader2 size={35} className="spin" /><h3>Loading analytics...</h3></div>
+        <div className="empty"><Loader2 size={35} className="spin" /><h3>Loading real analytics...</h3></div>
+      </div>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <div className="content">
+        <div className="empty">
+          <AlertTriangle size={35} />
+          <h3>Analytics unavailable</h3>
+          <p>{error}</p>
+          <button className="primary" onClick={load}><RefreshCw size={16} /> Retry</button>
+        </div>
       </div>
     );
   }
@@ -1933,9 +1954,13 @@ function AnalyticsPage() {
       <div className="resource-head">
         <div>
           <h2>Analytics</h2>
-          <p>Deep dive into your content performance.</p>
+          <p>Live performance from real production data.</p>
         </div>
+        <button className="primary" onClick={load} disabled={loading}>
+          <RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh
+        </button>
       </div>
+      {error && <div className="panel" style={{ color: '#ff8a7a', padding: 12, marginBottom: 14 }}>Refresh failed: {error}</div>}
       <div className="metrics">
         <Metric icon={Globe} label="Total views" value={formatNumber(d?.total_views ?? 0)} delta={`${formatNumber(d?.views_today ?? 0)} today`} />
         <Metric icon={TrendingUp} label="This week" value={formatNumber(d?.views_this_week ?? 0)} delta={`${formatNumber(d?.views_this_month ?? 0)} this month`} />
@@ -1968,48 +1993,56 @@ function AnalyticsPage() {
           )}
         </section>
       </div>
-      {d?.recent_comments && d.recent_comments.length > 0 && (
-        <div className="dashboard-grid" style={{ marginTop: 14 }}>
-          <section className="panel">
-            <PanelHead title="Recent comments" sub="Latest reader feedback" />
-            {d.recent_comments.slice(0, 5).map((c, i) => (
-              <div className="live-row" key={c.id || i}>
-                <div className="mini-cover" style={{ background: statusColor(c.status), fontSize: 11, width: 32, height: 32, borderRadius: '50%' }}>
-                  {c.user_name?.charAt(0)?.toUpperCase() || '?'}
-                </div>
-                <div>
-                  <b>{c.user_name} <small style={{ color: '#6f827d' }}>on {c.book_title}</small></b>
-                  <small>{c.body?.slice(0, 50)}{c.body && c.body.length > 50 ? '...' : ''}</small>
-                </div>
-                <span><u className={c.status === 'pending' ? 'draft' : ''}>{c.status}</u></span>
+      <div className="dashboard-grid" style={{ marginTop: 14 }}>
+        <section className="panel">
+          <PanelHead title="Recent comments" sub="Latest reader feedback" />
+          {d?.recent_comments && d.recent_comments.length > 0 ? d.recent_comments.slice(0, 5).map((c, i) => (
+            <div className="live-row" key={c.id || i}>
+              <div className="mini-cover" style={{ background: statusColor(c.status), fontSize: 11, width: 32, height: 32, borderRadius: '50%' }}>
+                {c.user_name?.charAt(0)?.toUpperCase() || '?'}
               </div>
-            ))}
-          </section>
-          <section className="panel">
-            <PanelHead title="Quick stats" sub="Content breakdown" />
-            <div className="queue-row">
-              <div><BookOpen size={18} /><span>Total books</span></div>
-              <b>{d?.total_books ?? 0}</b>
+              <div>
+                <b>{c.user_name} <small style={{ color: '#6f827d' }}>on {c.book_title}</small></b>
+                <small>{c.body?.slice(0, 50)}{c.body && c.body.length > 50 ? '...' : ''}</small>
+              </div>
+              <span><u className={c.status === 'pending' ? 'draft' : ''}>{c.status}</u></span>
             </div>
-            <div className="queue-row">
-              <div><FileEdit size={18} /><span>Total chapters</span></div>
-              <b>{(d?.popular_books || []).reduce((sum, b) => sum + (b.chapters_count || 0), 0)}</b>
+          )) : (
+            <div className="live-row">
+              <div className="mini-cover" style={{ background: '#123E39', fontSize: 11, width: 32, height: 32, borderRadius: '50%' }}><MessageSquare size={14} /></div>
+              <div><b>No comments yet</b><small>Reader feedback will appear here.</small></div>
+              <span>--</span>
             </div>
-            <div className="queue-row">
-              <div><Menu size={18} /><span>Categories</span></div>
-              <b>{d?.total_categories ?? 0}</b>
-            </div>
-            <div className="queue-row">
-              <div><Users size={18} /><span>Writers</span></div>
-              <b>{d?.total_writers ?? 0}</b>
-            </div>
-            <div className="queue-row">
-              <div><Activity size={18} /><span>Active readers</span></div>
-              <b>{d?.active_readers ?? 0}</b>
-            </div>
-          </section>
-        </div>
-      )}
+          )}
+        </section>
+        <section className="panel">
+          <PanelHead title="Quick stats" sub="Real content breakdown" />
+          <div className="queue-row">
+            <div><BookOpen size={18} /><span>Total books</span></div>
+            <b>{formatNumber(d?.total_books ?? 0)}</b>
+          </div>
+          <div className="queue-row">
+            <div><FileEdit size={18} /><span>Total chapters</span></div>
+            <b>{formatNumber(d?.total_chapters ?? 0)}</b>
+          </div>
+          <div className="queue-row">
+            <div><Menu size={18} /><span>Categories</span></div>
+            <b>{formatNumber(d?.total_categories ?? 0)}</b>
+          </div>
+          <div className="queue-row">
+            <div><Users size={18} /><span>Writers</span></div>
+            <b>{formatNumber(d?.total_writers ?? 0)}</b>
+          </div>
+          <div className="queue-row">
+            <div><Activity size={18} /><span>Active readers (5 min)</span></div>
+            <b>{formatNumber(d?.active_readers ?? 0)}</b>
+          </div>
+          <div className="queue-row">
+            <div><Globe size={18} /><span>Unique readers</span></div>
+            <b>{formatNumber(d?.unique_readers ?? 0)}</b>
+          </div>
+        </section>
+      </div>
     </div>
   );
 }
@@ -3164,27 +3197,11 @@ function ChartArea({ data }: { data: { date: string; views: number }[] }) {
   }));
 
   if (data.length === 0) {
-    const fallback = [0, 0, 0, 0, 0, 0, 0];
     return (
-      <div className="chart-area">
-        <div className="chart-y">
-          <span>{max.toLocaleString()}</span>
-          <span>{Math.round(max * 0.66).toLocaleString()}</span>
-          <span>{Math.round(max * 0.33).toLocaleString()}</span>
-          <span>0</span>
-        </div>
-        <svg viewBox="0 0 700 230" preserveAspectRatio="none">
-          <defs>
-            <linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#48D7B0" stopOpacity=".28" />
-              <stop offset="1" stopColor="#48D7B0" stopOpacity="0" />
-            </linearGradient>
-          </defs>
-          <path className="fill" d="M0 210 H700 V230 H0Z" />
-          <path className="line" d="M0 210 H700" />
-        </svg>
-        <div className="days">
-          {['Thu', 'Fri', 'Sat', 'Sun', 'Mon', 'Tue', 'Wed'].map(d => <span key={d}>{d}</span>)}
+      <div className="chart-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 230 }}>
+        <div style={{ textAlign: 'center', color: '#6f827d' }}>
+          <BarChart3 size={28} style={{ opacity: 0.55, marginBottom: 6 }} />
+          <p style={{ margin: 0, fontSize: 13 }}>No view data for this period</p>
         </div>
       </div>
     );
