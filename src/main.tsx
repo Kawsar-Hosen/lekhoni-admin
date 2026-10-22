@@ -3200,7 +3200,7 @@ function ChartArea({ data }: { data: { date: string; views: number }[] }) {
     return (
       <div className="chart-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 230 }}>
         <div style={{ textAlign: 'center', color: '#6f827d' }}>
-          <BarChart3 size={28} style={{ opacity: 0.55, marginBottom: 6 }} />
+          <BarChart3 size={48} style={{ width: 48, height: 48, opacity: 0.55, marginBottom: 6 }} />
           <p style={{ margin: 0, fontSize: 13 }}>No reader view events in the last 7 days</p>
           <p style={{ margin: '4px 0 0', fontSize: 11 }}>The chart will populate as readers open books.</p>
         </div>
