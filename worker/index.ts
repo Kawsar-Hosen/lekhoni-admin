@@ -141,6 +141,15 @@ function moderatorAllowed(method: string, pathname: string): boolean {
   if (pathname === '/api/admin/writer-users' && method === 'GET') return true;
   if (/^\/api\/admin\/writer-users\/[^/]+$/.test(pathname) && (method === 'GET' || method === 'PATCH')) return true;
   if (/^\/api\/admin\/writers\/[^/]+$/.test(pathname) && method === 'PUT') return true;
+  // Reports: review, warn, dismiss, or delete reported content.
+  if (pathname === '/api/admin/reports' && method === 'GET') return true;
+  if (pathname === '/api/admin/reports/count' && method === 'GET') return true;
+  if (/^\/api\/admin\/reports\/[^/]+$/.test(pathname) && method === 'POST') return true;
+  // Categories and chapters: full content-management access.
+  if (pathname === '/api/admin/categories' && (method === 'GET' || method === 'POST')) return true;
+  if (/^\/api\/admin\/categories\/[^/]+$/.test(pathname) && (method === 'PUT' || method === 'DELETE')) return true;
+  if (pathname === '/api/admin/chapters' && (method === 'GET' || method === 'POST')) return true;
+  if (/^\/api\/admin\/chapters\/[^/]+$/.test(pathname) && (method === 'PUT' || method === 'DELETE')) return true;
   return false;
 }
 
@@ -374,7 +383,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Categories CRUD ---
       if (url.pathname === '/api/admin/categories' && request.method === 'GET')
-        return json(await sql`SELECT id,name,icon,color,cover_url,position,is_active,COALESCE(visible_on,'both') AS visible_on,requested_by,created_at FROM categories ORDER BY position,created_at DESC`);
+        return json(await sql`SELECT c.id,c.name,c.icon,c.color,c.cover_url,c.position,c.is_active,COALESCE(c.visible_on,'both') AS visible_on,c.requested_by,c.created_at,(SELECT COUNT(*)::int FROM books b WHERE b.category_id=c.id) AS books_count FROM categories c ORDER BY c.position,c.created_at DESC`);
       if (url.pathname === '/api/admin/categories' && request.method === 'POST') {
         const b = await request.json() as { name?: string; icon?: string; color?: string; cover_url?: string; position?: number };
         if (!b.name) return json({ error: 'name required' }, 400);
@@ -702,24 +711,74 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Analytics Dashboard ---
       if (url.pathname === '/api/admin/analytics' && request.method === 'GET') {
-        const [totalBooks, publishedBooks, totalViews, uniqueReaders, totalComments, pendingComments, pendingWriters, totalReactions] = await Promise.all([
-          sql`SELECT COUNT(*)::int AS n FROM books`,
-          sql`SELECT COUNT(*)::int AS n FROM books WHERE status='published'`,
-          sql`SELECT COUNT(*)::int AS n FROM view_events`,
-          sql`SELECT COUNT(DISTINCT device_id)::int AS n FROM view_events`,
-          sql`SELECT COUNT(*)::int AS n FROM comments WHERE status<>'deleted'`,
-          sql`SELECT COUNT(*)::int AS n FROM comments WHERE status='pending'`,
-          sql`SELECT COUNT(*)::int AS n FROM stories WHERE status='pending'`,
+        const [bookStats, viewStats, activeStats, commentStats, writerStats, categoryStats, chapterStats, reactionStats] = await Promise.all([
+          sql`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status='published')::int AS published, COALESCE(SUM(views),0)::bigint AS views FROM books`,
+          sql`SELECT
+            COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)::int AS today,
+            COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '7 days')::int AS week,
+            COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE - INTERVAL '30 days')::int AS month,
+            COUNT(DISTINCT device_id)::int AS unique_readers
+            FROM view_events`,
+          sql`SELECT COUNT(DISTINCT device_id)::int AS n FROM view_events WHERE created_at >= NOW() - INTERVAL '5 minutes'`,
+          sql`SELECT COUNT(*) FILTER (WHERE status<>'deleted')::int AS total, COUNT(*) FILTER (WHERE status='pending')::int AS pending FROM comments`,
+          sql`SELECT (SELECT COUNT(*)::int FROM writers) AS total, (SELECT COUNT(*)::int FROM stories WHERE status='pending') AS pending`,
+          sql`SELECT COUNT(*)::int AS n FROM categories`,
+          sql`SELECT COUNT(*)::int AS n FROM chapters`,
           sql`SELECT COUNT(*)::int AS n FROM reactions`,
         ]);
+        const dailyRows = await sql`SELECT to_char(d::date,'YYYY-MM-DD') AS date, COUNT(ve.id)::int AS views
+          FROM generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day') d
+          LEFT JOIN view_events ve ON ve.created_at >= d AND ve.created_at < d + INTERVAL '1 day'
+          GROUP BY d ORDER BY d`;
         const recentBooks = await sql`SELECT b.id,b.title,b.author,b.status,b.views,b.likes,b.dislikes,b.updated_at,COALESCE(c.name,'') AS category FROM books b LEFT JOIN categories c ON b.category_id=c.id ORDER BY b.updated_at DESC LIMIT 5`;
-        const recentComments = await sql`SELECT cm.id,cm.display_name,cm.body,cm.status,cm.created_at,b.title AS book_title FROM comments cm LEFT JOIN books b ON cm.book_id=b.id WHERE cm.status<>'deleted' ORDER BY cm.created_at DESC LIMIT 5`;
+        const popularBooks = await sql`SELECT b.id,b.title,b.author,b.views,b.likes,
+          (SELECT COUNT(*)::int FROM chapters ch WHERE ch.book_id=b.id) AS chapters_count
+          FROM books b WHERE b.status='published' ORDER BY b.views DESC LIMIT 6`;
+        const recentComments = await sql`SELECT cm.id,cm.display_name AS user_name,cm.body,cm.status,cm.created_at,b.title AS book_title FROM comments cm LEFT JOIN books b ON cm.book_id=b.id WHERE cm.status<>'deleted' ORDER BY cm.created_at DESC LIMIT 5`;
+        const totalViews = Number(bookStats[0].views || 0);
+        const totalBooks = Number(bookStats[0].total || 0);
+        const publishedBooks = Number(bookStats[0].published || 0);
+        const totalComments = Number(commentStats[0].total || 0);
+        const pendingComments = Number(commentStats[0].pending || 0);
+        const pendingWriters = Number(writerStats[0].pending || 0);
+        const totalWriters = Number(writerStats[0].total || 0);
+        const totalCategories = Number(categoryStats[0].n || 0);
+        const totalChapters = Number(chapterStats[0].n || 0);
+        const totalReactions = Number(reactionStats[0].n || 0);
+        const uniqueReaders = Number(viewStats[0].unique_readers || 0);
+        const dailyViews = dailyRows.map((r: any) => ({ date: r.date, views: Number(r.views || 0) }));
         return json({
-          totalBooks: totalBooks[0].n, publishedBooks: publishedBooks[0].n,
-          totalViews: totalViews[0].n, uniqueReaders: uniqueReaders[0].n,
-          totalComments: totalComments[0].n, pendingComments: pendingComments[0].n,
-          pendingWriters: pendingWriters[0].n, totalReactions: totalReactions[0].n,
-          recentBooks, recentComments
+          // snake_case: used by the admin dashboard and analytics page
+          total_books: totalBooks,
+          published_books: publishedBooks,
+          total_views: totalViews,
+          total_comments: totalComments,
+          pending_comments: pendingComments,
+          total_writers: totalWriters,
+          pending_writers: pendingWriters,
+          total_categories: totalCategories,
+          total_chapters: totalChapters,
+          active_readers: Number(activeStats[0].n || 0),
+          unique_readers: uniqueReaders,
+          views_today: Number(viewStats[0].today || 0),
+          views_this_week: Number(viewStats[0].week || 0),
+          views_this_month: Number(viewStats[0].month || 0),
+          total_reactions: totalReactions,
+          recent_books: recentBooks,
+          popular_books: popularBooks,
+          recent_comments: recentComments,
+          daily_views: dailyViews,
+          // backwards-compatible aliases
+          totalBooks,
+          publishedBooks,
+          totalViews,
+          uniqueReaders,
+          totalComments,
+          pendingComments,
+          pendingWriters,
+          totalReactions,
+          recentBooks,
+          recentComments,
         });
       }
 
@@ -2333,6 +2392,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return json({ error: 'Not found' }, 404);
       }
 
+      return json({ error: 'Not found' }, 404);
     } catch (error) { return json({ error: error instanceof Error ? error.message : 'Request failed' }, 500); }
 }
 
