@@ -19,4 +19,13 @@ npm run dev
 6. Set Worker secrets: `wrangler secret put DATABASE_URL` and `wrangler secret put MEDIA_PUBLIC_URL`.
 7. Protect `admin.xyteee.com` with Cloudflare Access before production use.
 
+## Moderator access
+
+- **Admin:** `https://admin.xyteee.com` — Cloudflare Access + `ADMIN_SECRET`.
+- **Moderators:** `https://lekhoni-admin.pages.dev` — simple username/password; this host opens on the Moderator tab by default.
+- Admin creates/disables/resets/deletes moderator accounts from the **Moderators** page.
+- Moderators can publish/unpublish stories, approve/reject writer stories, assign writer badges, delete stories, and send reader/writer notifications. Other admin pages and APIs are blocked server-side.
+
+Cloudflare Access protects only the custom domain. The `*.pages.dev` URL is public, so anyone can reach the login page there. If moderators must also pass Cloudflare Access, add a bypass policy for their path or disable Access for that host in the Zero Trust dashboard.
+
 Never expose `DATABASE_URL` or R2 credentials in the Vite frontend.
