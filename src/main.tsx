@@ -380,6 +380,7 @@ function App() {
 
   // Poll for new notifications every 15 seconds
   useEffect(() => {
+    if (!secret) return;
     const interval = setInterval(() => {
       api('/api/admin/analytics').then((d: any) => {
         setPendingComments(d.pending_comments || 0);
