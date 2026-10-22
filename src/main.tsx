@@ -3196,12 +3196,13 @@ function ChartArea({ data }: { data: { date: string; views: number }[] }) {
     views: d.views,
   }));
 
-  if (data.length === 0) {
+  if (data.length === 0 || data.every(d => Number(d.views) === 0)) {
     return (
       <div className="chart-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 230 }}>
         <div style={{ textAlign: 'center', color: '#6f827d' }}>
           <BarChart3 size={28} style={{ opacity: 0.55, marginBottom: 6 }} />
-          <p style={{ margin: 0, fontSize: 13 }}>No view data for this period</p>
+          <p style={{ margin: 0, fontSize: 13 }}>No reader view events in the last 7 days</p>
+          <p style={{ margin: '4px 0 0', fontSize: 11 }}>The chart will populate as readers open books.</p>
         </div>
       </div>
     );
