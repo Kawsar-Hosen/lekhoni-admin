@@ -448,7 +448,7 @@ function App() {
   if (!secret) return (
     <div className="shell" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', padding: 16 }}>
       <div style={{ maxWidth: 380, width: '100%', padding: 24, textAlign: 'center', background: '#121b1a', border: '1px solid #25332f', borderRadius: 14 }}>
-        <div className="mark" style={{ margin: '0 auto 12px' }}>ল</div>
+        <img src="/adminicon.png" alt="Lekhoni Admin" style={{ width: 80, height: 80, borderRadius: 18, objectFit: 'cover', margin: '0 auto 12px', display: 'block', boxShadow: '0 4px 16px #0005' }} />
         <h2 style={{ marginBottom: 6 }}>{loginMode === 'admin' ? 'Admin Login' : 'Moderator Login'}</h2>
         <p style={{ opacity: 0.7, fontSize: 12, marginBottom: 16 }}>
           {loginMode === 'admin' ? 'Enter the ADMIN_SECRET to manage Lekhoni Kahini.' : 'আপনার username ও password দিয়ে লগইন করুন।'}
@@ -480,7 +480,7 @@ function App() {
     <div className="shell">
       <aside className={mobileNavOpen ? 'open' : ''}>
         <div className="brand">
-          <div className="mark">ল</div>
+          <img src="/adminicon.png" alt="Lekhoni Admin" style={{ width: 46, height: 46, borderRadius: 13, objectFit: 'cover', boxShadow: '0 2px 8px #0004' }} />
           <div><strong>Lekhoni</strong><small>CONTENT STUDIO</small></div>
           <button onClick={clearSecret} title={isModerator ? 'Logout moderator' : 'Lock admin'} style={{ marginLeft: 'auto', cursor: 'pointer', background: 'none', border: 'none', fontSize: 16 }}>🔒</button>
           <button className="nav-close" onClick={() => setMobileNavOpen(false)} title="Close menu" aria-label="Close menu"><X size={18} /></button>
