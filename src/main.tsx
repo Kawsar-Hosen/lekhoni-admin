@@ -124,7 +124,7 @@ interface Analytics {
   daily_views: { date: string; views: number }[];
 }
 
-type Page = 'Dashboard' | 'Books' | 'Chapters' | 'Categories' | 'Comments' | 'Writers' | 'Users' | 'Home Control' | 'Notifications' | 'Moderators' | 'Analytics' | 'Settings' | 'Reports';
+type Page = 'Dashboard' | 'Submissions' | 'Books' | 'Chapters' | 'Categories' | 'Comments' | 'Writers' | 'Users' | 'Home Control' | 'Notifications' | 'Moderators' | 'Analytics' | 'Settings' | 'Reports';
 
 type ModeratorUser = { id?: string; username?: string; displayName?: string; display_name?: string; role?: string };
 
@@ -132,6 +132,7 @@ const API_BASE = 'https://lekhoni-admin-api.smdkawsar2.workers.dev';
 
 const nav: [Page, React.ElementType][] = [
   ['Dashboard', LayoutDashboard],
+  ['Submissions', Award],
   ['Books', BookOpen],
   ['Chapters', FileEdit],
   ['Categories', Menu],
@@ -146,7 +147,7 @@ const nav: [Page, React.ElementType][] = [
   ['Settings', Settings],
 ];
 
-const MODERATOR_PAGES: Page[] = ['Books', 'Chapters', 'Categories', 'Writers', 'Notifications', 'Reports', 'Analytics'];
+const MODERATOR_PAGES: Page[] = ['Submissions', 'Books', 'Chapters', 'Categories', 'Writers', 'Notifications', 'Reports', 'Analytics'];
 
 // ─── API Helper ─────────────────────────────────────────────────────────
 
@@ -494,8 +495,8 @@ function App() {
             <button key={label} title={label} className={page === label ? 'active' : ''} onClick={() => { setPage(label); setMobileNavOpen(false); }}>
               <Icon size={18} />
               <span>{label}</span>
+              {label === 'Submissions' && pendingWriters > 0 && <b style={{ background: '#f59e0b', color: '#000' }}>{pendingWriters}</b>}
               {label === 'Comments' && pendingComments > 0 && <b>{pendingComments}</b>}
-              {label === 'Writers' && pendingWriters > 0 && <b>{pendingWriters}</b>}
               {label === 'Notifications' && pendingNotifications > 0 && <b>{pendingNotifications}</b>}
             </button>
           ))}
@@ -527,6 +528,7 @@ function App() {
           </div>
         </header>
         {page === 'Dashboard' && !isModerator && <Dashboard onCreate={() => openCreate('book')} onToast={showToast} />}
+        {page === 'Submissions' && <SubmissionsPage isModerator={isModerator} onToast={showToast} onRefreshPending={setPendingWriters} />}
         {page === 'Books' && <BooksPage isModerator={isModerator} onEdit={(b: Book) => openEdit('book', b)} onToast={showToast} onRefreshPending={setPendingComments} />}
         {page === 'Chapters' && <ChaptersPage onToast={showToast} />}
         {page === 'Categories' && <CategoriesPage onEdit={(c: Category) => openEdit('category', c)} onToast={showToast} />}
@@ -1237,6 +1239,515 @@ function CommentsPage({ onToast, onRefreshPending }: { onToast: (m: string) => v
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── Submissions Page (Dedicated Story Review & Approval) ────────────────
+
+function SubmissionsPage({ onToast, onRefreshPending, isModerator = false }: { onToast: (m: string) => void; onRefreshPending?: (n: number) => void; isModerator?: boolean }) {
+  const [stories, setStories] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState<'pending' | 'published' | 'rejected' | 'all'>('pending');
+  const [search, setSearch] = useState('');
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [previewStory, setPreviewStory] = useState<any | null>(null);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api('/api/admin/writers')
+      .then((d: any) => setStories(Array.isArray(d) ? d : []))
+      .catch(() => onToast('Failed to load story submissions'))
+      .finally(() => setLoading(false));
+  }, [onToast]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const updateStatus = async (storyId: string, status: 'published' | 'rejected' | 'pending') => {
+    const note = (notes[storyId] || '').trim();
+    setUpdatingId(storyId);
+    try {
+      await api(`/api/admin/writers/${storyId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ status, note })
+      });
+      setStories(prev => prev.map(s => s.id === storyId ? { ...s, status, review_note: note } : s));
+      if (previewStory?.id === storyId) {
+        setPreviewStory((prev: any) => ({ ...prev, status, review_note: note }));
+      }
+      onRefreshPending?.(-1);
+      onToast(status === 'published' ? 'গল্পটি সফলভাবে প্রকাশিত হয়েছে!' : status === 'rejected' ? 'গল্পটি বাতিল করা হয়েছে।' : 'অপেক্ষমান তালিকায় ফিরিয়ে আনা হয়েছে।');
+    } catch {
+      onToast('স্ট্যাটাস আপডেট করা যায়নি');
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
+  const pendingCount = stories.filter(s => s.status === 'pending').length;
+  const publishedCount = stories.filter(s => s.status === 'published').length;
+  const rejectedCount = stories.filter(s => s.status === 'rejected').length;
+
+  const filtered = stories.filter(s => {
+    if (tab !== 'all' && s.status !== tab) return false;
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return (s.title || '').toLowerCase().includes(q) ||
+           (s.writer_name || '').toLowerCase().includes(q) ||
+           (s.category || '').toLowerCase().includes(q);
+  });
+
+  const formatDate = (dateStr: string) => {
+    if (!dateStr) return '—';
+    try {
+      return new Date(dateStr).toLocaleDateString('bn-BD', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    } catch {
+      return dateStr;
+    }
+  };
+
+  return (
+    <div className="content">
+      {/* Header */}
+      <div className="resource-head" style={{ marginBottom: 20 }}>
+        <div>
+          <h2>গল্প অনুমোদন (Story Submissions)</h2>
+          <p>অ্যাপ থেকে লেখকদের জমা দেওয়া গল্পসমূহ এক ক্লিকে অনুমোদন বা বাতিল করুন।</p>
+        </div>
+        <button className="primary" onClick={load} disabled={loading} style={{ background: '#1c2d28', border: '1px solid #324942', color: '#56d5b1' }}>
+          <RefreshCw size={15} className={loading ? 'spin' : ''} /> রিফ্রেশ করুন
+        </button>
+      </div>
+
+      {/* Top Metrics Cards */}
+      <div className="metrics" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 14, marginBottom: 22 }}>
+        <div className="metric" style={{ cursor: 'pointer', border: tab === 'pending' ? '1px solid #f59e0b' : '1px solid #25332f' }} onClick={() => setTab('pending')}>
+          <div className="metric-icon" style={{ background: '#3d280b', color: '#f59e0b' }}>
+            <Clock size={20} />
+          </div>
+          <p>অপেক্ষমান গল্প</p>
+          <strong style={{ color: '#f59e0b' }}>{pendingCount}</strong>
+          <small className="warn">{pendingCount > 0 ? 'অনুমোদনের অপেক্ষায়' : 'কোনো পেন্ডিং নেই'}</small>
+        </div>
+
+        <div className="metric" style={{ cursor: 'pointer', border: tab === 'published' ? '1px solid #10b981' : '1px solid #25332f' }} onClick={() => setTab('published')}>
+          <div className="metric-icon" style={{ background: '#12392c', color: '#10b981' }}>
+            <Check size={20} />
+          </div>
+          <p>অনুমোদিত ও প্রকাশিত</p>
+          <strong style={{ color: '#10b981' }}>{publishedCount}</strong>
+          <small style={{ color: '#10b981' }}>লাইভ চলছে</small>
+        </div>
+
+        <div className="metric" style={{ cursor: 'pointer', border: tab === 'rejected' ? '1px solid #ef4444' : '1px solid #25332f' }} onClick={() => setTab('rejected')}>
+          <div className="metric-icon" style={{ background: '#3b1c1c', color: '#ef4444' }}>
+            <Ban size={20} />
+          </div>
+          <p>বাতিলকৃত গল্প</p>
+          <strong style={{ color: '#ef4444' }}>{rejectedCount}</strong>
+          <small style={{ color: '#ef4444' }}>রিভিউতে বাতিল</small>
+        </div>
+
+        <div className="metric" style={{ cursor: 'pointer', border: tab === 'all' ? '1px solid #56d5b1' : '1px solid #25332f' }} onClick={() => setTab('all')}>
+          <div className="metric-icon" style={{ background: '#18342d', color: '#56d5b1' }}>
+            <BookOpen size={20} />
+          </div>
+          <p>সর্বমোট গল্প</p>
+          <strong>{stories.length}</strong>
+          <small style={{ color: '#82958f' }}>সকল স্ট্যাটাস</small>
+        </div>
+      </div>
+
+      {/* Main Panel */}
+      <div className="panel resource" style={{ padding: 20 }}>
+        {/* Toolbar & Filter Tabs */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 14, paddingBottom: 16, borderBottom: '1px solid #25332f' }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button
+              onClick={() => setTab('pending')}
+              style={{
+                background: tab === 'pending' ? '#f59e0b' : '#141e1c',
+                color: tab === 'pending' ? '#000' : '#8fa19c',
+                border: '1px solid ' + (tab === 'pending' ? '#f59e0b' : '#2a3935'),
+                borderRadius: 8,
+                padding: '7px 14px',
+                fontWeight: 700,
+                fontSize: 13,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              ⏳ অপেক্ষমান ({pendingCount})
+            </button>
+            <button
+              onClick={() => setTab('published')}
+              style={{
+                background: tab === 'published' ? '#10b981' : '#141e1c',
+                color: tab === 'published' ? '#fff' : '#8fa19c',
+                border: '1px solid ' + (tab === 'published' ? '#10b981' : '#2a3935'),
+                borderRadius: 8,
+                padding: '7px 14px',
+                fontWeight: 700,
+                fontSize: 13,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              ✅ অনুমোদিত ({publishedCount})
+            </button>
+            <button
+              onClick={() => setTab('rejected')}
+              style={{
+                background: tab === 'rejected' ? '#ef4444' : '#141e1c',
+                color: tab === 'rejected' ? '#fff' : '#8fa19c',
+                border: '1px solid ' + (tab === 'rejected' ? '#ef4444' : '#2a3935'),
+                borderRadius: 8,
+                padding: '7px 14px',
+                fontWeight: 700,
+                fontSize: 13,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              ❌ বাতিলকৃত ({rejectedCount})
+            </button>
+            <button
+              onClick={() => setTab('all')}
+              style={{
+                background: tab === 'all' ? '#1e3831' : '#141e1c',
+                color: tab === 'all' ? '#56d5b1' : '#8fa19c',
+                border: '1px solid ' + (tab === 'all' ? '#56d5b1' : '#2a3935'),
+                borderRadius: 8,
+                padding: '7px 14px',
+                fontWeight: 700,
+                fontSize: 13,
+                cursor: 'pointer',
+              }}
+            >
+              সকল ({stories.length})
+            </button>
+          </div>
+
+          <label className="search" style={{ height: 38, width: 260 }}>
+            <Search size={16} />
+            <input
+              placeholder="গল্প, লেখক বা ক্যাটাগরি খুঁজুন..."
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              style={{ width: '100%', fontSize: 13 }}
+            />
+          </label>
+        </div>
+
+        {/* Stories List */}
+        {loading ? (
+          <div className="empty" style={{ height: 300 }}>
+            <Loader2 size={34} className="spin" style={{ color: '#4bc8a5' }} />
+            <h3 style={{ marginTop: 14 }}>গল্প লোড হচ্ছে...</h3>
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="empty" style={{ height: 300 }}>
+            <BookOpen size={40} style={{ color: '#3d524c' }} />
+            <h3 style={{ marginTop: 14 }}>কোনো গল্প পাওয়া যায়নি</h3>
+            <p style={{ color: '#738681' }}>{tab === 'pending' ? 'এই মুহূর্তে অনুমোদনের জন্য কোনো অপেক্ষমান গল্প নেই।' : 'অনুসন্ধানের সাথে মিল পাওয়া যায়নি।'}</p>
+          </div>
+        ) : (
+          <div style={{ display: 'grid', gap: 16, marginTop: 18 }}>
+            {filtered.map((s: any) => {
+              const isPending = s.status === 'pending';
+              const isPublished = s.status === 'published';
+              const isRejected = s.status === 'rejected';
+              const currentNote = notes[s.id] ?? (s.review_note || '');
+
+              return (
+                <div
+                  key={s.id}
+                  style={{
+                    background: '#141d1c',
+                    border: '1px solid ' + (isPending ? '#533c1d' : isPublished ? '#1d3f33' : '#3d2323'),
+                    borderRadius: 12,
+                    padding: 18,
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(0, 1fr)',
+                    gap: 14,
+                    transition: 'border-color 0.2s',
+                  }}
+                >
+                  {/* Top Row: Cover, Info & Status */}
+                  <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                    {/* Story Cover */}
+                    {s.cover_url ? (
+                      <img
+                        src={s.cover_url}
+                        alt={s.title}
+                        style={{ width: 62, height: 86, borderRadius: 8, objectFit: 'cover', border: '1px solid #2a3935', flexShrink: 0 }}
+                      />
+                    ) : (
+                      <div
+                        style={{
+                          width: 62,
+                          height: 86,
+                          borderRadius: 8,
+                          background: 'linear-gradient(135deg, #1b3830, #0c1a16)',
+                          border: '1px solid #2a3935',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: '#56d5b1',
+                          fontSize: 22,
+                          fontWeight: 800,
+                          flexShrink: 0,
+                        }}
+                      >
+                        {(s.title || '?')[0]}
+                      </div>
+                    )}
+
+                    {/* Story Main Meta */}
+                    <div style={{ flex: 1, minWidth: 240 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 4 }}>
+                        <h3 style={{ margin: 0, fontSize: 17, color: '#eaf4f0', fontWeight: 700 }}>{s.title}</h3>
+                        {/* Status Badge */}
+                        <span
+                          style={{
+                            padding: '3px 10px',
+                            borderRadius: 12,
+                            fontSize: 11,
+                            fontWeight: 700,
+                            background: isPending ? '#3e2a0f' : isPublished ? '#14382c' : '#3e1a1a',
+                            color: isPending ? '#fbbf24' : isPublished ? '#34d399' : '#f87171',
+                            border: '1px solid ' + (isPending ? '#855314' : isPublished ? '#1e5f48' : '#7f2323'),
+                          }}
+                        >
+                          {isPending ? '⏳ অপেক্ষমান (Review)' : isPublished ? '✅ প্রকাশিত (Published)' : '❌ বাতিলকৃত (Rejected)'}
+                        </span>
+                        {s.category && (
+                          <span style={{ fontSize: 11, color: '#82958f', background: '#1c2825', padding: '3px 9px', borderRadius: 8, border: '1px solid #2a3935' }}>
+                            📂 {s.category}
+                          </span>
+                        )}
+                        <span style={{ fontSize: 11, color: '#56d5b1', background: '#132822', padding: '3px 9px', borderRadius: 8 }}>
+                          📖 {s.chapter_count || s.chapters_count || 1}টি পর্ব
+                        </span>
+                      </div>
+
+                      {/* Writer Meta */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#8fa19c', marginBottom: 8 }}>
+                        {s.avatar_url ? (
+                          <img src={s.avatar_url} alt="" style={{ width: 20, height: 20, borderRadius: '50%', objectFit: 'cover' }} />
+                        ) : (
+                          <div style={{ width: 20, height: 20, borderRadius: '50%', background: '#1d3e35', color: '#56d5b1', fontSize: 11, display: 'grid', placeItems: 'center', fontWeight: 700 }}>
+                            {(s.writer_name || 'L')[0]}
+                          </div>
+                        )}
+                        <span>লেখক: <strong style={{ color: '#eaf4f0' }}>{s.writer_name || 'লেখক'}</strong></span>
+                        <span>•</span>
+                        <span style={{ fontSize: 12, color: '#6f827d' }}>জমা দেওয়া হয়েছে: {formatDate(s.created_at || s.updated_at)}</span>
+                      </div>
+
+                      {/* Summary / Description */}
+                      <p style={{ margin: 0, fontSize: 13, color: '#a7b8b3', lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                        {s.description || 'কোনো বিবরণ দেওয়া হয়নি।'}
+                      </p>
+                    </div>
+
+                    {/* View Details Button */}
+                    <button
+                      onClick={() => setPreviewStory(s)}
+                      style={{
+                        background: '#192523',
+                        border: '1px solid #2d3e39',
+                        color: '#9fb0ab',
+                        borderRadius: 8,
+                        padding: '8px 14px',
+                        cursor: 'pointer',
+                        fontSize: 12,
+                        fontWeight: 600,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        height: 36,
+                      }}
+                    >
+                      <Eye size={15} /> পূর্ণ বিবরণ
+                    </button>
+                  </div>
+
+                  {/* Previous Admin Review Note (if any) */}
+                  {s.review_note && (
+                    <div style={{ background: '#1c1b14', border: '1px solid #3d351b', borderRadius: 8, padding: '8px 14px', fontSize: 12, color: '#e8c97e', display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <span>📝 <strong>পূর্বের নোট:</strong> {s.review_note}</span>
+                    </div>
+                  )}
+
+                  {/* Action Bar (Approve / Reject & Feedback Note) */}
+                  <div
+                    style={{
+                      borderTop: '1px solid #23312e',
+                      paddingTop: 12,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      flexWrap: 'wrap',
+                      gap: 12,
+                    }}
+                  >
+                    {/* Note Input */}
+                    <div style={{ flex: 1, minWidth: 260 }}>
+                      <input
+                        placeholder="লেখকের জন্য ফিডব্যাক বা নোট লিখুন (ঐচ্ছিক)..."
+                        value={currentNote}
+                        onChange={e => setNotes(prev => ({ ...prev, [s.id]: e.target.value }))}
+                        style={{
+                          width: '100%',
+                          background: '#0d1514',
+                          border: '1px solid #283733',
+                          borderRadius: 8,
+                          padding: '8px 12px',
+                          color: '#eaf4f0',
+                          fontSize: 12,
+                          outline: 'none',
+                        }}
+                      />
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      {/* Approve Button */}
+                      {s.status !== 'published' && (
+                        <button
+                          onClick={() => updateStatus(s.id, 'published')}
+                          disabled={updatingId === s.id}
+                          style={{
+                            background: '#10b981',
+                            color: '#06281e',
+                            border: 'none',
+                            borderRadius: 8,
+                            padding: '8px 16px',
+                            fontWeight: 700,
+                            fontSize: 13,
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 6,
+                          }}
+                        >
+                          <Check size={16} /> অনুমোদন ও প্রকাশ
+                        </button>
+                      )}
+
+                      {/* Reject Button */}
+                      {s.status !== 'rejected' && (
+                        <button
+                          onClick={() => updateStatus(s.id, 'rejected')}
+                          disabled={updatingId === s.id}
+                          style={{
+                            background: '#ef4444',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: 8,
+                            padding: '8px 16px',
+                            fontWeight: 700,
+                            fontSize: 13,
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 6,
+                          }}
+                        >
+                          <Ban size={16} /> বাতিল করুন
+                        </button>
+                      )}
+
+                      {/* Revert to Pending */}
+                      {s.status !== 'pending' && (
+                        <button
+                          onClick={() => updateStatus(s.id, 'pending')}
+                          disabled={updatingId === s.id}
+                          style={{
+                            background: '#1c2825',
+                            color: '#9fb0ab',
+                            border: '1px solid #2d3e39',
+                            borderRadius: 8,
+                            padding: '8px 14px',
+                            fontWeight: 600,
+                            fontSize: 12,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          পুনর্বিবেচনা (Pending)
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Story Full Preview Modal */}
+      {previewStory && (
+        <div className="overlay" onClick={() => setPreviewStory(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 640 }}>
+            <div className="modal-head">
+              <div>
+                <p className="kicker">STORY SUBMISSION PREVIEW</p>
+                <h2 style={{ fontSize: 20 }}>{previewStory.title}</h2>
+              </div>
+              <button type="button" onClick={() => setPreviewStory(null)}><X size={20} /></button>
+            </div>
+
+            <div style={{ display: 'flex', gap: 16, marginBottom: 18, alignItems: 'center' }}>
+              {previewStory.cover_url && (
+                <img src={previewStory.cover_url} alt="" style={{ width: 70, height: 98, borderRadius: 8, objectFit: 'cover', border: '1px solid #2a3935' }} />
+              )}
+              <div>
+                <p style={{ margin: '0 0 6px', fontSize: 14 }}>লেখক: <strong style={{ color: '#56d5b1' }}>{previewStory.writer_name}</strong></p>
+                <p style={{ margin: '0 0 6px', fontSize: 13, color: '#8fa19c' }}>ক্যাটাগরি: <strong>{previewStory.category || 'সাধারণ'}</strong></p>
+                <p style={{ margin: '0 0 6px', fontSize: 13, color: '#8fa19c' }}>মোট পর্ব: <strong>{previewStory.chapter_count || previewStory.chapters_count || 1}টি</strong></p>
+                <p style={{ margin: 0, fontSize: 12, color: '#6f827d' }}>জমার তারিখ: {formatDate(previewStory.created_at)}</p>
+              </div>
+            </div>
+
+            <div style={{ background: '#0e1614', border: '1px solid #25332f', borderRadius: 8, padding: 14, marginBottom: 18 }}>
+              <h4 style={{ margin: '0 0 8px', fontSize: 13, color: '#56d5b1' }}>গল্পের সারসংক্ষেপ (Description):</h4>
+              <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7, color: '#d0dfda', whiteSpace: 'pre-wrap' }}>
+                {previewStory.description || 'কোনো বিবরণ নেই।'}
+              </p>
+            </div>
+
+            <div className="modal-actions" style={{ marginTop: 20 }}>
+              {previewStory.status !== 'published' && (
+                <button
+                  className="primary"
+                  onClick={() => { updateStatus(previewStory.id, 'published'); setPreviewStory(null); }}
+                  style={{ background: '#10b981', color: '#06281e' }}
+                >
+                  <Check size={16} /> অনুমোদন ও প্রকাশ
+                </button>
+              )}
+              {previewStory.status !== 'rejected' && (
+                <button
+                  onClick={() => { updateStatus(previewStory.id, 'rejected'); setPreviewStory(null); }}
+                  style={{ background: '#ef4444', color: '#fff', border: 'none', borderRadius: 8, padding: '10px 16px', fontWeight: 700, cursor: 'pointer' }}
+                >
+                  <Ban size={16} /> বাতিল করুন
+                </button>
+              )}
+              <button type="button" onClick={() => setPreviewStory(null)}>বন্ধ করুন</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2347,11 +2858,10 @@ function AppVersionEditor({ onToast }: { onToast: (m: string) => void }) {
 }
 
 function AboutContentEditor({ onToast }: { onToast: (m: string) => void }) {
-  const [lang, setLang] = useState<'bn' | 'en' | 'hi'>('bn');
+  const [lang, setLang] = useState<'bn' | 'en'>('bn');
   const defaults: Record<string, { title: string; subtitle: string; desc: string; features: string[] }> = {
     bn: { title: 'Lekhoni Kahini', subtitle: 'বাংলা সাহিত্য ও উপন্যাসের এক অনন্য পাঠভুবন', desc: 'এখানে পাবেন নতুন ও জনপ্রিয় লেখকদের অসংখ্য উপন্যাস, ছোটগল্প, কবিতা ও বিভিন্ন সাহিত্যকর্ম। নিজের পছন্দের গল্প খুঁজে পড়ুন, প্রিয় লেখকদের অনুসরণ করুন এবং বাংলা সাহিত্যের গল্পে হারিয়ে যান।', features: ['হাজার হাজার বাংলা গল্প ও উপন্যাস', 'নতুন ও জনপ্রিয় লেখকদের সৃজনশীল সাহিত্য', 'অফলাইনে পড়ার সুবিধা', 'নিজের গল্প লেখা ও প্রকাশের সুযোগ', 'গল্প লিখে আয়ের সুযোগ পান', 'নিরাপদ ও ব্যবহারকারী-বান্ধব অভিজ্ঞতা'] },
-    en: { title: 'Lekhoni Kahini', subtitle: 'Your gateway to Bengali literature & novels', desc: 'Discover thousands of novels, short stories, poems and literary works from popular Bengali authors.', features: ['Thousands of Bengali stories & novels', 'Creative works from popular authors', 'Read offline anytime', 'Write & publish your own stories', 'Earn money by writing stories', 'Safe & user-friendly experience'] },
-    hi: { title: 'Lekhoni Kahini', subtitle: 'बंगाली साहित्य और उपन्यासों का अनोखा मंच', desc: 'यहाँ पाएं नए और लोकप्रिय लेखकों की असंख्य कहानियाँ, लघु कथाएँ, कविताएँ और साहित्यिक कृतियाँ।', features: ['हज़ारों बंगाली कहानियाँ और उपन्यास', 'लोकप्रिय लेखकों की रचनाएँ', 'कभी भी ऑफ़लाइन पढ़ें', 'अपनी कहानियाँ लिखें और प्रकाशित करें', 'कहानी लिखकर कमाएं', 'सुरक्षित और उपयोगकर्ता-अनुकूल'] }
+    en: { title: 'Lekhoni Kahini', subtitle: 'Your gateway to Bengali literature & novels', desc: 'Discover thousands of novels, short stories, poems and literary works from popular Bengali authors.', features: ['Thousands of Bengali stories & novels', 'Creative works from popular authors', 'Read offline anytime', 'Write & publish your own stories', 'Earn money by writing stories', 'Safe & user-friendly experience'] }
   };
   const [data, setData] = useState<Record<string, { title: string; subtitle: string; desc: string; features: string[] }>>(defaults);
   const [version, setVersion] = useState('1.0.0');
@@ -2371,7 +2881,6 @@ function AboutContentEditor({ onToast }: { onToast: (m: string) => void }) {
   const handleSave = async () => {
     setSaving(true);
     try {
-      const allFeatures = [...new Set([...data.bn.features, ...data.en.features, ...data.hi.features].filter(f => f.trim()))];
       await api('/api/admin/about', {
         method: 'PUT',
         body: JSON.stringify({
@@ -2407,11 +2916,11 @@ function AboutContentEditor({ onToast }: { onToast: (m: string) => void }) {
       <p style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 16 }}>This content appears on the "About App" page. App shows permanent defaults if not saved.</p>
       {/* Language tabs */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-        {(['bn', 'en', 'hi'] as const).map(l => (
+        {(['bn', 'en'] as const).map(l => (
           <button key={l} onClick={() => setLang(l)} style={{
             padding: '6px 16px', borderRadius: 8, border: '1px solid var(--line)', cursor: 'pointer', fontSize: 12, fontWeight: 600,
             background: lang === l ? 'var(--primary)' : 'var(--card)', color: lang === l ? '#fff' : 'var(--ink)'
-          }}>{l === 'bn' ? 'বাংলা' : l === 'en' ? 'English' : 'हिन्दी'}</button>
+          }}>{l === 'bn' ? 'বাংলা' : 'English'}</button>
         ))}
       </div>
       <label>
@@ -2470,11 +2979,6 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
   const [coverPreview, setCoverPreview] = useState(editItem?.cover_url || '');
   const [categories, setCategories] = useState<Category[]>([]);
   const [submitting, setSubmitting] = useState(false);
-  const [pdfUrl, setPdfUrl] = useState((editItem as any)?.pdf_url || '');
-  const [authorName, setAuthorName] = useState((editItem as any)?.author_name || '');
-  const [dedication, setDedication] = useState((editItem as any)?.dedication || '');
-  const [showAds, setShowAds] = useState(editItem?.show_ads !== false);
-  const [pdfRewardAd, setPdfRewardAd] = useState((editItem as any)?.pdf_reward_ad !== false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -2519,11 +3023,6 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
         cover_url: coverUrl,
         category_id: categoryId || undefined,
         status,
-        pdf_url: pdfUrl.trim(),
-        author_name: authorName.trim(),
-        dedication: dedication.trim(),
-        show_ads: showAds,
-        pdf_reward_ad: pdfRewardAd,
         writer_status: writerStatus,
         is_new: isNew,
       };
@@ -2642,82 +3141,6 @@ function BookModal({ editItem, close, onToast }: { editItem: Book | null; close:
             />
           </div>
         )}
-        <label className="upload" style={pdfUrl ? { borderStyle: 'solid', borderColor: '#8B5CF6' } : {}}>
-          <CloudUpload />
-          <span>{pdfUrl ? 'PDF selected - click to change' : 'Upload PDF file'}</span>
-          <small>PDF · max 50MB · stored in Cloudflare R2</small>
-          <input
-            type="file"
-            accept=".pdf,application/pdf"
-            onChange={async (e) => {
-              const file = e.target.files?.[0];
-              if (!file) return;
-              setSubmitting(true);
-              try {
-                const fd = new FormData();
-                fd.append('file', file);
-                const res = await fetch(`${API_BASE}/api/upload-pdf`, { method: 'POST', body: fd });
-                if (!res.ok) throw new Error('Upload failed');
-                const data = await res.json();
-                setPdfUrl(data.url || '');
-                onToast('PDF uploaded');
-              } catch { onToast('PDF upload failed'); }
-              setSubmitting(false);
-            }}
-          />
-        </label>
-        {pdfUrl && (
-          <div style={{ marginTop: 8, padding: 8, background: '#F3F4F6', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 13, color: '#374151', flex: 1, wordBreak: 'break-all' }}>{pdfUrl}</span>
-            <button type="button" onClick={() => setPdfUrl('')} style={{ background: 'none', border: 'none', color: '#EF4444', cursor: 'pointer', padding: 4 }}><X size={14} /></button>
-          </div>
-        )}
-        <label>
-          Or PDF URL <small style={{ color: '#6B7280' }}>(if file is hosted elsewhere)</small>
-          <input
-            placeholder="https://example.com/file.pdf"
-            value={pdfUrl}
-            onChange={e => setPdfUrl(e.target.value)}
-          />
-        </label>
-        <div className="form-grid">
-          <label>
-            Author Name <small style={{ color: '#6B7280' }}>(for PDF)</small>
-            <input
-              placeholder="লেখকের নাম (PDF-এর জন্য)"
-              value={authorName}
-              onChange={e => setAuthorName(e.target.value)}
-            />
-          </label>
-          <label>
-            Dedication <small style={{ color: '#6B7280' }}>(optional)</small>
-            <input
-              placeholder="যাকে উৎসর্গ করতে চান"
-              value={dedication}
-              onChange={e => setDedication(e.target.value)}
-            />
-          </label>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0', borderTop: '1px solid #E5E7EB', marginTop: 8 }}>
-          <div>
-            <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>Show Ads</div>
-            <div style={{ fontSize: 12, color: '#6B7280' }}>Interstitial ad before reading</div>
-          </div>
-          <button type="button" onClick={() => setShowAds(!showAds)} style={{ width: 48, height: 26, borderRadius: 13, border: 'none', background: showAds ? '#10B981' : '#D1D5DB', cursor: 'pointer', position: 'relative', transition: 'background 0.2s' }}>
-            <span style={{ position: 'absolute', top: 3, left: showAds ? 25 : 3, width: 20, height: 20, borderRadius: 10, background: '#fff', transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
-          </button>
-        </div>
-        {pdfUrl && (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0', borderTop: '1px solid #E5E7EB' }}>
-            <div>
-              <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>PDF Reward Ad</div>
-              <div style={{ fontSize: 12, color: '#6B7280' }}>Watch ad to open PDF</div>
-            </div>
-            <button type="button" onClick={() => setPdfRewardAd(!pdfRewardAd)} style={{ width: 48, height: 26, borderRadius: 13, border: 'none', background: pdfRewardAd ? '#8B5CF6' : '#D1D5DB', cursor: 'pointer', position: 'relative', transition: 'background 0.2s' }}>
-              <span style={{ position: 'absolute', top: 3, left: pdfRewardAd ? 25 : 3, width: 20, height: 20, borderRadius: 10, background: '#fff', transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
-            </button>
-          </div>
-        )}
         <div className="modal-actions">
           <button type="button" onClick={close} disabled={submitting}>Cancel</button>
           <button className="primary" type="submit" disabled={submitting}>
@@ -2738,7 +3161,6 @@ function ChapterModal({ close, onToast }: { close: () => void; onToast: (m: stri
   const [body, setBody] = useState('');
   const [position, setPosition] = useState(1);
   const [status, setStatus] = useState('draft');
-  const [rewardAd, setRewardAd] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
@@ -2763,7 +3185,6 @@ function ChapterModal({ close, onToast }: { close: () => void; onToast: (m: stri
           body,
           position: Number(position),
           status,
-          reward_ad: rewardAd,
         }),
       });
       onToast('Chapter created');
@@ -2824,21 +3245,12 @@ function ChapterModal({ close, onToast }: { close: () => void; onToast: (m: stri
         <label>
           Body
           <textarea
-            rows={8}
+            rows={10}
             placeholder="Write the chapter content here... (supports Markdown)"
             value={body}
             onChange={e => setBody(e.target.value)}
           />
         </label>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 0', borderTop: '1px solid #E5E7EB' }}>
-          <div>
-            <div style={{ fontSize: 14, fontWeight: 600, color: '#374151' }}>Reward Ad</div>
-            <div style={{ fontSize: 12, color: '#6B7280' }}>Lock chapter + show ad to unlock</div>
-          </div>
-          <button type="button" onClick={() => setRewardAd(!rewardAd)} style={{ width: 48, height: 26, borderRadius: 13, border: 'none', background: rewardAd ? '#8B5CF6' : '#D1D5DB', cursor: 'pointer', position: 'relative', transition: 'background 0.2s' }}>
-            <span style={{ position: 'absolute', top: 3, left: rewardAd ? 25 : 3, width: 20, height: 20, borderRadius: 10, background: '#fff', transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
-          </button>
-        </div>
         <div className="modal-actions">
           <button type="button" onClick={close} disabled={submitting}>Cancel</button>
           <button className="primary" type="submit" disabled={submitting}>
