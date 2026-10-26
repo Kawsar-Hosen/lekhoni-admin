@@ -1,6 +1,68 @@
-import { neon } from '@neondatabase/serverless';
+export interface Env {
+  DATABASE_URL?: string;
+  DB?: D1Database;
+  MEDIA: R2Bucket;
+  ALLOWED_ORIGIN: string;
+  MEDIA_PUBLIC_URL: string;
+  MAIL_WEBHOOK_URL?: string;
+  MAIL_WEBHOOK_SECRET?: string;
+  JWT_SECRET?: string;
+  ADMIN_SECRET?: string;
+}
 
-export interface Env { DATABASE_URL: string; MEDIA: R2Bucket; ALLOWED_ORIGIN: string; MEDIA_PUBLIC_URL: string; MAIL_WEBHOOK_URL?: string; MAIL_WEBHOOK_SECRET?: string; JWT_SECRET?: string; ADMIN_SECRET?: string }
+export function createD1Sql(db: D1Database) {
+  return async (strings: TemplateStringsArray, ...values: any[]) => {
+    let rawQuery = '';
+    const bindings: any[] = [];
+    for (let i = 0; i < strings.length; i++) {
+      rawQuery += strings[i];
+      if (i < values.length) {
+        let v = values[i];
+        if (Array.isArray(v) && rawQuery.trimEnd().endsWith('= ANY(')) {
+          rawQuery = rawQuery.trimEnd().slice(0, -6) + 'IN (';
+          if (v.length === 0) {
+            rawQuery += 'NULL';
+          } else {
+            rawQuery += v.map(() => '?').join(',');
+            for (const item of v) bindings.push(item);
+          }
+          continue;
+        }
+
+        rawQuery += '?';
+        if (typeof v === 'boolean') {
+          bindings.push(v ? 1 : 0);
+        } else if (v !== null && typeof v === 'object' && !(v instanceof ArrayBuffer) && !(v instanceof Uint8Array)) {
+          bindings.push(JSON.stringify(v));
+        } else {
+          bindings.push(v === undefined ? null : v);
+        }
+      }
+    }
+
+    let q = rawQuery
+      .replace(/to_char\(d::date,\s*'YYYY-MM-DD'\)/gi, "strftime('%Y-%m-%d', d)")
+      .replace(/FROM\s+generate_series\(CURRENT_DATE\s*-\s*INTERVAL\s*'6 days',\s*CURRENT_DATE,\s*INTERVAL\s*'1 day'\)\s*d/gi,
+        "FROM (WITH RECURSIVE dates(d) AS (SELECT date('now', '-6 days') UNION ALL SELECT date(d, '+1 day') FROM dates WHERE d < date('now')) SELECT d FROM dates)")
+      .replace(/NOW\(\)\s*([+-])\s*INTERVAL\s*'(\d+)\s*([^']+)'/gi, (_, sign, num, unit) => `datetime('now', '${sign}${num} ${unit}')`)
+      .replace(/CURRENT_DATE\s*([+-])\s*INTERVAL\s*'(\d+)\s*([^']+)'/gi, (_, sign, num, unit) => `date('now', '${sign}${num} ${unit}')`)
+      .replace(/\bNOW\(\)/gi, `datetime('now')`)
+      .replace(/\bCURRENT_DATE\b/gi, `date('now')`)
+      .replace(/\bgen_random_uuid\(\)/gi, `lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-a' || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))`)
+      .replace(/\bILIKE\b/gi, 'LIKE')
+      .replace(/::[a-zA-Z0-9_]+/g, '');
+
+    const stmt = db.prepare(q).bind(...bindings);
+    const res = await stmt.all();
+    return (res.results || []) as any[];
+  };
+}
+
+function getSql(env: Env) {
+  if (env.DB) return createD1Sql(env.DB);
+  throw new Error('Cloudflare D1 database binding "DB" is not configured');
+}
+
 const corsHeaders = (origin: string) => ({ 'content-type': 'application/json', 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type, authorization', 'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS' });
 const json = (data: unknown, status = 200, origin = '*') => new Response(JSON.stringify(data), { status, headers: corsHeaders(origin) });
 
@@ -166,16 +228,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
       // --- DB Migration (run once) ---
       if (url.pathname === '/api/admin/migrate-shortid' && request.method === 'POST') {
-        if (!env.DATABASE_URL) return json({ error: 'No DB' }, 503);
-        const sql = neon(env.DATABASE_URL);
+        const sql = getSql(env);
         await sql`ALTER TABLE books ADD COLUMN IF NOT EXISTS short_id TEXT UNIQUE`;
         // Single-statement backfill: md5(uuid) is unique per book (hex, 8 chars).
         const r = await sql`UPDATE books SET short_id=substring(md5(id::text) from 1 for 8) WHERE short_id IS NULL`;
         return json({ ok: true, backfilled: (r as unknown as { rowCount?: number }).rowCount ?? null });
       }
       if (url.pathname === '/api/admin/migrate' && request.method === 'POST') {
-        if (!env.DATABASE_URL) return json({ error: 'No DB' }, 503);
-        const sql = neon(env.DATABASE_URL);
+        const sql = getSql(env);
         await sql`CREATE TABLE IF NOT EXISTS referrals (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), code TEXT UNIQUE NOT NULL, writer_id UUID UNIQUE REFERENCES writers(id) ON DELETE CASCADE, uses INT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`CREATE TABLE IF NOT EXISTS quiz_scores (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), who TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', xp INT NOT NULL DEFAULT 0, day DATE NOT NULL DEFAULT CURRENT_DATE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`CREATE UNIQUE INDEX IF NOT EXISTS quiz_scores_who_uidx ON quiz_scores (who)`;
@@ -285,8 +345,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Verification Migration (lightweight: avoids subrequest limit) ---
       if (url.pathname === '/api/admin/migrate-verification' && request.method === 'POST') {
-        if (!env.DATABASE_URL) return json({ error: 'No DB' }, 503);
-        const sql = neon(env.DATABASE_URL);
+        const sql = getSql(env);
         await sql`ALTER TABLE writers ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT TRUE`;
         await sql`CREATE TABLE IF NOT EXISTS verification_codes (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), email TEXT NOT NULL, code_hash TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT 'writer_signup', attempts INT NOT NULL DEFAULT 0, consumed BOOLEAN NOT NULL DEFAULT FALSE, ip TEXT NOT NULL DEFAULT '', expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         await sql`CREATE INDEX IF NOT EXISTS idx_verification_codes_email ON verification_codes(email)`;
@@ -322,8 +381,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return json({ key, url: `${env.MEDIA_PUBLIC_URL}/${key}` }, 201);
       }
 
-      if (!env.DATABASE_URL) return json({ error: 'Neon DATABASE_URL is not configured' }, 503);
-      const sql = neon(env.DATABASE_URL);
+      const sql = getSql(env);
 
       // ==================== MODERATOR AUTH ====================
       // Login is public; the issued session token is accepted by /api/admin/*.

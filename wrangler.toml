@@ -2,14 +2,15 @@ name = "lekhoni-admin-api"
 main = "worker/index.ts"
 compatibility_date = "2026-08-26"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "lekhoni-db"
+database_id = "c5e6206c-d84a-4c03-980f-cf9880d82f0d"
+
 [[r2_buckets]]
 binding = "MEDIA"
 bucket_name = "lekhoni-media"
 
 [vars]
-# Admin stays on the Access-protected custom domain; moderators use the
-# public Pages URL because Cloudflare Access is not part of the app login.
 ALLOWED_ORIGIN = "https://admin.xyteee.com,https://lekhoni-admin.pages.dev"
-
-# Keep the Neon URL in a Worker secret:
-# wrangler secret put DATABASE_URL
+MEDIA_PUBLIC_URL = "https://pub-55f5f01908bd4e3094ea07f7deaa7978.r2.dev"
