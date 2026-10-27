@@ -1184,6 +1184,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (url.pathname === '/api/admin/moderators' && request.method === 'GET') {
         if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
         await ensureModeratorTables(sql);
+        await sql`DELETE FROM moderators WHERE id IS NULL OR id=''`;
         return json(await sql`SELECT id,username,display_name,is_active,created_at,last_login_at FROM moderators ORDER BY created_at DESC`);
       }
       if (url.pathname === '/api/admin/moderators' && request.method === 'POST') {
@@ -1194,16 +1195,25 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         if (!validatePassword(b.password || '')) return json({ error: 'Password must be 8-128 characters and contain a letter and a number' }, 400);
         const displayName = (b.display_name || '').trim().slice(0, 60) || uname;
         await ensureModeratorTables(sql);
+        await sql`DELETE FROM moderators WHERE username=${uname} AND (id IS NULL OR id='')`;
         const exists = await sql`SELECT id FROM moderators WHERE username=${uname} LIMIT 1`;
         if (exists.length) return json({ error: 'Username already exists' }, 409);
         const { hash, salt } = await moderatorHashPassword(b.password as string);
-        const r = await sql`INSERT INTO moderators (username,display_name,password_hash,salt,is_active) VALUES (${uname},${displayName},${hash},${salt},1) RETURNING id,username,display_name,is_active,created_at,last_login_at`;
-        return json(r[0], 201);
+        const modId = crypto.randomUUID();
+        await sql`INSERT INTO moderators (id,username,display_name,password_hash,salt,is_active) VALUES (${modId},${uname},${displayName},${hash},${salt},1)`;
+        return json({
+          id: modId,
+          username: uname,
+          display_name: displayName,
+          is_active: 1,
+          created_at: new Date().toISOString(),
+          last_login_at: null,
+        }, 201);
       }
       const moderatorMatch = url.pathname.match(/^\/api\/admin\/moderators\/([^/]+)$/);
       if (moderatorMatch && request.method === 'PATCH') {
         if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
-        if (!uuid(moderatorMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        if (!moderatorMatch[1] || moderatorMatch[1].length < 5) return json({ error: 'Invalid ID' }, 400);
         const b = await request.json().catch(() => ({})) as { display_name?: string; is_active?: boolean; password?: string };
         await ensureModeratorTables(sql);
         const existing = await sql`SELECT id FROM moderators WHERE id=${moderatorMatch[1]} LIMIT 1`;
@@ -1228,7 +1238,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
       if (moderatorMatch && request.method === 'DELETE') {
         if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
-        if (!uuid(moderatorMatch[1])) return json({ error: 'Invalid ID' }, 400);
+        if (!moderatorMatch[1] || moderatorMatch[1].length < 5) return json({ error: 'Invalid ID' }, 400);
         await ensureModeratorTables(sql);
         await sql`DELETE FROM moderators WHERE id=${moderatorMatch[1]}`;
         return json({ ok: true });
