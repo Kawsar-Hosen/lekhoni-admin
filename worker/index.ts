@@ -1222,24 +1222,51 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const r = await sql`SELECT id,username,writer_name,approval_required,is_active,badge FROM writers WHERE id=${adminWriterMatch[1]}`;
         return json(r[0] || { error: 'Not found' }, r.length ? 200 : 404);
       }
-      // --- Admin: Delete Writer (cascade) ---
-      const adminWriterDeleteMatch = url.pathname.match(/^\/api\/admin\/writers\/([^/]+)$/);
+      // --- Admin: Delete Writer (cascade: stories, chapters, books, comments, follows, notifs) ---
+      const adminWriterDeleteMatch = url.pathname.match(/^\/api\/admin\/(?:writers|writer-users)\/([^/]+)$/);
       if (adminWriterDeleteMatch && request.method === 'DELETE') {
         const wid = adminWriterDeleteMatch[1];
         if (!uuid(wid)) return json({ error: 'Invalid ID' }, 400);
-        const storyIds = (await sql`SELECT id FROM stories WHERE writer_id=${wid}`).map((r: any) => r.id);
+        
+        // 1. Get writer info
+        const wRows = await sql`SELECT writer_name, username FROM writers WHERE id=${wid}`;
+        const writerName = wRows.length ? wRows[0].writer_name : '';
+
+        // 2. Collect all story IDs
+        const storyRows = await sql`SELECT id, title FROM stories WHERE writer_id=${wid}`;
+        const storyIds = storyRows.map((r: any) => r.id);
+        const storyTitles = storyRows.map((r: any) => r.title);
+
         if (storyIds.length > 0) {
-          try { await sql`DELETE FROM comments WHERE book_id = ANY(${storyIds})`; } catch(e) {}
-          try { await sql`DELETE FROM story_reports WHERE book_id = ANY(${storyIds})`; } catch(e) {}
-          try { await sql`DELETE FROM likes WHERE book_id = ANY(${storyIds})`; } catch(e) {}
-          try { await sql`DELETE FROM bookmarks WHERE book_id = ANY(${storyIds})`; } catch(e) {}
-          try { await sql`DELETE FROM chapters WHERE book_id = ANY(${storyIds})`; } catch(e) {}
+          try { await sql`DELETE FROM comments WHERE book_id IN (SELECT id FROM stories WHERE writer_id=${wid})`; } catch(e) {}
+          try { await sql`DELETE FROM story_reports WHERE book_id IN (SELECT id FROM stories WHERE writer_id=${wid})`; } catch(e) {}
+          try { await sql`DELETE FROM likes WHERE book_id IN (SELECT id FROM stories WHERE writer_id=${wid})`; } catch(e) {}
+          try { await sql`DELETE FROM bookmarks WHERE book_id IN (SELECT id FROM stories WHERE writer_id=${wid})`; } catch(e) {}
+          try { await sql`DELETE FROM story_chapters WHERE story_id IN (SELECT id FROM stories WHERE writer_id=${wid})`; } catch(e) {}
         }
+
+        // 3. Delete any published books by this writer or matching titles
+        if (writerName) {
+          try { await sql`DELETE FROM chapters WHERE book_id IN (SELECT id FROM books WHERE author=${writerName})`; } catch(e) {}
+          try { await sql`DELETE FROM comments WHERE book_id IN (SELECT id FROM books WHERE author=${writerName})`; } catch(e) {}
+          try { await sql`DELETE FROM story_reports WHERE book_id IN (SELECT id FROM books WHERE author=${writerName})`; } catch(e) {}
+          try { await sql`DELETE FROM books WHERE author=${writerName}`; } catch(e) {}
+        }
+        for (const stTitle of storyTitles) {
+          try { await sql`DELETE FROM chapters WHERE book_id IN (SELECT id FROM books WHERE title=${stTitle})`; } catch(e) {}
+          try { await sql`DELETE FROM books WHERE title=${stTitle}`; } catch(e) {}
+        }
+
+        // 4. Delete stories, activities, notifications, follows, referrals
         try { await sql`DELETE FROM stories WHERE writer_id=${wid}`; } catch(e) {}
         try { await sql`DELETE FROM writer_notifications WHERE writer_id=${wid}`; } catch(e) {}
+        try { await sql`DELETE FROM writer_activities WHERE writer_id=${wid}`; } catch(e) {}
         try { await sql`DELETE FROM follows WHERE writer_id=${wid}`; } catch(e) {}
+        try { await sql`DELETE FROM referrals WHERE writer_id=${wid}`; } catch(e) {}
+
+        // 5. Delete writer account
         await sql`DELETE FROM writers WHERE id=${wid}`;
-        return json({ ok: true, message: 'Writer and all related data deleted' });
+        return json({ ok: true, message: 'Writer and all related data permanently deleted' });
       }
       // --- Admin: Delete User (cascade) ---
       const adminUserDeleteMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)$/);
