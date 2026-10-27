@@ -392,7 +392,6 @@ async function sendFcmNotification(
             channel_id: 'lekhoni_notifications_channel',
             sound: 'default',
             icon: 'ic_launcher',
-            click_action: 'FLUTTER_NOTIFICATION_CLICK',
             ...(dataPayload.imageUrl || dataPayload.storyCover ? { image: dataPayload.imageUrl || dataPayload.storyCover } : {}),
           },
         },
