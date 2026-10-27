@@ -220,29 +220,24 @@ async function resolveAuth(request: Request, env: Env, sql: any): Promise<AdminA
   };
 }
 
-// Server-side allowlist: moderators can only do the shared moderation tasks.
+// Server-side allowlist: moderators can only do permitted moderation tasks.
+// Strictly disallowed for moderators: deleting books, deleting writers, category control, push notifications, settings, and moderator management.
 function moderatorAllowed(method: string, pathname: string): boolean {
   if (pathname === '/api/admin/analytics' && method === 'GET') return true;
   if (pathname === '/api/admin/realtime-analytics' && method === 'GET') return true;
-  if (pathname === '/api/admin/notifications' && (method === 'GET' || method === 'POST' || method === 'DELETE')) return true;
-  if (/^\/api\/admin\/notifications\/[^/]+$/.test(pathname) && method === 'DELETE') return true;
   if (pathname === '/api/admin/writers' && method === 'GET') return true;
-  if (pathname === '/api/admin/writer-notifications/send' && method === 'POST') return true;
-  if (pathname === '/api/admin/books' && (method === 'GET' || method === 'POST')) return true;
-  if (/^\/api\/admin\/books\/[^/]+$/.test(pathname) && (method === 'GET' || method === 'PUT' || method === 'DELETE')) return true;
-  if (/^\/api\/admin\/books\/[^/]+\/chapters$/.test(pathname) && (method === 'GET' || method === 'POST')) return true;
   if (pathname === '/api/admin/writer-users' && method === 'GET') return true;
   if (/^\/api\/admin\/writer-users\/[^/]+$/.test(pathname) && (method === 'GET' || method === 'PATCH' || method === 'PUT')) return true;
-  if (/^\/api\/admin\/writers\/[^/]+/.test(pathname)) return true;
-  // Reports: review, warn, dismiss, or delete reported content.
+  // Books & Chapters: Read & Edit only (NO DELETE for books!)
+  if (pathname === '/api/admin/books' && (method === 'GET' || method === 'POST')) return true;
+  if (/^\/api\/admin\/books\/[^/]+$/.test(pathname) && (method === 'GET' || method === 'PUT')) return true;
+  if (/^\/api\/admin\/books\/[^/]+\/chapters$/.test(pathname) && (method === 'GET' || method === 'POST')) return true;
+  if (pathname === '/api/admin/chapters' && (method === 'GET' || method === 'POST')) return true;
+  if (/^\/api\/admin\/chapters\/[^/]+$/.test(pathname) && (method === 'PUT' || method === 'DELETE')) return true;
+  // Reports: review, warn, dismiss, or resolve reported content
   if (pathname === '/api/admin/reports' && method === 'GET') return true;
   if (pathname === '/api/admin/reports/count' && method === 'GET') return true;
   if (/^\/api\/admin\/reports\/[^/]+$/.test(pathname) && (method === 'POST' || method === 'PUT' || method === 'PATCH')) return true;
-  // Categories and chapters: full content-management access.
-  if (pathname === '/api/admin/categories' && (method === 'GET' || method === 'POST')) return true;
-  if (/^\/api\/admin\/categories\/[^/]+$/.test(pathname) && (method === 'PUT' || method === 'DELETE')) return true;
-  if (pathname === '/api/admin/chapters' && (method === 'GET' || method === 'POST')) return true;
-  if (/^\/api\/admin\/chapters\/[^/]+$/.test(pathname) && (method === 'PUT' || method === 'DELETE')) return true;
   // Stories approval / reject
   if (pathname === '/api/admin/stories' && method === 'GET') return true;
   if (/^\/api\/admin\/stories\/[^/]+/.test(pathname)) return true;
