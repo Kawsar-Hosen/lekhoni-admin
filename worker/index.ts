@@ -201,7 +201,33 @@ async function ensureModeratorTables(sql: any): Promise<void> {
   await sql`CREATE TABLE IF NOT EXISTS moderators (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL DEFAULT '', password_hash TEXT NOT NULL, salt TEXT NOT NULL, is_active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_login_at TIMESTAMPTZ)`;
   await sql`CREATE TABLE IF NOT EXISTS moderator_sessions (token_hash TEXT PRIMARY KEY, moderator_id UUID NOT NULL REFERENCES moderators(id) ON DELETE CASCADE, expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
   await sql`CREATE INDEX IF NOT EXISTS idx_moderator_sessions_moderator ON moderator_sessions(moderator_id)`;
+  await sql`CREATE TABLE IF NOT EXISTS moderator_login_logs (id TEXT PRIMARY KEY, moderator_id TEXT NOT NULL, ip TEXT, city TEXT, country TEXT, isp TEXT, user_agent TEXT, device TEXT, logged_in_at TEXT NOT NULL DEFAULT (datetime('now')))`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_mod_logs_moderator ON moderator_login_logs(moderator_id)`;
+  try { await sql`ALTER TABLE moderators ADD COLUMN last_login_ip TEXT`; } catch (_) {}
+  try { await sql`ALTER TABLE moderators ADD COLUMN last_login_device TEXT`; } catch (_) {}
+  try { await sql`ALTER TABLE moderators ADD COLUMN last_login_network TEXT`; } catch (_) {}
   moderatorTablesReady = true;
+}
+
+function parseDeviceInfo(ua: string): string {
+  if (!ua) return 'অজানা ডিভাইস';
+  let os = 'অন্যান্য';
+  if (/android/i.test(ua)) os = 'Android';
+  else if (/iphone/i.test(ua)) os = 'iPhone';
+  else if (/ipad/i.test(ua)) os = 'iPad';
+  else if (/windows nt 10/i.test(ua)) os = 'Windows 10/11';
+  else if (/windows/i.test(ua)) os = 'Windows';
+  else if (/mac os x/i.test(ua)) os = 'macOS';
+  else if (/linux/i.test(ua)) os = 'Linux';
+
+  let browser = 'Browser';
+  if (/edg/i.test(ua)) browser = 'Edge';
+  else if (/chrome|crios/i.test(ua)) browser = 'Chrome';
+  else if (/firefox|fxios/i.test(ua)) browser = 'Firefox';
+  else if (/safari/i.test(ua)) browser = 'Safari';
+  else if (/opera|opr/i.test(ua)) browser = 'Opera';
+
+  return `${os} (${browser})`;
 }
 
 async function resolveAuth(request: Request, env: Env, sql: any): Promise<AdminAuth | null> {
@@ -684,7 +710,22 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const token = randomHex(32);
         const tokenHash = await sha256Hex(token);
         await sql`INSERT INTO moderator_sessions (token_hash,moderator_id,expires_at) VALUES (${tokenHash},${rows[0].id},datetime('now', '+7 days'))`;
-        await sql`UPDATE moderators SET last_login_at=datetime('now') WHERE id=${rows[0].id}`;
+
+        const cf = (request as any).cf || {};
+        const ip = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || '';
+        const city = cf.city || '';
+        const country = cf.country || '';
+        const isp = cf.asOrganization || '';
+        const ua = request.headers.get('user-agent') || '';
+        const device = parseDeviceInfo(ua);
+        const logId = crypto.randomUUID();
+
+        try {
+          await sql`INSERT INTO moderator_login_logs (id, moderator_id, ip, city, country, isp, user_agent, device, logged_in_at) VALUES (${logId}, ${rows[0].id}, ${ip}, ${city}, ${country}, ${isp}, ${ua}, ${device}, datetime('now'))`;
+        } catch (_) {}
+
+        await sql`UPDATE moderators SET last_login_at=datetime('now'), last_login_ip=${ip}, last_login_device=${device}, last_login_network=${isp} WHERE id=${rows[0].id}`;
+
         return json({
           token,
           user: { id: rows[0].id, username: rows[0].username, displayName: rows[0].display_name || rows[0].username, role: 'moderator' },
@@ -1180,7 +1221,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
         await ensureModeratorTables(sql);
         await sql`DELETE FROM moderators WHERE id IS NULL OR id=''`;
-        return json(await sql`SELECT id,username,display_name,is_active,created_at,last_login_at FROM moderators ORDER BY created_at DESC`);
+        return json(await sql`SELECT id,username,display_name,is_active,created_at,last_login_at,last_login_ip,last_login_device,last_login_network FROM moderators ORDER BY created_at DESC`);
+      }
+      const modLogsMatch = url.pathname.match(/^\/api\/admin\/moderators\/([^/]+)\/logs$/);
+      if (modLogsMatch && request.method === 'GET') {
+        if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
+        await ensureModeratorTables(sql);
+        const logs = await sql`SELECT id, ip, city, country, isp, user_agent, device, logged_in_at FROM moderator_login_logs WHERE moderator_id=${modLogsMatch[1]} ORDER BY logged_in_at DESC LIMIT 100`;
+        return json(logs);
       }
       if (url.pathname === '/api/admin/moderators' && request.method === 'POST') {
         if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
@@ -1203,6 +1251,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           is_active: 1,
           created_at: new Date().toISOString(),
           last_login_at: null,
+          last_login_ip: null,
+          last_login_device: null,
+          last_login_network: null,
         }, 201);
       }
       const moderatorMatch = url.pathname.match(/^\/api\/admin\/moderators\/([^/]+)$/);
@@ -1228,13 +1279,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           await sql`UPDATE moderators SET password_hash=${hash},salt=${salt} WHERE id=${moderatorMatch[1]}`;
           await sql`DELETE FROM moderator_sessions WHERE moderator_id=${moderatorMatch[1]}`;
         }
-        const r = await sql`SELECT id,username,display_name,is_active,created_at,last_login_at FROM moderators WHERE id=${moderatorMatch[1]}`;
+        const r = await sql`SELECT id,username,display_name,is_active,created_at,last_login_at,last_login_ip,last_login_device,last_login_network FROM moderators WHERE id=${moderatorMatch[1]}`;
         return json(r[0]);
       }
       if (moderatorMatch && request.method === 'DELETE') {
         if (auth?.role !== 'admin') return json({ error: 'Admin only' }, 403);
         if (!moderatorMatch[1] || moderatorMatch[1].length < 5) return json({ error: 'Invalid ID' }, 400);
         await ensureModeratorTables(sql);
+        await sql`DELETE FROM moderator_login_logs WHERE moderator_id=${moderatorMatch[1]}`;
         await sql`DELETE FROM moderators WHERE id=${moderatorMatch[1]}`;
         return json({ ok: true });
       }
