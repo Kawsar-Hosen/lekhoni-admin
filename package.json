@@ -5,24 +5,9 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build-web.cjs",
-    "sync:flutter": "node scripts/sync-flutter.cjs",
-    "dev": "vite",
-    "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@neondatabase/serverless": "latest",
-    "@vitejs/plugin-react": "latest",
-    "lucide-react": "latest",
-    "pg": "^8.23.0",
-    "react": "latest",
-    "react-dom": "latest",
-    "typescript": "latest",
-    "vite": "latest"
+    "sync:flutter": "node scripts/sync-flutter.cjs"
   },
   "devDependencies": {
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
     "wrangler": "^4.127.0"
   }
 }
