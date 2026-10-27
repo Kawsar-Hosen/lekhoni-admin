@@ -210,7 +210,7 @@ async function resolveAuth(request: Request, env: Env, sql: any): Promise<AdminA
   if (!token) return null;
   await ensureModeratorTables(sql);
   const tokenHash = await sha256Hex(token);
-  const rows = await sql`SELECT m.id,m.username,m.display_name FROM moderator_sessions s JOIN moderators m ON m.id=s.moderator_id WHERE s.token_hash=${tokenHash} AND s.expires_at > NOW() AND m.is_active=true LIMIT 1`;
+  const rows = await sql`SELECT m.id,m.username,m.display_name FROM moderator_sessions s JOIN moderators m ON m.id=s.moderator_id WHERE s.token_hash=${tokenHash} AND s.expires_at > datetime('now') AND (m.is_active=1 OR m.is_active=true) LIMIT 1`;
   if (!rows.length) return null;
   return {
     role: 'moderator',
@@ -223,12 +223,14 @@ async function resolveAuth(request: Request, env: Env, sql: any): Promise<AdminA
 // Server-side allowlist: moderators can only do the shared moderation tasks.
 function moderatorAllowed(method: string, pathname: string): boolean {
   if (pathname === '/api/admin/analytics' && method === 'GET') return true;
+  if (pathname === '/api/admin/realtime-analytics' && method === 'GET') return true;
   if (pathname === '/api/admin/notifications' && (method === 'GET' || method === 'POST' || method === 'DELETE')) return true;
   if (/^\/api\/admin\/notifications\/[^/]+$/.test(pathname) && method === 'DELETE') return true;
   if (pathname === '/api/admin/writers' && method === 'GET') return true;
   if (pathname === '/api/admin/writer-notifications/send' && method === 'POST') return true;
-  if (pathname === '/api/admin/books' && method === 'GET') return true;
+  if (pathname === '/api/admin/books' && (method === 'GET' || method === 'POST')) return true;
   if (/^\/api\/admin\/books\/[^/]+$/.test(pathname) && (method === 'GET' || method === 'PUT' || method === 'DELETE')) return true;
+  if (/^\/api\/admin\/books\/[^/]+\/chapters$/.test(pathname) && (method === 'GET' || method === 'POST')) return true;
   if (pathname === '/api/admin/writer-users' && method === 'GET') return true;
   if (/^\/api\/admin\/writer-users\/[^/]+$/.test(pathname) && (method === 'GET' || method === 'PATCH' || method === 'PUT')) return true;
   if (/^\/api\/admin\/writers\/[^/]+/.test(pathname)) return true;
@@ -679,15 +681,15 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const password = b.password || '';
         if (!uname || !password) return json({ error: 'Username and password required' }, 400, env.ALLOWED_ORIGIN);
         await ensureModeratorTables(sql);
-        await sql`DELETE FROM moderator_sessions WHERE expires_at < NOW()`;
+        await sql`DELETE FROM moderator_sessions WHERE expires_at < datetime('now')`;
         const rows = await sql`SELECT id,username,display_name,password_hash,salt,is_active FROM moderators WHERE username=${uname} LIMIT 1`;
-        if (!rows.length || rows[0].is_active !== true) return json({ error: 'Invalid username or password' }, 401, env.ALLOWED_ORIGIN);
+        if (!rows.length || !Boolean(rows[0].is_active)) return json({ error: 'Invalid username or password' }, 401, env.ALLOWED_ORIGIN);
         const ok = await moderatorPasswordMatches(password, rows[0].password_hash as string, rows[0].salt as string);
         if (!ok) return json({ error: 'Invalid username or password' }, 401, env.ALLOWED_ORIGIN);
         const token = randomHex(32);
         const tokenHash = await sha256Hex(token);
-        await sql`INSERT INTO moderator_sessions (token_hash,moderator_id,expires_at) VALUES (${tokenHash},${rows[0].id},NOW()+INTERVAL '7 days')`;
-        await sql`UPDATE moderators SET last_login_at=NOW() WHERE id=${rows[0].id}`;
+        await sql`INSERT INTO moderator_sessions (token_hash,moderator_id,expires_at) VALUES (${tokenHash},${rows[0].id},datetime('now', '+7 days'))`;
+        await sql`UPDATE moderators SET last_login_at=datetime('now') WHERE id=${rows[0].id}`;
         return json({
           token,
           user: { id: rows[0].id, username: rows[0].username, displayName: rows[0].display_name || rows[0].username, role: 'moderator' },
@@ -1195,7 +1197,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const exists = await sql`SELECT id FROM moderators WHERE username=${uname} LIMIT 1`;
         if (exists.length) return json({ error: 'Username already exists' }, 409);
         const { hash, salt } = await moderatorHashPassword(b.password as string);
-        const r = await sql`INSERT INTO moderators (username,display_name,password_hash,salt,is_active) VALUES (${uname},${displayName},${hash},${salt},true) RETURNING id,username,display_name,is_active,created_at,last_login_at`;
+        const r = await sql`INSERT INTO moderators (username,display_name,password_hash,salt,is_active) VALUES (${uname},${displayName},${hash},${salt},1) RETURNING id,username,display_name,is_active,created_at,last_login_at`;
         return json(r[0], 201);
       }
       const moderatorMatch = url.pathname.match(/^\/api\/admin\/moderators\/([^/]+)$/);
@@ -1212,7 +1214,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           await sql`UPDATE moderators SET display_name=${dn} WHERE id=${moderatorMatch[1]}`;
         }
         if (typeof b.is_active === 'boolean') {
-          await sql`UPDATE moderators SET is_active=${b.is_active} WHERE id=${moderatorMatch[1]}`;
+          await sql`UPDATE moderators SET is_active=${b.is_active ? 1 : 0} WHERE id=${moderatorMatch[1]}`;
           if (!b.is_active) await sql`DELETE FROM moderator_sessions WHERE moderator_id=${moderatorMatch[1]}`;
         }
         if (b.password !== undefined) {
