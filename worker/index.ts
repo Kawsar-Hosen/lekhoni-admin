@@ -669,6 +669,44 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return json({ ok: true });
       }
 
+      // --- Book Chapters Sub-route (/api/admin/books/:id/chapters) ---
+      const adminBookChsMatch = url.pathname.match(/^\/api\/admin\/books\/([^/]+)\/chapters$/);
+      if (adminBookChsMatch && request.method === 'GET') {
+        const bid = adminBookChsMatch[1];
+        if (!uuid(bid)) return json({ error: 'Invalid ID' }, 400);
+        let chs = await sql`SELECT id,book_id,title,body,position,status,views,created_at,reward_ad FROM chapters WHERE book_id=${bid} ORDER BY position ASC, created_at ASC`;
+        if (!chs.length) {
+          // Fallback: check if chapters exist in story_chapters for corresponding story
+          const bk = await sql`SELECT title, author FROM books WHERE id=${bid} LIMIT 1`;
+          if (bk.length) {
+            const st = await sql`SELECT id FROM stories WHERE title=${bk[0].title} LIMIT 1`;
+            if (st.length) {
+              const storyChs = await sql`SELECT id,title,body,position,minutes,created_at FROM story_chapters WHERE story_id=${st[0].id} ORDER BY position ASC, created_at ASC`;
+              if (storyChs.length) {
+                for (const sc of storyChs) {
+                  const newChId = crypto.randomUUID();
+                  try {
+                    await sql`INSERT INTO chapters (id,book_id,title,body,position,minutes,status,reward_ad) VALUES (${newChId},${bid},${sc.title},${sc.body||''},${sc.position||0},${sc.minutes||5},'published',0)`;
+                  } catch (_) {}
+                }
+                chs = await sql`SELECT id,book_id,title,body,position,status,views,created_at,reward_ad FROM chapters WHERE book_id=${bid} ORDER BY position ASC, created_at ASC`;
+              }
+            }
+          }
+        }
+        return json(chs);
+      }
+      if (adminBookChsMatch && request.method === 'POST') {
+        const bid = adminBookChsMatch[1];
+        if (!uuid(bid)) return json({ error: 'Invalid ID' }, 400);
+        const b = await request.json() as Record<string, unknown>;
+        if (!b.title) return json({ error: 'title required' }, 400);
+        const newChId = crypto.randomUUID();
+        const rw = b.reward_ad != null ? (b.reward_ad ? 1 : 0) : 0;
+        const r = await sql`INSERT INTO chapters (id,book_id,title,body,position,minutes,status,reward_ad) VALUES (${newChId},${bid},${b.title as string},${b.body||''},${b.position||0},${b.minutes||5},${b.status||'published'},${rw}) RETURNING id,book_id,title,body,position,status,reward_ad,created_at`;
+        return json(r[0] || { id: newChId, book_id: bid, title: b.title }, 201);
+      }
+
       // --- Chapters CRUD ---
       if (url.pathname === '/api/admin/chapters' && request.method === 'GET')
         return json(await sql`SELECT ch.id,ch.book_id,ch.title,ch.position,ch.status,ch.views,ch.created_at,ch.reward_ad,b.title AS book_title FROM chapters ch LEFT JOIN books b ON ch.book_id=b.id ORDER BY b.title,ch.position`);
@@ -677,7 +715,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         if (!b.book_id || !b.title) return json({ error: 'book_id and title required' }, 400);
         if (!uuid(b.book_id as string)) return json({ error: 'Invalid book_id' }, 400);
         const newChId = crypto.randomUUID();
-        const r = await sql`INSERT INTO chapters (id,book_id,title,body,position,status,reward_ad) VALUES (${newChId},${b.book_id as string},${b.title as string},${b.body||''},${b.position||0},${b.status||'draft'},${Boolean(b.reward_ad)}) RETURNING id,book_id,title,position,status,reward_ad,created_at`;
+        const rw = b.reward_ad != null ? (b.reward_ad ? 1 : 0) : 0;
+        const r = await sql`INSERT INTO chapters (id,book_id,title,body,position,status,reward_ad) VALUES (${newChId},${b.book_id as string},${b.title as string},${b.body||''},${b.position||0},${b.status||'published'},${rw}) RETURNING id,book_id,title,body,position,status,reward_ad,created_at`;
         return json(r[0] || { id: newChId, book_id: b.book_id, title: b.title }, 201);
       }
       const chMatch = url.pathname.match(/^\/api\/admin\/chapters\/([^/]+)$/);
