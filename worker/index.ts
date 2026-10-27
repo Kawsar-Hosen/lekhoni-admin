@@ -1820,27 +1820,206 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return json({ ok: true });
       }
 
-      // --- Send Expo Push Notifications ---
-      async function sendExpoPushNotifications(pushTokens: string[], title: string, body: string, data: Record<string, string> = {}): Promise<void> {
-        if (!pushTokens.length) return;
-        const messages = pushTokens.filter(t => t && t.startsWith('ExponentPushToken')).map(token => ({
-          to: token,
-          sound: 'default',
-          title,
-          body,
-          data,
-          channelId: 'default',
-        }));
-        if (!messages.length) return;
-        // Send in batches of 100
-        for (let i = 0; i < messages.length; i += 100) {
-          try {
-            await fetch('https://exp.host/--/api/v2/push/send', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(messages.slice(i, i + 100)),
-            });
-          } catch (e) { console.error('Expo push send error', e); }
+      // --- Firebase Cloud Messaging (FCM HTTP v1) Push Notifications ---
+      const FIREBASE_CONFIG = {
+        projectId: 'xyteeeapp',
+        clientEmail: 'firebase-adminsdk-fbsvc@xyteeeapp.iam.gserviceaccount.com',
+        privateKey: `-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCYH6NH226Y8/ZX\nrMaxWgr3gRljT49Rq17cPeq5LW7Cvh92TpSK4YRkR4IIkP/ylxAQgPczFLWR97DD\nxwJTFqixhZEOuP8h1cg70N8FN8A/GrV/GtDGhMpK1WVWWS7+6TGu8nL3HU4yQ9G8\nmOJ2kbIGJdALFqUUetjLdDgibnCRmTy9sFL2g+jbQPWPgGOa4556BxFDeN9e9Ac2\nBTJ7Eax6EiPiOnk76DLCd96GWrCfTcw9K348LO8SnHgsQFqr6sHv9X8Nlc0Cy+vn\nF9p0t3YfycAZp/q4JgyYn3l8b5Z4a/ClA1AKKh11tzQu9eCJdDHQCcLEKWQClE2S\nPRSON/WdAgMBAAECggEABlTLbKZFENrBzgMr733YzCrEa1CdyCTKqVNutV90Rz4h\nnJX80tfmdO77SjnQsTXDeSWzmXMQndSHd+p3M2KTdEn5ECS3wkkoZixABUf9Tr22\nP+Xrj6uUqMR/YnaKlm45qgyUp39sfaU6xto9E0672vYlaw9kS6PTlIolJke0PyxR\n///OxSxz30yfRfYCV1qSHFcJTitKNJIyF/pb5Jbx7pc5wxzoQXJrC/hH7K9Hiqvc\nCA2ujx5V3o7TuaRaPR4gkoQZPkcNwaaSt3tDsI7r4PEVw2K2pNfI1cuuJQO6/p1v\nZJPVml2musa7vsaefxDnk9w/7aXFllG8kSgoK7rhYQKBgQDIn+5pPsyybkvTLvQQ\n7u6lsU725DsonpiN0uvIPZxyx9g8dO2BTFet8xFFjs4tyOV1PydV0kau/rEoSEcx\n6PKqANlC9Iesz5Zl6T7u1euvo0Gyo618CDpqGN82Oi0+dGkY+bMIgDpMQQWweR7d\nHKV/fuzaPW63+AgNNAmIndNufQKBgQDCHKI0FakFOLAosmEy9BPulenjRmI+UuI0\nYPvw0ZfvNdYqIHSwkm9tZVIRkTwKJLNXzldBvAKEikTO93Ls0lvCLuKRNKD31KJG\nnDcmwCS/t9wS1DxNADSPTkeX0AZSchxa2u6W+BeOZx761g2Uqljczwlz+YELwAbw\nj7B6L/mtoQKBgCziSu5U1Gre7ivTB1t6eP2sy2PE789InAyusX1c+1FakHAGINSa\nhcsu5CBRsKLhnSQ7+sriflnMNUoz0WnDGfcatYCbQHdTAezO3/uC9HWY6qvSno9v\nL9JouhdhsJmWZaTmyD0QovpIWcN/dX42WHhLpyW0NL8HyJVbnP5pgNHpAoGAFs8w\njDhDXTa1FIMpgshFk1KQYkGCB9rLc+Y1lK28UcKcwOSBccIzT8KJK0FKsdJwNJAt\nlq7WCOcKgNt46LUrTR0fSHrLs3OMAgoXPPl1GAYt2RSRZWbxxiknpoIuS//WryJs\nyNasRfJ+JHGEtQRzXrcBYFxgOpY8+oWX8jOy/iECgYA3b1cNLDJZ2eT/J6OL7HFu\nshwB5Lhxg5w5h1lL3Fg4suDVPBApOJKy/zkEym9hod3x7UlG92svZNbctMGv3eH8\nUFIodvZg8jV1PdkNsHvZ2zTBWok8WMGdCyqYeSxC+AClJh3jd8sqqVHthsqaX9My\n8Z5IEIJwC5wj5i48KrYc+A==\n-----END PRIVATE KEY-----\n`
+      };
+
+      let cachedFcmAccessToken: { token: string; exp: number } | null = null;
+
+      function b64url(buf: ArrayBuffer | Uint8Array): string {
+        const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+        let s = '';
+        for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+        return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      }
+
+      function strToB64url(str: string): string {
+        return b64url(new TextEncoder().encode(str));
+      }
+
+      function pemToBinary(pem: string): Uint8Array {
+        const lines = pem.trim().split('\n').filter(l => !l.startsWith('---'));
+        const b64 = lines.join('').trim();
+        const raw = atob(b64);
+        const arr = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+        return arr;
+      }
+
+      async function getGoogleOAuthAccessToken(): Promise<string | null> {
+        const now = Math.floor(Date.now() / 1000);
+        if (cachedFcmAccessToken && cachedFcmAccessToken.exp > now + 60) {
+          return cachedFcmAccessToken.token;
+        }
+
+        try {
+          const header = { alg: 'RS256', typ: 'JWT' };
+          const claimSet = {
+            iss: FIREBASE_CONFIG.clientEmail,
+            scope: 'https://www.googleapis.com/auth/firebase.messaging',
+            aud: 'https://oauth2.googleapis.com/token',
+            exp: now + 3600,
+            iat: now,
+          };
+
+          const encodedHeader = strToB64url(JSON.stringify(header));
+          const encodedClaims = strToB64url(JSON.stringify(claimSet));
+          const unsignedToken = `${encodedHeader}.${encodedClaims}`;
+
+          const keyData = pemToBinary(FIREBASE_CONFIG.privateKey);
+          const cryptoKey = await crypto.subtle.importKey(
+            'pkcs8',
+            keyData,
+            { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+            false,
+            ['sign']
+          );
+
+          const sig = await crypto.subtle.sign(
+            'RSASSA-PKCS1-v1_5',
+            cryptoKey,
+            new TextEncoder().encode(unsignedToken)
+          );
+
+          const jwt = `${unsignedToken}.${b64url(sig)}`;
+
+          const resp = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+              assertion: jwt,
+            }),
+          });
+
+          if (!resp.ok) {
+            const errText = await resp.text();
+            console.error('OAuth token exchange error:', errText);
+            return null;
+          }
+
+          const data = (await resp.json()) as { access_token: string; expires_in: number };
+          cachedFcmAccessToken = {
+            token: data.access_token,
+            exp: now + (data.expires_in || 3600),
+          };
+          return data.access_token;
+        } catch (e) {
+          console.error('Failed to get Google OAuth token for FCM:', e);
+          return null;
+        }
+      }
+
+      async function sendFcmNotification(
+        token: string,
+        title: string,
+        body: string,
+        dataPayload: Record<string, string>,
+        accessToken: string
+      ): Promise<boolean> {
+        try {
+          const messagePayload: any = {
+            message: {
+              token,
+              notification: {
+                title,
+                body,
+                ...(dataPayload.imageUrl || dataPayload.storyCover ? { image: dataPayload.imageUrl || dataPayload.storyCover } : {}),
+              },
+              data: dataPayload,
+              android: {
+                priority: 'high',
+                notification: {
+                  channel_id: 'lekhoni_notifications_channel',
+                  sound: 'default',
+                  icon: 'ic_launcher',
+                  click_action: 'FLUTTER_NOTIFICATION_CLICK',
+                  ...(dataPayload.imageUrl || dataPayload.storyCover ? { image: dataPayload.imageUrl || dataPayload.storyCover } : {}),
+                },
+              },
+            },
+          };
+
+          const res = await fetch(`https://fcm.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/messages:send`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(messagePayload),
+          });
+
+          return res.ok;
+        } catch (err) {
+          console.error('Single FCM push error:', err);
+          return false;
+        }
+      }
+
+      // --- Universal Push Notifications (Firebase FCM v1 + Legacy Expo Fallback) ---
+      async function sendExpoPushNotifications(
+        pushTokens: string[],
+        title: string,
+        body: string,
+        data: Record<string, string> = {}
+      ): Promise<void> {
+        if (!pushTokens || !pushTokens.length) return;
+
+        // Clean tokens
+        const validTokens = Array.from(new Set(pushTokens.map(t => t?.trim()).filter(Boolean)));
+        if (!validTokens.length) return;
+
+        const expoTokens: string[] = [];
+        const fcmTokens: string[] = [];
+
+        for (const t of validTokens) {
+          if (t.startsWith('ExponentPushToken') || t.startsWith('ExpoPushToken')) {
+            expoTokens.push(t);
+          } else {
+            // standard Firebase FCM token
+            fcmTokens.push(t);
+          }
+        }
+
+        // 1. Send via Firebase FCM v1 HTTP API (Targeting Android Status Bar)
+        if (fcmTokens.length > 0) {
+          const accessToken = await getGoogleOAuthAccessToken();
+          if (accessToken) {
+            // Send in parallel chunks of 15
+            const chunkSize = 15;
+            for (let i = 0; i < fcmTokens.length; i += chunkSize) {
+              const chunk = fcmTokens.slice(i, i + chunkSize);
+              await Promise.allSettled(
+                chunk.map(token => sendFcmNotification(token, title, body, data, accessToken))
+              );
+            }
+          }
+        }
+
+        // 2. Send via Expo (for any legacy tokens)
+        if (expoTokens.length > 0) {
+          const messages = expoTokens.map(token => ({
+            to: token,
+            sound: 'default',
+            title,
+            body,
+            data,
+            channelId: 'lekhoni_notifications_channel',
+          }));
+          for (let i = 0; i < messages.length; i += 100) {
+            try {
+              await fetch('https://exp.host/--/api/v2/push/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(messages.slice(i, i + 100)),
+              });
+            } catch (e) {
+              console.error('Expo push send error', e);
+            }
+          }
         }
       }
 
