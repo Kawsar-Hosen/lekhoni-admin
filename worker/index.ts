@@ -57,6 +57,7 @@ export function createD1Sql(db: D1Database) {
       .replace(/\bILIKE\b/gi, 'LIKE')
       .replace(/\bGREATEST\b/gi, 'MAX')
       .replace(/\bLEAST\b/gi, 'MIN')
+      .replace(/jsonb_array_length\((.*?)\)/gi, 'json_array_length($1)')
       .replace(/::[a-zA-Z0-9_]+/g, '');
 
     const stmt = db.prepare(q).bind(...bindings);
@@ -791,8 +792,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           (SELECT us.settings->>'bio' FROM user_state us WHERE us.device_key=d.device_key) AS user_bio,
           (SELECT us.settings->>'language' FROM user_state us WHERE us.device_key=d.device_key) AS language,
           (SELECT us.updated_at FROM user_state us WHERE us.device_key=d.device_key) AS last_active,
-          (SELECT jsonb_array_length(COALESCE(us.favorites, '[]'::jsonb)) FROM user_state us WHERE us.device_key=d.device_key) AS favorites_count,
-          (SELECT jsonb_array_length(COALESCE(us.bookmarks, '[]'::jsonb)) FROM user_state us WHERE us.device_key=d.device_key) AS bookmarks_count,
+          (SELECT json_array_length(COALESCE(us.favorites, '[]')) FROM user_state us WHERE us.device_key=d.device_key) AS favorites_count,
+          (SELECT json_array_length(COALESCE(us.bookmarks, '[]')) FROM user_state us WHERE us.device_key=d.device_key) AS bookmarks_count,
           0 AS comments_count
           FROM devices d ORDER BY d.last_seen_at DESC NULLS LAST`;
         return json(users);
@@ -899,13 +900,17 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const nid = crypto.randomUUID();
         const r = await sql`INSERT INTO notifications (id,title,body,icon,url,story_cover,status,created_at) VALUES (${nid},${b.title},${b.body},${b.icon||'bell'},${b.url||''},${b.story_cover||''},'sent',datetime('now')) RETURNING id,title,body,icon,url,story_cover,status,created_at`;
         // Send push notifications to all devices with push tokens
+        let tokensFound = 0;
+        let sentCount = 0;
         try {
           const allTokens = await sql`SELECT push_token FROM devices WHERE push_token != '' AND push_token IS NOT NULL`;
+          tokensFound = allTokens.length;
           if (allTokens.length) {
             await sendExpoPushNotifications(allTokens.map((t: any) => t.push_token), b.title, b.body, { type: 'admin', url: b.url || '', storyCover: b.story_cover || '' });
+            sentCount = allTokens.length;
           }
         } catch (e) { console.error('admin broadcast push error', e); }
-        return json(r[0] || { id: nid, title: b.title, body: b.body, status: 'sent', created_at: new Date().toISOString() }, 201);
+        return json({ ...(r[0] || {}), id: nid, title: b.title, body: b.body, status: 'sent', tokens_found: tokensFound, sent: sentCount, created_at: new Date().toISOString() }, 201);
       }
       const notifMatch = url.pathname.match(/^\/api\/admin\/notifications\/([^/]+)$/);
       if (notifMatch && request.method === 'DELETE') {
