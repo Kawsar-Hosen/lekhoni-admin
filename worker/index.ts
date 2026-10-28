@@ -1732,7 +1732,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             const existingBook = await sql`SELECT id FROM books WHERE title=${st.title} AND author=${st.writer_name} LIMIT 1`;
             if (existingBook.length) {
               bookId = existingBook[0].id;
-              await sql`UPDATE books SET display_status=${st.display_status||''},writer_status=${st.writer_status||''},hide_title_on_cover=${st.hide_title_on_cover?1:0},pdf_url=${st.pdf_url||''},dedication=${st.dedication||''},author_name=${st.author_name||''},visible_on=${st.visible_on||'both'},story_type=${st.story_type||'episodes'} WHERE id=${bookId}`;
+              await sql`UPDATE books SET status='published',display_status=${st.display_status||''},writer_status=${st.writer_status||''},hide_title_on_cover=${st.hide_title_on_cover?1:0},pdf_url=${st.pdf_url||''},dedication=${st.dedication||''},author_name=${st.author_name||''},visible_on=${st.visible_on||'both'},story_type=${st.story_type||'episodes'} WHERE id=${bookId}`;
             } else {
               const __sid3 = await mintShortId(sql);
               const newBookId = crypto.randomUUID();
@@ -1779,8 +1779,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           note = (body.review_note || body.note || '').trim();
         } catch {}
         await sql`UPDATE stories SET status='rejected',review_note=${note},updated_at=datetime('now') WHERE id=${sid}`;
-        const s = await sql`SELECT s.id,s.title,s.writer_id FROM stories s WHERE s.id=${sid}`;
+        const s = await sql`SELECT s.id,s.title,s.writer_id,w.writer_name FROM stories s LEFT JOIN writers w ON s.writer_id=w.id WHERE s.id=${sid}`;
         if (s.length) {
+          try {
+            await sql`UPDATE books SET status='hidden' WHERE title=${s[0].title} AND author=${s[0].writer_name}`;
+          } catch(e) {}
           try {
             await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id) VALUES (${crypto.randomUUID()},${s[0].writer_id},'Story Rejected',${'"' + s[0].title + '" was rejected.' + (note ? ' Reason: ' + note : '')},'rejected',${sid})`;
           } catch(e) {}
