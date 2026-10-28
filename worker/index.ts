@@ -1,3 +1,5 @@
+import { handleChatWebSocket, handleChatApi } from './chat';
+
 export interface Env {
   DATABASE_URL?: string;
   DB?: D1Database;
@@ -511,10 +513,44 @@ async function sendExpoPushNotifications(
   return result;
 }
 
+export async function createJWTWithSecret(payload: Record<string, any>, secret: string): Promise<string> {
+  if (!secret) throw new Error('JWT_SECRET not configured');
+  const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = btoa(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 }));
+  const data = `${header}.${body}`;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+  return `${data}.${btoa(String.fromCharCode(...new Uint8Array(sig)))}`;
+}
+
+export async function verifyJWTWithSecret(token: string, secret: string): Promise<Record<string, any> | null> {
+  if (!secret) return null;
+  try {
+    const [h, b, s] = token.split('.');
+    const data = `${h}.${b}`;
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    const sig = Uint8Array.from(atob(s), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify('HMAC', key, sig, new TextEncoder().encode(data));
+    if (!valid) return null;
+    const payload = JSON.parse(atob(b));
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch { return null; }
+}
+
 async function handleRequest(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const JWT_SECRET = (env as any).JWT_SECRET || '';
+    const createJWT = (payload: Record<string, any>) => createJWTWithSecret(payload, JWT_SECRET);
+    const verifyJWT = (token: string) => verifyJWTWithSecret(token, JWT_SECRET);
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(env.ALLOWED_ORIGIN || '*') });
     if (url.pathname === '/api/health') return json({ ok: true, service: 'lekhoni-admin-api', database: Boolean(env.DATABASE_URL) }, 200, env.ALLOWED_ORIGIN);
+
+    // --- Real-time Writer Chat WebSocket Upgrade ---
+    if (url.pathname === '/api/ws/chat') {
+      const sql = getSql(env);
+      return handleChatWebSocket(request, env, url, sql, verifyJWT);
+    }
 
     try {
       // Admin migrations are always admin-secret only. Other /api/admin/*
@@ -2216,32 +2252,6 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return { hash, salt: s };
       }
 
-      // --- JWT (fail-closed: never fall back to a dev secret) ---
-      const JWT_SECRET = (env as any).JWT_SECRET || '';
-      async function createJWT(payload: Record<string, any>): Promise<string> {
-        if (!JWT_SECRET) throw new Error('JWT_SECRET not configured');
-        const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-        const body = btoa(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 }));
-        const data = `${header}.${body}`;
-        const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-        const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-        return `${data}.${btoa(String.fromCharCode(...new Uint8Array(sig)))}`;
-      }
-      async function verifyJWT(token: string): Promise<Record<string, any> | null> {
-        if (!JWT_SECRET) return null;
-        try {
-          const [h, b, s] = token.split('.');
-          const data = `${h}.${b}`;
-          const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
-          const sig = Uint8Array.from(atob(s), c => c.charCodeAt(0));
-          const valid = await crypto.subtle.verify('HMAC', key, sig, new TextEncoder().encode(data));
-          if (!valid) return null;
-          const payload = JSON.parse(atob(b));
-          if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
-          return payload;
-        } catch { return null; }
-      }
-
       // --- Writer Signup (email verification required) ---
       if (url.pathname === '/api/public/writers/signup' && request.method === 'POST') {
         const b = await request.json() as { username?: string; writer_name?: string; email?: string; password?: string; ref?: string };
@@ -2839,6 +2849,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           writerId = payload.id;
         }
 
+        // --- Writer Messaging & Chat Routes ---
+        if (url.pathname.startsWith('/api/writer/chat')) {
+          const chatRes = await handleChatApi(request, env, url, sql, writerId, sendExpoPushNotifications);
+          if (chatRes) return chatRes;
+        }
+
         // --- Writer Dashboard Stats ---
         if (url.pathname === '/api/writer/stats' && request.method === 'GET') {
           const [storyCount, totalViews, followerCount, recentActivity] = await Promise.all([
@@ -3321,6 +3337,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const response = await handleRequest(request, env);
+    if (response.status === 101) return response; // WebSocket upgrade handshake
     const requestOrigin = request.headers.get('Origin') || '';
     const allowed = (env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
     if (requestOrigin && (allowed.includes('*') || allowed.includes(requestOrigin))) {
