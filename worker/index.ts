@@ -1551,18 +1551,40 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             if (writer.length) targetWriterId = writer[0].id;
           }
           if (targetWriterId) {
-            const msg = `আপনার গল্প "${storyTitle}" নীতিমালা লঙ্ঘনের কারণে মুছে ফেলা হয়েছে। ${body.admin_note||''}`;
-            await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type) VALUES (${crypto.randomUUID()},${targetWriterId},'গল্প অপসারিত',${msg},'removed')`;
+            const msg = `আপনার গল্প "${storyTitle}" নীতিমালা লঙ্ঘনের কারণে সাময়িকভাবে মুছে ফেলা হয়েছে। ${body.admin_note||''}`;
+            await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id) VALUES (${crypto.randomUUID()},${targetWriterId},'গল্প অপসারিত',${msg},'removed',${r.book_id})`;
           }
-          try { await sql`DELETE FROM story_chapters WHERE story_id=${r.book_id}`; } catch(e) {}
-          try { await sql`DELETE FROM stories WHERE id=${r.book_id}`; } catch(e) {}
-          try { await sql`DELETE FROM chapters WHERE book_id=${r.book_id}`; } catch(e) {}
-          try { await sql`DELETE FROM books WHERE id=${r.book_id} OR short_id=${r.book_id}`; } catch(e) {}
+          // Soft-delete: mark books and stories as 'deleted' so they can be restored later from trash!
+          try { await sql`UPDATE books SET status='deleted' WHERE id=${r.book_id} OR short_id=${r.book_id}`; } catch(e) {}
+          try { await sql`UPDATE stories SET status='deleted', review_note=${body.admin_note || 'রিপোর্টের কারণে মুছে ফেলা হয়েছে'} WHERE id=${r.book_id}`; } catch(e) {}
           if (storyTitle) {
-            try { await sql`DELETE FROM chapters WHERE book_id IN (SELECT id FROM books WHERE title=${storyTitle})`; } catch(_) {}
-            try { await sql`DELETE FROM books WHERE title=${storyTitle}`; } catch(_) {}
-            try { await sql`DELETE FROM story_chapters WHERE story_id IN (SELECT id FROM stories WHERE title=${storyTitle})`; } catch(_) {}
-            try { await sql`DELETE FROM stories WHERE title=${storyTitle}`; } catch(_) {}
+            try { await sql`UPDATE books SET status='deleted' WHERE title=${storyTitle}`; } catch(_) {}
+            try { await sql`UPDATE stories SET status='deleted', review_note=${body.admin_note || 'রিপোর্টের কারণে মুছে ফেলা হয়েছে'} WHERE title=${storyTitle}`; } catch(_) {}
+          }
+        } else if (action === 'restore' || action === 'restored') {
+          await sql`UPDATE reports SET status='restored', admin_note=${body.admin_note||'অ্যাডমিন কর্তৃক গল্পটি পুনঃবহাল করা হয়েছে'} WHERE id=${repId}`;
+          const book = await sql`SELECT id,title,author FROM books WHERE (id=${r.book_id} OR short_id=${r.book_id}) LIMIT 1`;
+          const story = await sql`SELECT id,title,writer_id FROM stories s WHERE s.id=${r.book_id} LIMIT 1`;
+          let targetWriterId = '';
+          let storyTitle = '';
+          if (story.length) {
+            targetWriterId = story[0].writer_id;
+            storyTitle = story[0].title;
+          } else if (book.length) {
+            storyTitle = book[0].title;
+            const writer = await sql`SELECT id FROM writers WHERE writer_name=${book[0].author} LIMIT 1`;
+            if (writer.length) targetWriterId = writer[0].id;
+          }
+          // Restore books and stories back to 'published'
+          try { await sql`UPDATE books SET status='published' WHERE id=${r.book_id} OR short_id=${r.book_id}`; } catch(e) {}
+          try { await sql`UPDATE stories SET status='published', review_note='' WHERE id=${r.book_id}`; } catch(e) {}
+          if (storyTitle) {
+            try { await sql`UPDATE books SET status='published' WHERE title=${storyTitle}`; } catch(_) {}
+            try { await sql`UPDATE stories SET status='published', review_note='' WHERE title=${storyTitle}`; } catch(_) {}
+          }
+          if (targetWriterId) {
+            const msg = `আপনার গল্প "${storyTitle}" পুনঃবহাল (Restore) করা হয়েছে এবং পুনরায় প্ল্যাটফর্মে লাইভ করা হয়েছে।`;
+            await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id) VALUES (${crypto.randomUUID()},${targetWriterId},'গল্প পুনঃবহাল',${msg},'approved',${r.book_id})`;
           }
         }
         return json({ ok: true });
