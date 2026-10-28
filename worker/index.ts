@@ -1703,7 +1703,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         return json({ updated_books: r.rowCount, updated_stories: r2.rowCount });
       }
       if (url.pathname === '/api/admin/stories' && request.method === 'GET')
-        return json(await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,s.chapters_count,s.review_note,s.author_name,s.created_at,s.updated_at,w.writer_name,w.username FROM stories s LEFT JOIN writers w ON s.writer_id=w.id ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 ELSE 2 END,s.updated_at DESC`);
+        return json(await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,
+          COALESCE((SELECT COUNT(*)::int FROM story_chapters sc WHERE sc.story_id=s.id), s.chapters_count, 0) AS chapters_count,
+          s.review_note,s.author_name,s.display_status,s.writer_status,s.visible_on,s.story_type,s.hide_title_on_cover,s.pdf_url,s.dedication,
+          s.created_at,s.updated_at,w.writer_name,w.username,w.avatar_url 
+          FROM stories s LEFT JOIN writers w ON s.writer_id=w.id 
+          ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 ELSE 2 END,s.updated_at DESC`);
 
       // --- Admin Approve Story ---
       const adminStoryApproveMatch = url.pathname.match(/^\/api\/admin\/stories\/([^/]+)\/approve$/);
@@ -1784,6 +1789,26 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
 
       const adminStoryMatch = url.pathname.match(/^\/api\/admin\/stories\/([^/]+)$/);
+      if (adminStoryMatch && request.method === 'GET') {
+        const sid = adminStoryMatch[1];
+        if (!uuid(sid)) return json({ error: 'Invalid ID' }, 400);
+        const rows = await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,
+          COALESCE((SELECT COUNT(*)::int FROM story_chapters sc WHERE sc.story_id=s.id), s.chapters_count, 0) AS chapters_count,
+          s.review_note,s.author_name,s.display_status,s.writer_status,s.visible_on,s.story_type,s.hide_title_on_cover,s.pdf_url,s.dedication,
+          s.created_at,s.updated_at,w.writer_name,w.username,w.avatar_url 
+          FROM stories s LEFT JOIN writers w ON s.writer_id=w.id 
+          WHERE s.id=${sid} LIMIT 1`;
+        if (!rows.length) return json({ error: 'Story not found' }, 404);
+        const st = rows[0];
+        let chs = await sql`SELECT id,story_id,title,body,position,minutes,created_at FROM story_chapters WHERE story_id=${sid} ORDER BY position ASC, created_at ASC`;
+        if (!chs.length) {
+          const bk = await sql`SELECT id FROM books WHERE title=${st.title} LIMIT 1`;
+          if (bk.length) {
+            chs = await sql`SELECT id,book_id as story_id,title,body,position,minutes,created_at FROM chapters WHERE book_id=${bk[0].id} ORDER BY position ASC, created_at ASC`;
+          }
+        }
+        return json({ ...st, chapters: chs });
+      }
       if (adminStoryMatch && request.method === 'PUT') {
         if (!uuid(adminStoryMatch[1])) return json({ error: 'Invalid ID' }, 400);
         const b = await request.json() as { status?: string; review_note?: string };
@@ -1834,8 +1859,19 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
       const adminStoryChMatch = url.pathname.match(/^\/api\/admin\/stories\/([^/]+)\/chapters$/);
       if (adminStoryChMatch && request.method === 'GET') {
-        if (!uuid(adminStoryChMatch[1])) return json({ error: 'Invalid ID' }, 400);
-        return json(await sql`SELECT id,story_id,title,body,position,minutes,created_at FROM story_chapters WHERE story_id=${adminStoryChMatch[1]} ORDER BY position`);
+        const sid = adminStoryChMatch[1];
+        if (!uuid(sid)) return json({ error: 'Invalid ID' }, 400);
+        let chs = await sql`SELECT id,story_id,title,body,position,minutes,created_at FROM story_chapters WHERE story_id=${sid} ORDER BY position ASC, created_at ASC`;
+        if (!chs.length) {
+          const st = await sql`SELECT title FROM stories WHERE id=${sid} LIMIT 1`;
+          if (st.length) {
+            const bk = await sql`SELECT id FROM books WHERE title=${st[0].title} LIMIT 1`;
+            if (bk.length) {
+              chs = await sql`SELECT id,book_id as story_id,title,body,position,minutes,created_at FROM chapters WHERE book_id=${bk[0].id} ORDER BY position ASC, created_at ASC`;
+            }
+          }
+        }
+        return json(chs);
       }
 
       // --- Admin: Writer Notifications ---
