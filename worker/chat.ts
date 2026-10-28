@@ -366,7 +366,7 @@ export async function handleChatApi(
       if (cursorRow.length) {
         rows = await sql`
           SELECT m.id, m.conversation_id, m.sender_id, m.reply_to_id, m.message_type,
-                 m.content, m.media_url, m.media_meta, m.status, m.is_deleted, m.deleted_for, m.created_at,
+                 m.content, m.media_url, m.media_meta, m.status, m.is_deleted, m.deleted_for, m.reactions, m.created_at,
                  r.content AS reply_content, r.sender_id AS reply_sender_id,
                  rw.writer_name AS reply_sender_name
           FROM messages m
@@ -382,7 +382,7 @@ export async function handleChatApi(
     } else {
       rows = await sql`
         SELECT m.id, m.conversation_id, m.sender_id, m.reply_to_id, m.message_type,
-               m.content, m.media_url, m.media_meta, m.status, m.is_deleted, m.deleted_for, m.created_at,
+               m.content, m.media_url, m.media_meta, m.status, m.is_deleted, m.deleted_for, m.reactions, m.created_at,
                r.content AS reply_content, r.sender_id AS reply_sender_id,
                rw.writer_name AS reply_sender_name
         FROM messages m
@@ -408,6 +408,10 @@ export async function handleChatApi(
       })
       .map((m: any) => {
         const isDeleted = Boolean(m.is_deleted);
+        let parsedReactions = {};
+        try {
+          parsedReactions = JSON.parse(m.reactions || '{}');
+        } catch (_) {}
         return {
           id: m.id,
           conversation_id: m.conversation_id,
@@ -427,6 +431,7 @@ export async function handleChatApi(
           media_meta: isDeleted ? {} : JSON.parse(m.media_meta || '{}'),
           status: m.status,
           is_deleted: isDeleted,
+          reactions: parsedReactions,
           created_at: m.created_at,
         };
       })
@@ -542,6 +547,7 @@ export async function handleChatApi(
       media_meta: body.media_meta || {},
       status: initialStatus,
       is_deleted: false,
+      reactions: {},
       created_at: now,
     };
 
@@ -566,6 +572,7 @@ export async function handleChatApi(
             conversation_id: convId,
             sender_id: writerId,
             sender_name: senderName,
+            sender_avatar: senderRow[0]?.avatar_url || '',
           });
         }
       } catch (pushErr) {
@@ -669,6 +676,68 @@ export async function handleChatApi(
     }
 
     return json({ ok: true });
+  }
+
+  // ── G2. React to Message (6 quick reacts + custom emoji) ─────────────────
+  const reactMatch = path.match(/^\/api\/writer\/chat\/messages\/([^/]+)\/react$/);
+  if (reactMatch && request.method === 'POST') {
+    const msgId = reactMatch[1];
+    const body = (await request.json().catch(() => ({}))) as { emoji?: string };
+    const emoji = (body.emoji || '').trim();
+    if (!emoji) return json({ error: 'Emoji is required' }, 400);
+
+    const msgRow = await sql`SELECT id, conversation_id, reactions FROM messages WHERE id=${msgId} LIMIT 1`;
+    if (!msgRow.length) return json({ error: 'Message not found' }, 404);
+
+    const msg = msgRow[0];
+    const convId = msg.conversation_id;
+
+    // Verify membership
+    const member = await sql`SELECT 1 FROM conversation_members WHERE conversation_id=${convId} AND writer_id=${writerId} LIMIT 1`;
+    if (!member.length) return json({ error: 'Forbidden' }, 403);
+
+    let reactions: Record<string, string[]> = {};
+    try {
+      reactions = JSON.parse(msg.reactions || '{}');
+    } catch (_) {
+      reactions = {};
+    }
+
+    // Toggle logic: If user already reacted with this emoji, remove it.
+    // If user clicked this emoji again, it removes. If another emoji, it switches or adds.
+    let alreadyHadThis = false;
+    for (const key of Object.keys(reactions)) {
+      if (key === emoji && reactions[key].includes(writerId)) {
+        alreadyHadThis = true;
+      }
+      reactions[key] = reactions[key].filter(id => id !== writerId);
+      if (reactions[key].length === 0) {
+        delete reactions[key];
+      }
+    }
+
+    if (!alreadyHadThis) {
+      if (!reactions[emoji]) reactions[emoji] = [];
+      reactions[emoji].push(writerId);
+    }
+
+    const updatedReactionsJson = JSON.stringify(reactions);
+    await sql`UPDATE messages SET reactions = ${updatedReactionsJson}, updated_at = datetime('now') WHERE id = ${msgId}`;
+
+    // Broadcast reaction event to conversation members
+    const members = await sql`SELECT writer_id FROM conversation_members WHERE conversation_id=${convId}`;
+    for (const m of members) {
+      broadcastToWriter(m.writer_id, {
+        type: 'message_reaction',
+        conversation_id: convId,
+        message_id: msgId,
+        emoji,
+        reactions,
+        user_id: writerId,
+      });
+    }
+
+    return json({ ok: true, reactions });
   }
 
   // ── H. Media Attachment Upload (R2 Storage) ─────────────────────────────
