@@ -75,8 +75,22 @@ function getSql(env: Env) {
   throw new Error('Cloudflare D1 database binding "DB" is not configured');
 }
 
-const corsHeaders = (origin: string) => ({ 'content-type': 'application/json', 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type, authorization', 'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS' });
-const json = (data: unknown, status = 200, origin = '*') => new Response(JSON.stringify(data), { status, headers: corsHeaders(origin) });
+const corsHeaders = (origin: string, cacheTtl = 0) => {
+  const h: Record<string, string> = {
+    'content-type': 'application/json',
+    'access-control-allow-origin': origin,
+    'access-control-allow-headers': 'content-type, authorization',
+    'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+  };
+  if (cacheTtl > 0) {
+    h['cache-control'] = `public, max-age=${cacheTtl}, stale-while-revalidate=${cacheTtl * 2}`;
+  } else {
+    h['cache-control'] = 'no-store, no-cache, must-revalidate';
+  }
+  return h;
+};
+const json = (data: unknown, status = 200, origin = '*', cacheTtl = 0) =>
+  new Response(JSON.stringify(data), { status, headers: corsHeaders(origin, status === 200 ? cacheTtl : 0) });
 
 const TEMP_MAIL_DOMAINS = ['mailinator.com','10minutemail.com','guerrillamail.com','yopmail.com','tempmail.com','throwawaymail.com','fakemail.net','trashmail.com','maildrop.cc','getnada.com','mohmal.com','sharklasers.com'];
 function baseDomain(d: string): string { const p = d.toLowerCase().split('.'); return p.length > 2 ? p.slice(-2).join('.') : d.toLowerCase(); }
@@ -565,6 +579,22 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         // Single-statement backfill: md5(uuid) is unique per book (hex, 8 chars).
         const r = await sql`UPDATE books SET short_id=substring(md5(id::text) from 1 for 8) WHERE short_id IS NULL`;
         return json({ ok: true, backfilled: (r as unknown as { rowCount?: number }).rowCount ?? null });
+      }
+      if (url.pathname === '/api/admin/migrate-indexes' && (request.method === 'POST' || request.method === 'GET')) {
+        const sql = getSql(env);
+        await sql`CREATE INDEX IF NOT EXISTS idx_chapters_book_status ON chapters(book_id, status)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_chapters_status_pos ON chapters(status, position)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_books_status_updated ON books(status, updated_at DESC)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_books_title ON books(title)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_stories_writer_status ON stories(writer_id, status)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_stories_title ON stories(title)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_follows_writer ON follows(writer_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_follows_device ON follows(device_id)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_writer_notifs_writer ON writer_notifications(writer_id, is_read, created_at DESC)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_comments_book_status ON comments(book_id, status)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_view_events_created ON view_events(created_at DESC)`;
+        await sql`CREATE INDEX IF NOT EXISTS idx_view_events_device ON view_events(device_id)`;
+        return json({ ok: true, message: 'Optimization indexes created successfully' });
       }
       if (url.pathname === '/api/admin/migrate' && request.method === 'POST') {
         const sql = getSql(env);
@@ -1434,12 +1464,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       // --- Public: About App ---
       if (url.pathname === '/api/public/about' && request.method === 'GET') {
         const row = await sql`SELECT content FROM about_content WHERE id=1 LIMIT 1`;
-        return json(row[0]?.content || { title: 'Lekhoni Kahini', subtitle: 'বাংলা সাহিত্য ও উপন্যাসের এক অনন্য পাঠভুবন', description: 'এখানে পাবেন নতুন ও জনপ্রিয় লেখকদের অসংখ্য উপন্যাস, ছোটগল্প, কবিতা ও বিভিন্ন সাহিত্যকর্ম। নিজের পছন্দের গল্প খুঁজে পড়ুন, প্রিয় লেখকদের অনুসরণ করুন এবং বাংলা সাহিত্যের গল্পে হারিয়ে যান।', features: ['হাজার হাজার বাংলা গল্প ও উপন্যাস', 'নতুন ও জনপ্রিয় লেখকদের সৃজনশীল সাহিত্য', 'অফলাইনে পড়ার সুবিধা', 'নিজের গল্প লেখা ও প্রকাশের সুযোগ'], version: '1.0.0', developer: 'Kawsar Hosen' });
+        return json(row[0]?.content || { title: 'Lekhoni Kahini', subtitle: 'বাংলা সাহিত্য ও উপন্যাসের এক অনন্য পাঠভুবন', description: 'এখানে পাবেন নতুন ও জনপ্রিয় লেখকদের অসংখ্য উপন্যাস, ছোটগল্প, কবিতা ও বিভিন্ন সাহিত্যকর্ম। নিজের পছন্দের গল্প খুঁজে পড়ুন, প্রিয় লেখকদের অনুসরণ করুন এবং বাংলা সাহিত্যের গল্পে হারিয়ে যান।', features: ['হাজার হাজার বাংলা গল্প ও উপন্যাস', 'নতুন ও জনপ্রিয় লেখকদের সৃজনশীল সাহিত্য', 'অফলাইনে পড়ার সুবিধা', 'নিজের গল্প লেখা ও প্রকাশের সুযোগ'], version: '1.0.0', developer: 'Kawsar Hosen' }, 200, '*', 3600);
       }
       // --- Public: Comments approval setting ---
       if (url.pathname === '/api/public/comments-config' && request.method === 'GET') {
         const row = await sql`SELECT comments_approval FROM home_settings WHERE id=1 LIMIT 1`;
-        return json({ comments_approval: row[0]?.comments_approval !== false });
+        return json({ comments_approval: row[0]?.comments_approval !== false }, 200, '*', 300);
       }
       // --- Admin: About Content ---
       if (url.pathname === '/api/admin/about' && request.method === 'GET') {
@@ -1982,20 +2012,25 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       // scope=all (website) sees everything; default (app) hides website-only items.
       const scopeAll = url.searchParams.get('scope') === 'all';
       if (url.pathname === '/api/public/categories' && request.method === 'GET') {
-        if (scopeAll) return json(await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true ORDER BY position`);
-        return json(await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true AND COALESCE(visible_on,'both')!='website' ORDER BY position`);
+        if (scopeAll) return json(await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true ORDER BY position`, 200, '*', 300);
+        return json(await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true AND COALESCE(visible_on,'both')!='website' ORDER BY position`, 200, '*', 300);
       }
       if (url.pathname === '/api/public/books' && request.method === 'GET') {
-        if (scopeAll) return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`);
-        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website' ORDER BY b.updated_at DESC`);
+        if (scopeAll) return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`, 200, '*', 180);
+        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website' ORDER BY b.updated_at DESC`, 200, '*', 180);
       }
-      if (url.pathname === '/api/public/chapters' && request.method === 'GET')
-        return json(await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE status='published' ORDER BY position`);
+      if (url.pathname === '/api/public/chapters' && request.method === 'GET') {
+        const bookId = url.searchParams.get('book_id');
+        if (bookId) {
+          return json(await sql`SELECT id,book_id,title,position,minutes FROM chapters WHERE book_id=${bookId} AND status='published' ORDER BY position`, 200, '*', 300);
+        }
+        return json(await sql`SELECT id,book_id,title,position,minutes FROM chapters WHERE status='published' ORDER BY position LIMIT 100`, 200, '*', 300);
+      }
       const pubChMatch = url.pathname.match(/^\/api\/public\/chapters\/([^/]+)$/);
       if (pubChMatch && request.method === 'GET') {
         const ch = await sql`SELECT id,book_id,title,body,position,minutes,status,created_at FROM chapters WHERE id=${pubChMatch[1]} LIMIT 1`;
         if (!ch.length) return json({ error: 'Not found' }, 404);
-        return json(ch[0]);
+        return json(ch[0], 200, '*', 300);
       }
 
       // --- Public: Home sections config ---
@@ -2006,7 +2041,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const saved = raw ? (JSON.parse(typeof raw === 'string' ? raw : JSON.stringify(raw)) as { key: string; enabled: boolean; title?: string }[]).filter((s) => s && known.includes(s.key)) : [];
         const seen = new Set(saved.map((s) => s.key));
         for (const k of known) if (!seen.has(k)) { saved.push({ key: k, enabled: true, title: '' }); seen.add(k); }
-        return json(saved.map((s) => ({ key: s.key, enabled: s.enabled !== false, title: s.title || '' })));
+        return json(saved.map((s) => ({ key: s.key, enabled: s.enabled !== false, title: s.title || '' })), 200, '*', 300);
       }
 
       // --- Public: Home section book lists (fixed + category-based) ---
@@ -2049,7 +2084,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const weekMs = 7 * dayMs;
         const weekSeed = Math.floor(Date.now() / weekMs);
         const rotated = writers.map((w: any, i: number) => ({ ...w, _score: ((weekSeed + i * 7919) % writers.length) })).sort((a: any, b: any) => a._score - b._score).slice(0, 12);
-        return json({ viewsVisible: cfgRow?.[0]?.views_visible !== false, sections, writers: rotated.map((w: any) => ({ id: `${w.id}`, username: w.username, writer_name: w.writer_name, bio: w.bio, avatar_url: w.avatar_url, follower_count: w.follower_count, badge: w.badge || 'none' })) });
+        return json({ viewsVisible: cfgRow?.[0]?.views_visible !== false, sections, writers: rotated.map((w: any) => ({ id: `${w.id}`, username: w.username, writer_name: w.writer_name, bio: w.bio, avatar_url: w.avatar_url, follower_count: w.follower_count, badge: w.badge || 'none' })) }, 200, '*', 180);
       }
 
       const pubBookMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)$/);
@@ -2061,7 +2096,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           : await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookId} AND b.status='published' AND COALESCE(b.visible_on,'both')!='website'`;
         if (!rows.length) return json({ error: 'Not found' }, 404);
         const chs = await sql`SELECT id,book_id,title,body,position,minutes FROM chapters WHERE book_id=${bookId} AND status='published' ORDER BY position`;
-        return json({ ...rows[0], chapters: chs });
+        return json({ ...rows[0], chapters: chs }, 200, '*', 180);
       }
 
       if (url.pathname === '/api/public/events' && request.method === 'POST') {
@@ -2238,9 +2273,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (url.pathname === '/api/public/notifications' && request.method === 'GET') {
         const deviceId = url.searchParams.get('device_id') || '';
         if (deviceId) {
-          return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND (device_id='' OR device_id=${deviceId}) ORDER BY created_at DESC LIMIT 30`);
+          return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND (device_id='' OR device_id=${deviceId}) ORDER BY created_at DESC LIMIT 30`, 200, '*', 120);
         }
-        return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND device_id='' ORDER BY created_at DESC LIMIT 20`);
+        return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND device_id='' ORDER BY created_at DESC LIMIT 20`, 200, '*', 120);
       }
 
       // --- PBKDF2 Hashing ---
@@ -2608,7 +2643,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const rows = await sql`SELECT key,value FROM app_config WHERE key IN ('androidVersionCode','androidVersionName','forceUpdate')`;
         const m: Record<string, string> = {};
         for (const r of rows as any[]) m[r.key] = r.value;
-        return json({ androidVersionCode: parseInt(m.androidVersionCode || '0', 10) || 0, androidVersionName: m.androidVersionName || '', force: m.forceUpdate === '1' });
+        return json({ androidVersionCode: parseInt(m.androidVersionCode || '0', 10) || 0, androidVersionName: m.androidVersionName || '', force: m.forceUpdate === '1' }, 200, '*', 300);
       }
       // --- Admin: Get/Set app version ---
       if (url.pathname === '/api/admin/app-version' && request.method === 'GET') {
@@ -2713,14 +2748,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Public Writers List ---
       if (url.pathname === '/api/public/writers' && request.method === 'GET')
-        return json(await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE is_active=true ORDER BY follower_count DESC,created_at DESC`);
+        return json(await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE is_active=true ORDER BY follower_count DESC,created_at DESC`, 200, '*', 300);
 
       const writerPubMatch = url.pathname.match(/^\/api\/public\/writers\/([^/]+)$/);
       if (writerPubMatch && request.method === 'GET') {
         if (!uuid(writerPubMatch[1])) return json({ error: 'Invalid ID' }, 400);
         const r = await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE id=${writerPubMatch[1]} AND is_active=true`;
         if (!r.length) return json({ error: 'Not found' }, 404);
-        return json(r[0]);
+        return json(r[0], 200, '*', 300);
       }
 
       // --- Follow/Unfollow ---
