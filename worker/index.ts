@@ -2573,7 +2573,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
         if (writerUser) {
           // Logged-in writer: max 5 comments / replies on a story
-          const wCount = await sql`SELECT COUNT(*)::int as c FROM comments WHERE c.book_id = ANY(${idList}) AND writer_id=${writerUser.id} AND status<>'deleted'`;
+          const wCount = await sql`SELECT COUNT(*) as c FROM comments WHERE book_id = ANY(${idList}) AND writer_id=${writerUser.id} AND status<>'deleted'`;
           if ((wCount[0]?.c || 0) >= 5) {
             return json({ error: 'writer_limit_reached', message: 'লেখক হিসেবে একটি গল্পে সর্বোচ্চ ৫টি মন্তব্য বা রিপ্লাই করতে পারবেন।' }, 400);
           }
@@ -2592,13 +2592,13 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             }
 
             // 2. Anti-spam: Duplicate comment check
-            const dupCmt = await sql`SELECT id FROM comments WHERE device_id=${dId} AND c.book_id = ANY(${idList}) AND body=${cbody} AND status<>'deleted' LIMIT 1`;
+            const dupCmt = await sql`SELECT id FROM comments WHERE device_id=${dId} AND book_id = ANY(${idList}) AND body=${cbody} AND status<>'deleted' LIMIT 1`;
             if (dupCmt.length) {
               return json({ error: 'duplicate_comment', message: 'একই মন্তব্য বারবার পোস্ট করা যাবে না।' }, 400);
             }
 
             // 3. Guest limit: max 2 comments on a story
-            const gCount = await sql`SELECT COUNT(*)::int as c FROM comments WHERE c.book_id = ANY(${idList}) AND device_id=${dId} AND status<>'deleted'`;
+            const gCount = await sql`SELECT COUNT(*) as c FROM comments WHERE book_id = ANY(${idList}) AND device_id=${dId} AND status<>'deleted'`;
             if ((gCount[0]?.c || 0) >= 2) {
               return json({ error: 'guest_limit_reached', message: 'অতিথি হিসেবে একটি গল্পে সর্বোচ্চ ২টি মন্তব্য করতে পারবেন। আরও মন্তব্য করতে লেখক একাউন্টে লগইন করুন।' }, 400);
             }
