@@ -1,6 +1,9 @@
+import { createClient } from '@libsql/client/web';
 import { handleChatWebSocket, handleChatApi } from './chat';
 
 export interface Env {
+  TURSO_URL?: string;
+  TURSO_AUTH_TOKEN?: string;
   DATABASE_URL?: string;
   DB?: D1Database;
   MEDIA: R2Bucket;
@@ -70,10 +73,158 @@ export function createD1Sql(db: D1Database) {
   };
 }
 
-function getSql(env: Env) {
-  if (env.DB) return createD1Sql(env.DB);
-  throw new Error('Cloudflare D1 database binding "DB" is not configured');
+let cachedTursoClient: ReturnType<typeof createClient> | null = null;
+let cachedTursoUrl = '';
+
+export function createTursoSql(url: string, authToken: string) {
+  if (!cachedTursoClient || cachedTursoUrl !== url) {
+    cachedTursoClient = createClient({ url, authToken });
+    cachedTursoUrl = url;
+  }
+  const client = cachedTursoClient;
+
+  return async (strings: TemplateStringsArray, ...values: any[]) => {
+    let rawQuery = '';
+    const bindings: any[] = [];
+    for (let i = 0; i < strings.length; i++) {
+      rawQuery += strings[i];
+      if (i < values.length) {
+        let v = values[i];
+        if (Array.isArray(v) && rawQuery.trimEnd().endsWith('= ANY(')) {
+          rawQuery = rawQuery.trimEnd().slice(0, -6) + 'IN (';
+          if (v.length === 0) {
+            rawQuery += 'NULL';
+          } else {
+            rawQuery += v.map(() => '?').join(',');
+            for (const item of v) bindings.push(item);
+          }
+          continue;
+        }
+
+        rawQuery += '?';
+        if (typeof v === 'boolean') {
+          bindings.push(v ? 1 : 0);
+        } else if (v !== null && typeof v === 'object' && !(v instanceof ArrayBuffer) && !(v instanceof Uint8Array)) {
+          bindings.push(JSON.stringify(v));
+        } else {
+          bindings.push(v === undefined ? null : v);
+        }
+      }
+    }
+
+    let q = rawQuery
+      .replace(/DEFAULT\s+NOW\(\)/gi, 'DEFAULT CURRENT_TIMESTAMP')
+      .replace(/\bTIMESTAMPTZ\b/gi, 'TEXT')
+      .replace(/\bJSONB\b/gi, 'TEXT')
+      .replace(/\bUUID\b/gi, 'TEXT')
+      .replace(/to_char\(d::date,\s*'YYYY-MM-DD'\)/gi, "strftime('%Y-%m-%d', d)")
+      .replace(/FROM\s+generate_series\(CURRENT_DATE\s*-\s*INTERVAL\s*'6 days',\s*CURRENT_DATE,\s*INTERVAL\s*'1 day'\)\s*d/gi,
+        "FROM (WITH RECURSIVE dates(d) AS (SELECT date('now', '-6 days') UNION ALL SELECT date(d, '+1 day') FROM dates WHERE d < date('now')) SELECT d FROM dates)")
+      .replace(/NOW\(\)\s*([+-])\s*INTERVAL\s*'(\d+)\s*([^']+)'/gi, (_, sign, num, unit) => `datetime('now', '${sign}${num} ${unit}')`)
+      .replace(/CURRENT_DATE\s*([+-])\s*INTERVAL\s*'(\d+)\s*([^']+)'/gi, (_, sign, num, unit) => `date('now', '${sign}${num} ${unit}')`)
+      .replace(/\bNOW\(\)/gi, `datetime('now')`)
+      .replace(/\bCURRENT_DATE\b/gi, `date('now')`)
+      .replace(/DEFAULT\s+gen_random_uuid\(\)/gi, "DEFAULT (lower(hex(randomblob(16))))")
+      .replace(/\bgen_random_uuid\(\)/gi, `lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)),2) || '-a' || substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))`)
+      .replace(/\bILIKE\b/gi, 'LIKE')
+      .replace(/\bGREATEST\b/gi, 'MAX')
+      .replace(/\bLEAST\b/gi, 'MIN')
+      .replace(/jsonb_array_length\((.*?)\)/gi, 'json_array_length($1)')
+      .replace(/::[a-zA-Z0-9_]+/g, '');
+
+    const res = await client.execute({ sql: q, args: bindings });
+    const out = (res.rows || []) as any[];
+    (out as any).rowCount = res.rowsAffected ?? out.length;
+    return out;
+  };
 }
+
+function getSql(env: Env) {
+  if (env.TURSO_URL && env.TURSO_AUTH_TOKEN) {
+    return createTursoSql(env.TURSO_URL, env.TURSO_AUTH_TOKEN);
+  }
+  if (env.DB) return createD1Sql(env.DB);
+  throw new Error('Cloudflare D1 or Turso database is not configured');
+}
+
+// ============================================================================
+// High-Performance In-Memory Edge Cache for D1 Database Offloading
+// ============================================================================
+interface CacheEntry {
+  data: any;
+  expiresAt: number;
+}
+const memoryCache = new Map<string, CacheEntry>();
+
+export function getCached<T = any>(key: string): T | null {
+  const entry = memoryCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    memoryCache.delete(key);
+    return null;
+  }
+  return entry.data as T;
+}
+
+export function setCached(key: string, data: any, ttlSeconds: number) {
+  memoryCache.set(key, {
+    data,
+    expiresAt: Date.now() + ttlSeconds * 1000,
+  });
+  if (memoryCache.size > 200) {
+    const oldestKey = memoryCache.keys().next().value;
+    if (oldestKey) memoryCache.delete(oldestKey);
+  }
+}
+
+export function invalidateCache(prefix?: string) {
+  if (!prefix) {
+    memoryCache.clear();
+    return;
+  }
+  for (const k of memoryCache.keys()) {
+    if (k.startsWith(prefix)) memoryCache.delete(k);
+  }
+}
+
+export function invalidatePublicCache() {
+  invalidateCache('home-sections:');
+  invalidateCache('books:');
+  invalidateCache('categories:');
+  invalidateCache('admin:');
+  invalidateCache('writers:');
+}
+
+let indexesEnsured = false;
+export async function ensureDbIndexes(sql: any): Promise<void> {
+  if (indexesEnsured) return;
+  indexesEnsured = true;
+  try {
+    await Promise.allSettled([
+      sql`CREATE INDEX IF NOT EXISTS idx_chapters_book_status ON chapters(book_id, status)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_chapters_status_pos ON chapters(status, position)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_books_status_updated ON books(status, updated_at DESC)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_books_status_views ON books(status, views DESC)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_books_category ON books(category_id, status)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_books_title ON books(title)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen_at DESC)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_devices_created_at ON devices(created_at DESC)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_devices_device_key ON devices(device_key)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_view_events_created ON view_events(created_at DESC)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_view_events_device ON view_events(device_id)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_view_events_book ON view_events(book_id)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_stories_writer_status ON stories(writer_id, status)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_follows_writer ON follows(writer_id)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_follows_device ON follows(device_id)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_comments_book_status ON comments(book_id, status)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_writers_active_followers ON writers(is_active, follower_count DESC)`,
+      sql`CREATE INDEX IF NOT EXISTS idx_categories_active_pos ON categories(is_active, position ASC)`,
+    ]);
+  } catch (err) {
+    console.error('ensureDbIndexes error:', err);
+  }
+}
+
 
 const corsHeaders = (origin: string, cacheTtl = 0) => {
   const h: Record<string, string> = {
@@ -416,26 +567,37 @@ async function sendFcmNotification(
   accessToken: string
 ): Promise<boolean> {
   try {
+    const isChat = dataPayload?.type === 'chat_message';
+
     const messagePayload: any = {
       message: {
         token,
-        notification: {
+        data: {
+          ...dataPayload,
           title,
           body,
-          ...(dataPayload.imageUrl || dataPayload.storyCover ? { image: dataPayload.imageUrl || dataPayload.storyCover } : {}),
         },
-        data: dataPayload,
         android: {
           priority: 'high',
-          notification: {
-            channel_id: 'lekhoni_notifications_channel',
-            sound: 'default',
-            icon: 'ic_launcher',
-            ...(dataPayload.imageUrl || dataPayload.storyCover ? { image: dataPayload.imageUrl || dataPayload.storyCover } : {}),
-          },
         },
       },
     };
+
+    // For non-chat general alerts (stories, system), use standard notification block
+    if (!isChat) {
+      messagePayload.message.notification = {
+        title,
+        body,
+        ...(dataPayload.imageUrl || dataPayload.storyCover ? { image: dataPayload.imageUrl || dataPayload.storyCover } : {}),
+      };
+      messagePayload.message.android.notification = {
+        channel_id: 'lekhoni_notifications_channel',
+        sound: 'default',
+        icon: 'ic_launcher',
+        ...(dataPayload.imageUrl || dataPayload.storyCover ? { image: dataPayload.imageUrl || dataPayload.storyCover } : {}),
+      };
+    }
+
 
     const res = await fetch(`https://fcm.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/messages:send`, {
       method: 'POST',
@@ -566,6 +728,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       return handleChatWebSocket(request, env, url, sql, verifyJWT);
     }
 
+    if (request.method !== 'GET' && request.method !== 'OPTIONS') {
+      invalidatePublicCache();
+    }
+
     try {
       // Admin migrations are always admin-secret only. Other /api/admin/*
       // routes are resolved below so moderator sessions can access them too.
@@ -647,6 +813,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT ''`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS story_title TEXT DEFAULT ''`;
         await sql`ALTER TABLE writer_notifications ADD COLUMN IF NOT EXISTS story_cover TEXT DEFAULT ''`;
+        await sql`ALTER TABLE comments ADD COLUMN IF NOT EXISTS writer_id UUID DEFAULT NULL`;
+        await sql`ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_id UUID DEFAULT NULL`;
+        await sql`CREATE TABLE IF NOT EXISTS comment_reports (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), comment_id TEXT NOT NULL, reporter_device_id TEXT DEFAULT '', reporter_writer_id UUID DEFAULT NULL, reason TEXT NOT NULL, details TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         // Users table for regular signed-up users
         await sql`CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL DEFAULT '', display_name TEXT NOT NULL, avatar_url TEXT DEFAULT '', bio TEXT DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`;
         // Add follower_user_id to follows for user follows
@@ -759,6 +928,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
 
       const sql = getSql(env);
+      await ensureDbIndexes(sql);
 
       // ==================== MODERATOR AUTH ====================
       // Login is public; the issued session token is accepted by /api/admin/*.
@@ -833,54 +1003,79 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Real-time Platform Analytics ---
       if (url.pathname === '/api/admin/realtime-analytics' && request.method === 'GET') {
+        const cacheKey = 'admin:realtime-analytics';
+        const cached = getCached(cacheKey);
+        if (cached) return json(cached);
+
         const [
-          totalDevicesRow,
-          todayDevicesRow,
-          weekDevicesRow,
-          monthDevicesRow,
-          activeTodayRow,
-          activeWeekRow,
-          activeMonthRow,
-          totalWritersRow,
-          todayWritersRow,
-          weekWritersRow,
-          monthWritersRow,
+          deviceCounts,
+          writerCounts,
           booksStatsRow,
           storiesStatsRow,
           reportsCountRow,
           commentsCountRow,
           topBooks,
-          daily7,
+          dailyNewUsers,
+          dailyActiveUsers,
+          dailyNewWriters,
           categoriesDist
         ] = await Promise.all([
-          sql`SELECT COUNT(*)::int AS n FROM devices`,
-          sql`SELECT COUNT(*)::int AS n FROM devices WHERE date(created_at) >= date('now')`,
-          sql`SELECT COUNT(*)::int AS n FROM devices WHERE date(created_at) >= date('now', '-7 days')`,
-          sql`SELECT COUNT(*)::int AS n FROM devices WHERE date(created_at) >= date('now', '-30 days')`,
-          sql`SELECT COUNT(*)::int AS n FROM devices WHERE date(last_seen_at) >= date('now')`,
-          sql`SELECT COUNT(*)::int AS n FROM devices WHERE date(last_seen_at) >= date('now', '-7 days')`,
-          sql`SELECT COUNT(*)::int AS n FROM devices WHERE date(last_seen_at) >= date('now', '-30 days')`,
-          sql`SELECT COUNT(*)::int AS n FROM writers`,
-          sql`SELECT COUNT(*)::int AS n FROM writers WHERE date(created_at) >= date('now')`,
-          sql`SELECT COUNT(*)::int AS n FROM writers WHERE date(created_at) >= date('now', '-7 days')`,
-          sql`SELECT COUNT(*)::int AS n FROM writers WHERE date(created_at) >= date('now', '-30 days')`,
+          sql`SELECT 
+            COUNT(*) AS total_devices,
+            COUNT(CASE WHEN date(created_at) >= date('now') THEN 1 END) AS today_devices,
+            COUNT(CASE WHEN date(created_at) >= date('now', '-7 days') THEN 1 END) AS week_devices,
+            COUNT(CASE WHEN date(created_at) >= date('now', '-30 days') THEN 1 END) AS month_devices,
+            COUNT(CASE WHEN date(last_seen_at) >= date('now') THEN 1 END) AS active_today,
+            COUNT(CASE WHEN date(last_seen_at) >= date('now', '-7 days') THEN 1 END) AS active_week,
+            COUNT(CASE WHEN date(last_seen_at) >= date('now', '-30 days') THEN 1 END) AS active_month
+          FROM devices`,
+          sql`SELECT
+            COUNT(*) AS total_writers,
+            COUNT(CASE WHEN date(created_at) >= date('now') THEN 1 END) AS today_writers,
+            COUNT(CASE WHEN date(created_at) >= date('now', '-7 days') THEN 1 END) AS week_writers,
+            COUNT(CASE WHEN date(created_at) >= date('now', '-30 days') THEN 1 END) AS month_writers
+          FROM writers`,
           sql`SELECT COUNT(*)::int AS total_books, COALESCE(SUM(views),0)::int AS total_views, COALESCE(SUM(likes),0)::int AS total_likes FROM books WHERE status='published'`,
           sql`SELECT COUNT(*)::int AS total_stories, COUNT(CASE WHEN status='pending' THEN 1 END)::int AS pending_stories FROM stories`,
           sql`SELECT COUNT(CASE WHEN status='pending' THEN 1 END)::int AS pending_reports FROM reports`,
           sql`SELECT COUNT(*)::int AS total_comments FROM comments`,
-          sql`SELECT b.id, b.title, b.author, b.cover_url, b.views, b.likes, COALESCE(c.name, '') AS category_name, (SELECT COUNT(*)::int FROM chapters ch WHERE ch.book_id=b.id) AS chapters_count FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.views DESC, b.likes DESC LIMIT 10`,
-          sql`WITH RECURSIVE days(d) AS (SELECT date('now', '-6 days') UNION ALL SELECT date(d, '+1 day') FROM days WHERE d < date('now')) SELECT d AS date, (SELECT COUNT(*)::int FROM devices WHERE date(created_at) = d) AS new_users, (SELECT COUNT(*)::int FROM devices WHERE date(last_seen_at) = d) AS active_users, (SELECT COUNT(*)::int FROM writers WHERE date(created_at) = d) AS new_writers FROM days ORDER BY d ASC`,
-          sql`SELECT c.id, c.name, c.color, (SELECT COUNT(*)::int FROM books b WHERE b.category_id=c.id AND b.status='published') AS books_count, (SELECT COALESCE(SUM(b.views), 0)::int FROM books b WHERE b.category_id=c.id) AS total_views FROM categories c WHERE c.is_active=1 ORDER BY total_views DESC LIMIT 8`
+          sql`SELECT b.id, b.title, b.author, b.cover_url, b.views, b.likes, COALESCE(c.name, '') AS category_name, COUNT(ch.id) AS chapters_count 
+              FROM (
+                SELECT id, title, author, cover_url, views, likes, category_id 
+                FROM books 
+                WHERE status='published' 
+                ORDER BY views DESC, likes DESC 
+                LIMIT 10
+              ) b 
+              LEFT JOIN categories c ON b.category_id=c.id 
+              LEFT JOIN chapters ch ON ch.book_id=b.id 
+              GROUP BY b.id, b.title, b.author, b.cover_url, b.views, b.likes, c.name 
+              ORDER BY b.views DESC, b.likes DESC`,
+          sql`SELECT date(created_at) AS d, COUNT(*) AS n FROM devices WHERE created_at >= date('now', '-6 days') GROUP BY date(created_at)`,
+          sql`SELECT date(last_seen_at) AS d, COUNT(*) AS n FROM devices WHERE last_seen_at >= date('now', '-6 days') GROUP BY date(last_seen_at)`,
+          sql`SELECT date(created_at) AS d, COUNT(*) AS n FROM writers WHERE created_at >= date('now', '-6 days') GROUP BY date(created_at)`,
+          sql`SELECT c.id, c.name, c.color, COUNT(b.id) AS books_count, COALESCE(SUM(b.views), 0) AS total_views 
+              FROM categories c 
+              LEFT JOIN books b ON b.category_id=c.id AND b.status='published' 
+              WHERE c.is_active=1 
+              GROUP BY c.id, c.name, c.color 
+              ORDER BY total_views DESC 
+              LIMIT 8`
         ]);
 
-        const totalViews = booksStatsRow[0]?.total_views || 0;
-        const totalUsers = totalDevicesRow[0]?.n || 0;
-        const todayUsers = todayDevicesRow[0]?.n || 0;
-        const weekUsers = weekDevicesRow[0]?.n || 0;
-        const monthUsers = monthDevicesRow[0]?.n || 0;
-        const activeToday = activeTodayRow[0]?.n || 0;
-        const activeWeek = activeWeekRow[0]?.n || 0;
-        const activeMonth = activeMonthRow[0]?.n || 0;
+        const totalViews = Number(booksStatsRow[0]?.total_views || 0);
+        const totalUsers = Number(deviceCounts[0]?.total_devices || 0);
+        const todayUsers = Number(deviceCounts[0]?.today_devices || 0);
+        const weekUsers = Number(deviceCounts[0]?.week_devices || 0);
+        const monthUsers = Number(deviceCounts[0]?.month_devices || 0);
+        const activeToday = Number(deviceCounts[0]?.active_today || 0);
+        const activeWeek = Number(deviceCounts[0]?.active_week || 0);
+        const activeMonth = Number(deviceCounts[0]?.active_month || 0);
+
+        const totalWriters = Number(writerCounts[0]?.total_writers || 0);
+        const todayWriters = Number(writerCounts[0]?.today_writers || 0);
+        const weekWriters = Number(writerCounts[0]?.week_writers || 0);
+        const monthWriters = Number(writerCounts[0]?.month_writers || 0);
 
         const activeRatioToday = totalUsers > 0 ? (activeToday || 1) / totalUsers : 0.05;
         const activeRatioWeek = totalUsers > 0 ? Math.min(1.0, (activeWeek || 3) / totalUsers) : 0.25;
@@ -891,22 +1086,31 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const monthViews = Math.max(weekViews * 2, Math.round(totalViews * Math.max(0.25, Math.min(0.9, activeRatioMonth * 0.8))));
 
         const dayNames = ['রবি', 'সোম', 'মঙ্গল', 'বুধ', 'বৃহঃ', 'শুক্র', 'শনি'];
-        const formattedDaily = (daily7 || []).map((row: any) => {
-          const dObj = new Date(row.date);
-          const dayLabel = !isNaN(dObj.getDay()) ? dayNames[dObj.getDay()] : row.date;
-          const dayActive = row.active_users || row.new_users || 0;
-          const estViews = Math.max(dayActive * 2, Math.round(todayViews * (0.6 + ((row.date.charCodeAt(row.date.length - 1) % 5) * 0.15))));
-          return {
-            date: row.date,
-            label: dayLabel,
-            new_users: row.new_users || 0,
-            active_users: row.active_users || 0,
-            new_writers: row.new_writers || 0,
-            views: estViews,
-          };
-        });
+        const newUsersMap = new Map((dailyNewUsers || []).map((r: any) => [r.d, Number(r.n || 0)]));
+        const activeUsersMap = new Map((dailyActiveUsers || []).map((r: any) => [r.d, Number(r.n || 0)]));
+        const newWritersMap = new Map((dailyNewWriters || []).map((r: any) => [r.d, Number(r.n || 0)]));
 
-        return json({
+        const formattedDaily = [];
+        const todayMs = Date.now();
+        for (let i = 6; i >= 0; i--) {
+          const dObj = new Date(todayMs - i * 86400000);
+          const dateStr = dObj.toISOString().slice(0, 10);
+          const dayLabel = dayNames[dObj.getDay()];
+          const dayNewUsers = newUsersMap.get(dateStr) || 0;
+          const dayActive = activeUsersMap.get(dateStr) || dayNewUsers;
+          const dayWriters = newWritersMap.get(dateStr) || 0;
+          const estViews = Math.max(dayActive * 2, Math.round(todayViews * (0.6 + ((dateStr.charCodeAt(dateStr.length - 1) % 5) * 0.15))));
+          formattedDaily.push({
+            date: dateStr,
+            label: dayLabel,
+            new_users: dayNewUsers,
+            active_users: dayActive,
+            new_writers: dayWriters,
+            views: estViews,
+          });
+        }
+
+        const responseData = {
           summary: {
             users: {
               today: todayUsers,
@@ -924,10 +1128,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
               total: totalViews,
             },
             writers: {
-              today: todayWritersRow[0]?.n || 0,
-              week: weekWritersRow[0]?.n || 0,
-              month: monthWritersRow[0]?.n || 0,
-              total: totalWritersRow[0]?.n || 0,
+              today: todayWriters,
+              week: weekWriters,
+              month: monthWriters,
+              total: totalWriters,
             },
             content: {
               total_books: booksStatsRow[0]?.total_books || 0,
@@ -942,7 +1146,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           top_books: topBooks || [],
           categories: categoriesDist || [],
           generated_at: new Date().toISOString()
-        });
+        };
+        setCached(cacheKey, responseData, 30);
+        return json(responseData);
       }
 
       // --- Categories CRUD ---
@@ -1120,7 +1326,19 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (writerUserMatch && (request.method === 'PATCH' || request.method === 'PUT')) {
         if (!uuid(writerUserMatch[1])) return json({ error: 'Invalid ID' }, 400);
         const b = await request.json() as { badge?: string; is_active?: boolean; approval_required?: boolean };
-        if (b.badge !== undefined) await sql`UPDATE writers SET badge=${b.badge} WHERE id=${writerUserMatch[1]}`;
+        if (b.badge !== undefined) {
+          const prevBadge = await sql`SELECT badge, writer_name FROM writers WHERE id=${writerUserMatch[1]} LIMIT 1`;
+          await sql`UPDATE writers SET badge=${b.badge} WHERE id=${writerUserMatch[1]}`;
+          if (b.badge === 'verified' && prevBadge[0]?.badge !== 'verified') {
+            const vTitle = 'অভিনন্দন! ভেরিফাইড লেখক ব্যাজ';
+            const vBody = 'অভিনন্দন! আপনার লেখক প্রোফাইল সফলভাবে যাচাইকৃত (Verified) করা হয়েছে। এখন আপনার প্রোফাইলে ব্লু ভেরিফাইড ব্যাজ প্রদর্শিত হবে।';
+            try {
+              await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type) VALUES (${crypto.randomUUID()},${writerUserMatch[1]},${vTitle},${vBody},'verified')`;
+            } catch (e) {
+              console.error('verified badge notification error', e);
+            }
+          }
+        }
         if (b.is_active !== undefined) await sql`UPDATE writers SET is_active=${b.is_active} WHERE id=${writerUserMatch[1]}`;
         if (b.approval_required !== undefined) await sql`UPDATE writers SET approval_required=${b.approval_required} WHERE id=${writerUserMatch[1]}`;
         const r = await sql`SELECT id,username,writer_name,email,avatar_url,bio,follower_count,badge,is_active,approval_required FROM writers WHERE id=${writerUserMatch[1]}`;
@@ -1203,11 +1421,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             }
           }
           const actData = JSON.stringify({ story_id: s.id, title: s.title });
-          const approveTitle = 'Story Approved';
-          const approveBody = `"${s.title}" has been published.`;
+          const approveTitle = 'গল্প অনুমোদিত হয়েছে';
+          const approveBody = `আপনার "${s.title}" গল্পটি সফলভাবে অনুমোদিত ও পাঠকদের জন্য প্রকাশিত হয়েছে।`;
           await sql`UPDATE stories SET status='published',review_note=${b.note||''},updated_at=datetime('now') WHERE id=${s.id}`;
           await sql`INSERT INTO writer_activities (id,writer_id,type,data) VALUES (${crypto.randomUUID()},${s.writer_id},'story_approved',${actData})`;
-          await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type) VALUES (${crypto.randomUUID()},${s.writer_id},${approveTitle},${approveBody},'approved')`;
+          await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id,story_title,story_cover) VALUES (${crypto.randomUUID()},${s.writer_id},${approveTitle},${approveBody},'approved',${s.id},${s.title},${s.cover_url||''})`;
           // Notify all followers about new story
           try {
             const followers = await sql`SELECT device_id FROM follows WHERE writer_id=${s.writer_id}`;
@@ -1226,7 +1444,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           return json({ ok: true, book_id: bookId });
         } else if (b.status === 'rejected') {
           await sql`UPDATE stories SET status='rejected',review_note=${b.note||''},updated_at=datetime('now') WHERE id=${s.id}`;
-          await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type) VALUES (${crypto.randomUUID()},${s.writer_id},'Story Rejected',${'"' + s.title + '" was rejected.' + (b.note ? ' Reason: '+b.note : '')},'rejected')`;
+          const rejectTitle = 'গল্প প্রত্যাখ্যাত হয়েছে';
+          const rejectBody = `আপনার "${s.title}" গল্পটি পর্যালোচনায় গ্রহণযোগ্য হয়নি।${b.note ? '\nরিজেক্টের কারণ: ' + b.note : ''}`;
+          await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id,story_title,story_cover) VALUES (${crypto.randomUUID()},${s.writer_id},${rejectTitle},${rejectBody},'rejected',${s.id},${s.title},${s.cover_url||''})`;
           return json({ ok: true });
         } else {
           await sql`UPDATE stories SET status='pending',review_note='',updated_at=datetime('now') WHERE id=${s.id}`;
@@ -1236,7 +1456,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Notifications CRUD ---
       if (url.pathname === '/api/admin/notifications' && request.method === 'GET') {
-        const notifs = await sql`SELECT id,title,body,COALESCE(icon,'bell') AS icon,COALESCE(url,'') AS url,'reader' AS target,status,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications ORDER BY created_at DESC LIMIT 100`;
+        const notifs = await sql`SELECT id,title,body,COALESCE(icon,'bell') AS icon,COALESCE(url,'') AS url,'reader' AS target,status,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE (device_id IS NULL OR device_id = '') AND title NOT LIKE '%নতুন গল্প%' AND title NOT LIKE '%নতুন অধ্যায়%' ORDER BY created_at DESC LIMIT 100`;
         return json(notifs);
       }
       if (url.pathname === '/api/admin/notifications' && request.method === 'POST') {
@@ -1359,6 +1579,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Analytics Dashboard ---
       if (url.pathname === '/api/admin/analytics' && request.method === 'GET') {
+        const cacheKey = 'admin:analytics';
+        const cached = getCached(cacheKey);
+        if (cached) return json(cached);
+
         const [bookStats, viewStats, activeStats, commentStats, writerStats, categoryStats, chapterStats, reactionStats] = await Promise.all([
           sql`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status='published')::int AS published, COALESCE(SUM(views),0)::bigint AS views FROM books`,
           sql`SELECT
@@ -1395,7 +1619,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const totalReactions = Number(reactionStats[0].n || 0);
         const uniqueReaders = Number(viewStats[0].unique_readers || 0);
         const dailyViews = dailyRows.map((r: any) => ({ date: r.date, views: Number(r.views || 0) }));
-        return json({
+        const responseData = {
           // snake_case: used by the admin dashboard and analytics page
           total_books: totalBooks,
           published_books: publishedBooks,
@@ -1427,7 +1651,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           totalReactions,
           recentBooks,
           recentComments,
-        });
+        };
+        setCached(cacheKey, responseData, 30);
+        return json(responseData);
       }
 
       // --- Live Readers (view_events last 5 min) ---
@@ -1663,7 +1889,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const updates: string[] = [];
         if (b.approval_required !== undefined) await sql`UPDATE writers SET approval_required=${b.approval_required} WHERE id=${adminWriterMatch[1]}`;
         if (b.is_active !== undefined) await sql`UPDATE writers SET is_active=${b.is_active} WHERE id=${adminWriterMatch[1]}`;
-        if (b.badge !== undefined) await sql`UPDATE writers SET badge=${b.badge} WHERE id=${adminWriterMatch[1]}`;
+        if (b.badge !== undefined) {
+          await sql`UPDATE writers SET badge=${b.badge} WHERE id=${adminWriterMatch[1]}`;
+          if (b.badge && b.badge !== 'none' && b.badge !== '') {
+            try {
+              await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type) VALUES (${crypto.randomUUID()},${adminWriterMatch[1]},'অভিনন্দন! ভেরিফাইড লেখক ব্যাজ','অভিনন্দন! আপনার লেখক প্রোফাইলে অফিসিয়াল ভেরিফাইড ব্যাজ প্রদান করা হয়েছে। এখন থেকে আপনার প্রতিটি গল্প ও প্রোফাইলে এই বিশেষ ব্যাজ প্রদর্শিত হবে।','verified')`;
+            } catch(e) {}
+          }
+        }
         const r = await sql`SELECT id,username,writer_name,approval_required,is_active,badge FROM writers WHERE id=${adminWriterMatch[1]}`;
         return json(r[0] || { error: 'Not found' }, r.length ? 200 : 404);
       }
@@ -1840,7 +2073,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             }
             try {
               await sql`INSERT INTO writer_activities (id,writer_id,type,data) VALUES (${crypto.randomUUID()},${st.writer_id},'story_approved',${JSON.stringify({ story_id: sid, title: st.title })})`;
-              await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id) VALUES (${crypto.randomUUID()},${st.writer_id},'Story Approved!',${'"' + st.title + '" has been published.'},'approved',${sid})`;
+              const appTitle = 'গল্প অনুমোদিত হয়েছে';
+              const appBody = `আপনার "${st.title}" গল্পটি সফলভাবে অনুমোদন ও লাইভ করা হয়েছে।`;
+              await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id,story_title,story_cover) VALUES (${crypto.randomUUID()},${st.writer_id},${appTitle},${appBody},'approved',${sid},${st.title},${st.cover_url||''})`;
               const followers = await sql`SELECT device_id FROM follows WHERE writer_id=${st.writer_id}`;
               for (const f of followers) {
                 if (f.device_id) {
@@ -1867,13 +2102,15 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           note = (body.review_note || body.note || '').trim();
         } catch {}
         await sql`UPDATE stories SET status='rejected',review_note=${note},updated_at=datetime('now') WHERE id=${sid}`;
-        const s = await sql`SELECT s.id,s.title,s.writer_id,w.writer_name FROM stories s LEFT JOIN writers w ON s.writer_id=w.id WHERE s.id=${sid}`;
+        const s = await sql`SELECT s.id,s.title,s.writer_id,s.cover_url,w.writer_name FROM stories s LEFT JOIN writers w ON s.writer_id=w.id WHERE s.id=${sid}`;
         if (s.length) {
           try {
             await sql`UPDATE books SET status='hidden' WHERE title=${s[0].title} AND author=${s[0].writer_name}`;
           } catch(e) {}
           try {
-            await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id) VALUES (${crypto.randomUUID()},${s[0].writer_id},'Story Rejected',${'"' + s[0].title + '" was rejected.' + (note ? ' Reason: ' + note : '')},'rejected',${sid})`;
+            const rejTitle = 'গল্প প্রত্যাখ্যাত হয়েছে';
+            const rejBody = `আপনার "${s[0].title}" গল্পটি পর্যালোচনায় গ্রহণযোগ্য হয়নি।${note ? '\nরিজেক্টের কারণ: ' + note : ''}`;
+            await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id,story_title,story_cover) VALUES (${crypto.randomUUID()},${s[0].writer_id},${rejTitle},${rejBody},'rejected',${sid},${s[0].title},${s[0].cover_url||''})`;
           } catch(e) {}
         }
         return json({ ok: true, status: 'rejected' });
@@ -2012,12 +2249,26 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       // scope=all (website) sees everything; default (app) hides website-only items.
       const scopeAll = url.searchParams.get('scope') === 'all';
       if (url.pathname === '/api/public/categories' && request.method === 'GET') {
-        if (scopeAll) return json(await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true ORDER BY position`, 200, '*', 300);
-        return json(await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true AND COALESCE(visible_on,'both')!='website' ORDER BY position`, 200, '*', 300);
+        const cacheKey = `categories:${scopeAll ? 'all' : 'app'}`;
+        const cached = getCached(cacheKey);
+        if (cached) return json(cached, 200, '*', 300);
+
+        const rows = scopeAll
+          ? await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true ORDER BY position`
+          : await sql`SELECT id,name,icon,color,cover_url,COALESCE(visible_on,'both') AS visible_on FROM categories WHERE is_active=true AND COALESCE(visible_on,'both')!='website' ORDER BY position`;
+        setCached(cacheKey, rows, 120);
+        return json(rows, 200, '*', 300);
       }
       if (url.pathname === '/api/public/books' && request.method === 'GET') {
-        if (scopeAll) return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`, 200, '*', 180);
-        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website' ORDER BY b.updated_at DESC`, 200, '*', 180);
+        const cacheKey = `books:${scopeAll ? 'all' : 'app'}`;
+        const cached = getCached(cacheKey);
+        if (cached) return json(cached, 200, '*', 180);
+
+        const rows = scopeAll
+          ? await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`
+          : await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website' ORDER BY b.updated_at DESC`;
+        setCached(cacheKey, rows, 60);
+        return json(rows, 200, '*', 180);
       }
       if (url.pathname === '/api/public/chapters' && request.method === 'GET') {
         const bookId = url.searchParams.get('book_id');
@@ -2046,6 +2297,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Public: Home section book lists (fixed + category-based) ---
       if (url.pathname === '/api/home-sections' && request.method === 'GET') {
+        const cacheKey = `home-sections:${scopeAll ? 'all' : 'app'}`;
+        const cached = getCached(cacheKey);
+        if (cached) return json(cached, 200, '*', 180);
+
         const cfgRow = await sql`SELECT sections, views_visible FROM home_settings WHERE id=1 LIMIT 1`;
         const cfgRaw = cfgRow[0]?.sections;
         const savedCfg = cfgRaw ? (JSON.parse(typeof cfgRaw === 'string' ? cfgRaw : JSON.stringify(cfgRaw)) as { key: string; enabled: boolean; title?: string }[]) : [];
@@ -2056,35 +2311,84 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           ? await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,b.category_id::text AS category_id,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.story_type,'episodes') AS story_type,b.created_at,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published'`
           : await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,b.category_id::text AS category_id,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.story_type,'episodes') AS story_type,b.created_at,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website'`;
         const fn = (id: string | null) => (id ? `${id}` : '');
-        const fmt = (b: any) => ({ id: fn(b.id), title: b.title, author: b.author, cover_url: b.cover_url, views: `${b.views}`, likes: b.likes, description: b.description, category: b.category, color: b.color, accent: b.accent, is_new: b.is_new, featured: b.featured, home_section: b.home_section || '', views_visible: b.views_visible !== false, display_status: b.display_status || '', writer_status: b.writer_status || '', hide_title_on_cover: b.hide_title_on_cover || false, show_ads: b.show_ads !== false, pdf_reward_ad: b.pdf_reward_ad !== false, pdf_url: b.pdf_url || '', dedication: b.dedication || '', author_name: b.author_name || '' });
+        const fmt = (b: any) => ({
+          id: fn(b.id),
+          title: b.title,
+          author: b.author,
+          cover_url: b.cover_url,
+          views: `${b.views}`,
+          likes: b.likes,
+          description: b.description,
+          category: b.category,
+          color: b.color,
+          accent: b.accent,
+          is_new: b.is_new,
+          featured: b.featured,
+          home_section: b.home_section || '',
+          views_visible: b.views_visible !== false,
+          display_status: b.display_status || '',
+          writer_status: b.writer_status || '',
+          hide_title_on_cover: b.hide_title_on_cover || false,
+          show_ads: b.show_ads !== false,
+          pdf_reward_ad: b.pdf_reward_ad !== false,
+          pdf_url: b.pdf_url || '',
+          dedication: b.dedication || '',
+          author_name: b.author_name || '',
+          created_at: b.created_at || '',
+          updated_at: b.updated_at || b.created_at || '',
+        });
         const byViews = (a: any, b: any) => +b.views - +a.views;
-        const byNewest = (a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-        const ageDays = (b: any) => (now - new Date(b.created_at).getTime()) / 86400000;
-        const ongoing = allBooks.filter((b: any) => ageDays(b) < 7 && b.display_status === 'new').sort(byNewest);
-        const weekly = allBooks.filter((b: any) => ageDays(b) >= 7 && ageDays(b) <= 30).sort(byViews);
-        const monthly = allBooks.filter((b: any) => ageDays(b) > 30).sort(byViews);
+        const byNewest = (a: any, b: any) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+        const ageHours = (b: any) => (now - new Date(b.created_at || 0).getTime()) / 3600000;
+        const updateAgeHours = (b: any) => (now - new Date(b.updated_at || b.created_at || 0).getTime()) / 3600000;
+
+        // 1. নতুন যুক্ত হয়েছে (Within 72 hours)
+        const newlyAdded = allBooks.filter((b: any) => ageHours(b) <= 72).sort(byNewest);
+
+        // 2. সর্বশেষ পর্ব (Episode stories updated with new chapter within 6 days = 144 hours)
+        const latestEpisodes = allBooks.filter((b: any) => {
+          const isEpisodeStory = b.story_type === 'episodes' || b.story_type === 'novel' || (!b.pdf_url && b.story_type !== 'pdf');
+          return isEpisodeStory && updateAgeHours(b) <= (6 * 24);
+        }).sort((a: any, b: any) => new Date(b.updated_at || b.created_at || 0).getTime() - new Date(a.updated_at || a.created_at || 0).getTime());
+
         const featured = allBooks.filter((b: any) => b.featured).sort(byViews);
-        const mostPop = [...allBooks].sort(byViews).slice(0, 12);
+        const mostPop = [...allBooks].sort(byViews).slice(0, 18);
+        const popularNovels = allBooks.filter((b: any) => {
+          const cat = (b.category || '').toLowerCase();
+          const storyType = (b.story_type || '').toLowerCase();
+          return cat.includes('উপন্যাস') || storyType === 'novel' || storyType === 'episodes';
+        }).sort(byViews).slice(0, 18);
+
         const fixedSections = [
+          { key: 'newlyAdded', title: titleOf('newlyAdded') || 'নতুন যুক্ত হয়েছে', books: newlyAdded.map(fmt) },
+          { key: 'latestEpisodes', title: titleOf('latestEpisodes') || 'সর্বশেষ পর্ব', books: latestEpisodes.map(fmt) },
           { key: 'featured', title: titleOf('featured') || 'বৈশিষ্ট্যযুক্ত', books: featured.slice(0, 12).map(fmt) },
-          { key: 'mostPopular', title: titleOf('mostPopular') || 'সর্বাধিক জনপ্রিয়', books: mostPop.map(fmt) },
-          { key: 'newEpisodes', title: titleOf('newEpisodes') || 'নতুন পর্ব', books: ongoing.slice(0, 12).map(fmt) },
           { key: 'popularAuthors', title: titleOf('popularAuthors') || 'জনপ্রিয় লেখক', books: [] },
-          { key: 'weeklyPopular', title: titleOf('weeklyPopular') || 'সাপ্তাহিক জনপ্রিয়', books: weekly.slice(0, 12).map(fmt) },
-          { key: 'monthlyPopular', title: titleOf('monthlyPopular') || 'মাসিক জনপ্রিয়', books: monthly.slice(0, 12).map(fmt) },
         ].filter((s) => isEnabled(s.key) && (s.key === 'popularAuthors' || s.books.length > 0));
+
+        // Category sections: Only show if category has at least 9 books
         const cats = await sql`SELECT id,name,icon,color,cover_url FROM categories WHERE is_active=true ORDER BY position ASC, name ASC`;
         const catSections = cats.map((cat: any) => {
-          const catBooks = allBooks.filter((b: any) => b.category_id === cat.id).sort(byNewest).slice(0, 12);
-          return { key: `cat:${cat.name}`, title: cat.name, icon: cat.icon || 'book-open', color: cat.color || '#123E39', cover_url: cat.cover_url, books: catBooks.map(fmt) };
-        }).filter((s: any) => s.books.length > 0);
+          const catBooks = allBooks.filter((b: any) => b.category_id === cat.id).sort(byViews);
+          return {
+            key: `cat:${cat.name}`,
+            title: cat.name,
+            icon: cat.icon || 'book-open',
+            color: cat.color || '#123E39',
+            cover_url: cat.cover_url,
+            total_books: catBooks.length,
+            books: catBooks.map(fmt),
+          };
+        }).filter((s: any) => s.total_books >= 9);
         const sections = [...fixedSections, ...catSections];
         const writers = await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE is_active=true ORDER BY follower_count DESC`;
         const dayMs = 86400000;
         const weekMs = 7 * dayMs;
         const weekSeed = Math.floor(Date.now() / weekMs);
         const rotated = writers.map((w: any, i: number) => ({ ...w, _score: ((weekSeed + i * 7919) % writers.length) })).sort((a: any, b: any) => a._score - b._score).slice(0, 12);
-        return json({ viewsVisible: cfgRow?.[0]?.views_visible !== false, sections, writers: rotated.map((w: any) => ({ id: `${w.id}`, username: w.username, writer_name: w.writer_name, bio: w.bio, avatar_url: w.avatar_url, follower_count: w.follower_count, badge: w.badge || 'none' })) }, 200, '*', 180);
+        const responseData = { viewsVisible: cfgRow?.[0]?.views_visible !== false, sections, writers: rotated.map((w: any) => ({ id: `${w.id}`, username: w.username, writer_name: w.writer_name, bio: w.bio, avatar_url: w.avatar_url, follower_count: w.follower_count, badge: w.badge || 'none' })) };
+        setCached(cacheKey, responseData, 60);
+        return json(responseData, 200, '*', 180);
       }
 
       const pubBookMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)$/);
@@ -2145,72 +2449,243 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (pubComMatch && request.method === 'GET') {
         const rawId = pubComMatch[1];
         const __cb = (await resolveBookId(sql, rawId)) || rawId;
-        return json(await sql`SELECT id,book_id,display_name,body,status,created_at,avatar_url FROM comments WHERE (book_id=${__cb} OR book_id=${rawId}) AND status='approved' ORDER BY created_at DESC LIMIT 50`);
+
+        // Resolve all linked book & story IDs (by direct ID or matching title)
+        const linked = await sql`
+          SELECT b.id FROM books b WHERE b.id=${rawId} OR b.id=${__cb}
+          UNION
+          SELECT s.id FROM stories s WHERE s.id=${rawId} OR s.id=${__cb}
+          UNION
+          SELECT b.id FROM books b WHERE b.title IN (SELECT title FROM stories WHERE id=${rawId} OR id=${__cb})
+          UNION
+          SELECT s.id FROM stories s WHERE s.title IN (SELECT title FROM books WHERE id=${rawId} OR id=${__cb})
+        `;
+        const idList = Array.from(new Set([rawId, __cb, ...linked.map((r: any) => r.id)].filter(Boolean)));
+
+        const rows = await sql`
+          SELECT c.id, c.book_id, COALESCE(d.device_key, c.device_id) AS device_id, c.writer_id, c.parent_id,
+                 CASE WHEN w.id IS NOT NULL THEN w.writer_name ELSE c.display_name END AS display_name,
+                 c.body, c.status, c.created_at,
+                 COALESCE(w.avatar_url, c.avatar_url, '') AS avatar_url,
+                 COALESCE(w.badge, 'none') AS writer_badge,
+                 CASE WHEN w.id IS NOT NULL THEN 1 ELSE 0 END AS is_writer,
+                 COALESCE(w.username, '') AS writer_username
+          FROM comments c
+          LEFT JOIN writers w ON c.writer_id = w.id
+          LEFT JOIN devices d ON c.device_id = d.id
+          WHERE c.book_id = ANY(${idList}) AND c.status <> 'deleted'
+          ORDER BY c.created_at ASC
+          LIMIT 100
+        `;
+        return json(rows);
       }
+
       const pubComOneMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)\/comments\/([^/]+)$/);
       if (pubComOneMatch && (request.method === 'PUT' || request.method === 'DELETE')) {
         const b1 = await request.json().catch(() => ({})) as { device_id?: string; body?: string };
-        if (!b1.device_id) return json({ error: 'device_id required' }, 400);
         const rawId = pubComOneMatch[1];
-        const __cb1 = (await resolveBookId(sql, rawId)) || rawId;
-        const own = await sql`SELECT c.id FROM comments c JOIN devices d ON d.id=c.device_id WHERE c.id=${pubComOneMatch[2]} AND (c.book_id=${__cb1} OR c.book_id=${rawId}) AND d.device_key=${b1.device_id} LIMIT 1`;
-        if (!own.length) return json({ error: 'Not found' }, 404);
+        const commentId = pubComOneMatch[2];
+
+        // Check if requester is authenticated writer
+        let authedWriterId: string | null = null;
+        const authH = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
+        if (authH) {
+          try {
+            const p = await verifyJWT(authH[1]);
+            if (p?.id) authedWriterId = p.id;
+          } catch (_) {}
+        }
+
+        const commentRows = await sql`
+          SELECT c.id, c.writer_id, c.device_id, d.device_key
+          FROM comments c
+          LEFT JOIN devices d ON c.device_id = d.id
+          WHERE c.id=${commentId} LIMIT 1
+        `;
+        if (!commentRows.length) return json({ error: 'Comment not found' }, 404);
+
+        const cRow = commentRows[0];
+        const isOwner = (authedWriterId && cRow.writer_id === authedWriterId) ||
+                        (b1.device_id && (cRow.device_key === b1.device_id || cRow.device_id === b1.device_id));
+        if (!isOwner) return json({ error: 'Unauthorized to modify this comment' }, 403);
+
         if (request.method === 'DELETE') {
-          await sql`UPDATE comments SET status='deleted' WHERE id=${pubComOneMatch[2]}`;
+          await sql`UPDATE comments SET status='deleted' WHERE id=${commentId}`;
           return json({ ok: true });
         }
-        const nbody = (b1.body || '').slice(0, 1000).trim();
+        const nbody = (b1.body || '').slice(0, 200).trim();
         if (!nbody) return json({ error: 'Empty comment' }, 400);
-        await sql`UPDATE comments SET body=${nbody},status='pending' WHERE id=${pubComOneMatch[2]}`;
-        return json({ ok: true, needs_approval: true });
+        await sql`UPDATE comments SET body=${nbody} WHERE id=${commentId}`;
+        return json({ ok: true });
       }
+
       if (pubComMatch && request.method === 'POST') {
         const rawId = pubComMatch[1];
         const bookId = (await resolveBookId(sql, rawId)) || rawId;
-        const b = await request.json() as { device_id?: string; name?: string; body?: string; avatar_url?: string };
-        if (!b.device_id || !b.name || !b.body) return json({ error: 'device_id, name, body required' }, 400);
+        const b = await request.json() as { device_id?: string; name?: string; body?: string; avatar_url?: string; parent_id?: string };
+        if (!b.body || !b.body.trim()) return json({ error: 'মন্তব্য খালি রাখা যাবে না' }, 400);
+
+        // Max 200 characters limit
+        const cbody = b.body.trim();
+        if (cbody.length > 200) {
+          return json({ error: 'character_limit_exceeded', message: 'মন্তব্য সর্বোচ্চ ২০০ অক্ষরের মধ্যে হতে হবে।' }, 400);
+        }
 
         // Check if book OR story exists
-        const bkExists = await sql`SELECT id,title,author FROM books WHERE id=${bookId} UNION ALL SELECT id,title,author_name AS author FROM stories WHERE id=${bookId} LIMIT 1`;
+        const bkExists = await sql`SELECT id,title,author,cover_url FROM books WHERE id=${bookId} UNION ALL SELECT id,title,author_name AS author,cover_url FROM stories WHERE id=${bookId} LIMIT 1`;
         if (!bkExists.length) return json({ error: 'Book not found' }, 404);
 
-        const cname = b.name.slice(0, 50), cbody = b.body.slice(0, 1000);
-        if (!cname.trim() || !cbody.trim()) return json({ error: 'Empty comment' }, 400);
+        // Resolve all linked IDs
+        const linked = await sql`
+          SELECT b.id FROM books b WHERE b.id=${rawId} OR b.id=${bookId}
+          UNION
+          SELECT s.id FROM stories s WHERE s.id=${rawId} OR s.id=${bookId}
+          UNION
+          SELECT b.id FROM books b WHERE b.title IN (SELECT title FROM stories WHERE id=${rawId} OR id=${bookId})
+          UNION
+          SELECT s.id FROM stories s WHERE s.title IN (SELECT title FROM books WHERE id=${rawId} OR id=${bookId})
+        `;
+        const idList = Array.from(new Set([rawId, bookId, ...linked.map((r: any) => r.id)].filter(Boolean)));
 
-        await sql`INSERT INTO devices (id, device_key, last_seen_at) VALUES (${crypto.randomUUID()}, ${b.device_id}, datetime('now')) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=datetime('now')`;
-        const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
-        const dId = deviceRow.length ? deviceRow[0].id : null;
+        // Check writer authentication
+        let writerUser: { id: string; writer_name: string; avatar_url: string; badge: string } | null = null;
+        const authH = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
+        if (authH) {
+          try {
+            const p = await verifyJWT(authH[1]);
+            if (p?.id) {
+              const wrRows = await sql`SELECT id, writer_name, avatar_url, badge FROM writers WHERE id=${p.id} AND is_active=true LIMIT 1`;
+              if (wrRows.length) writerUser = wrRows[0];
+            }
+          } catch (_) {}
+        }
 
-        const recent = await sql`SELECT id FROM comments WHERE (book_id=${bookId} OR book_id=${rawId}) AND device_id=${dId} AND created_at > datetime('now', '-10 minutes') LIMIT 5`;
-        if (recent.length >= 5) return json({ error: 'Too many comments — try later' }, 429);
-        const already = await sql`SELECT id FROM comments WHERE (book_id=${bookId} OR book_id=${rawId}) AND device_id=${dId} AND status<>'deleted' LIMIT 1`;
-        if (already.length) return json({ error: 'already_commented' }, 409);
+        let dId: string | null = null;
+        if (b.device_id) {
+          await sql`INSERT INTO devices (id, device_key, last_seen_at) VALUES (${crypto.randomUUID()}, ${b.device_id}, datetime('now')) ON CONFLICT (device_key) DO UPDATE SET last_seen_at=datetime('now')`;
+          const deviceRow = await sql`SELECT id FROM devices WHERE device_key=${b.device_id} LIMIT 1`;
+          if (deviceRow.length) dId = deviceRow[0].id;
+        }
 
-        // Check if approval is required
-        let needsApproval = true;
-        try {
-          const cfgRow = await sql`SELECT comments_approval FROM home_settings LIMIT 1`;
-          if (cfgRow.length && cfgRow[0].comments_approval !== undefined) {
-            needsApproval = cfgRow[0].comments_approval !== 0 && cfgRow[0].comments_approval !== false;
+        let cname = '';
+        let cavatar = '';
+        let commentWriterId: string | null = null;
+
+        if (writerUser) {
+          // Logged-in writer: max 5 comments / replies on a story
+          const wCount = await sql`SELECT COUNT(*)::int as c FROM comments WHERE c.book_id = ANY(${idList}) AND writer_id=${writerUser.id} AND status<>'deleted'`;
+          if ((wCount[0]?.c || 0) >= 5) {
+            return json({ error: 'writer_limit_reached', message: 'লেখক হিসেবে একটি গল্পে সর্বোচ্চ ৫টি মন্তব্য বা রিপ্লাই করতে পারবেন।' }, 400);
           }
-        } catch (_) {}
-        const commentStatus = needsApproval ? 'pending' : 'approved';
-        const avatarUrl = (b.avatar_url || '').slice(0, 2048);
-        const cmtId = crypto.randomUUID();
-        await sql`INSERT INTO comments (id, book_id, device_id, display_name, body, status, avatar_url, created_at) VALUES (${cmtId},${bookId},${dId},${cname},${cbody},${commentStatus},${avatarUrl},datetime('now'))`;
+          cname = writerUser.writer_name;
+          cavatar = writerUser.avatar_url || '';
+          commentWriterId = writerUser.id;
+        } else {
+          // Guest device: anti-spam checks
+          if (!b.device_id) return json({ error: 'device_id required for guest comments' }, 400);
 
-        // Send comment notification to writer
-        try {
-          const authorName = bkExists[0].author;
-          if (authorName) {
-            const writerRow = await sql`SELECT id FROM writers WHERE writer_name=${authorName} LIMIT 1`;
-            if (writerRow.length) {
-              const snippet = cbody.length > 40 ? cbody.slice(0, 40) + '...' : cbody;
-              await sql`INSERT INTO writer_notifications (id,writer_id,title,body,type,story_id,story_cover) VALUES (${crypto.randomUUID()},${writerRow[0].id},'নতুন মন্তব্য',${cname+' আপনার "'+bkExists[0].title+'" গল্পে মন্তব্য করেছেন: "'+snippet+'"'},'comment',${bookId},'')`;
+          // 1. Anti-spam: Rate limit frequency (wait 10 seconds between comments)
+          if (dId) {
+            const recentCmt = await sql`SELECT id FROM comments WHERE device_id=${dId} AND created_at >= datetime('now', '-10 seconds') LIMIT 1`;
+            if (recentCmt.length) {
+              return json({ error: 'rate_limited', message: 'একটু অপেক্ষা করে পুনরায় চেষ্টা করুন (স্প্যাম প্রতিরোধ)।' }, 429);
+            }
+
+            // 2. Anti-spam: Duplicate comment check
+            const dupCmt = await sql`SELECT id FROM comments WHERE device_id=${dId} AND c.book_id = ANY(${idList}) AND body=${cbody} AND status<>'deleted' LIMIT 1`;
+            if (dupCmt.length) {
+              return json({ error: 'duplicate_comment', message: 'একই মন্তব্য বারবার পোস্ট করা যাবে না।' }, 400);
+            }
+
+            // 3. Guest limit: max 2 comments on a story
+            const gCount = await sql`SELECT COUNT(*)::int as c FROM comments WHERE c.book_id = ANY(${idList}) AND device_id=${dId} AND status<>'deleted'`;
+            if ((gCount[0]?.c || 0) >= 2) {
+              return json({ error: 'guest_limit_reached', message: 'অতিথি হিসেবে একটি গল্পে সর্বোচ্চ ২টি মন্তব্য করতে পারবেন। আরও মন্তব্য করতে লেখক একাউন্টে লগইন করুন।' }, 400);
             }
           }
-        } catch(e) { console.error('comment notification error', e); }
-        return json({ ok: true, needs_approval: needsApproval, message: needsApproval ? 'Comment submitted for moderation' : 'Comment posted' }, 201);
+
+          cname = (b.name || 'পাঠক').trim().slice(0, 50);
+          if (!cname) cname = 'পাঠক';
+          cavatar = (b.avatar_url || '').slice(0, 2048);
+        }
+
+        // Direct approval so comments are immediately visible
+        const commentStatus = 'approved';
+        const cmtId = crypto.randomUUID();
+        const parentId = b.parent_id && b.parent_id.trim().length > 0 ? b.parent_id.trim() : null;
+
+        await sql`INSERT INTO comments (id, book_id, device_id, writer_id, parent_id, display_name, body, status, avatar_url, created_at)
+                  VALUES (${cmtId}, ${bookId}, ${dId}, ${commentWriterId}, ${parentId}, ${cname}, ${cbody}, ${commentStatus}, ${cavatar}, datetime('now'))`;
+
+        // Send comment notification to story author
+        try {
+          let targetWriterId: string | null = null;
+          let storyTitle = bkExists[0].title;
+          let storyCover = bkExists[0].cover_url || '';
+          let actualStoryId = bookId;
+
+          // Check stories table directly first
+          const stRow = await sql`
+            SELECT id, writer_id, title, cover_url
+            FROM stories
+            WHERE id=${bookId} OR id=${rawId} OR TRIM(LOWER(title)) = TRIM(LOWER(${bkExists[0].title}))
+            LIMIT 1
+          `;
+          if (stRow.length && stRow[0].writer_id) {
+            targetWriterId = stRow[0].writer_id;
+            storyTitle = stRow[0].title || storyTitle;
+            storyCover = stRow[0].cover_url || storyCover;
+            actualStoryId = stRow[0].id;
+          } else if (bkExists[0].author) {
+            const wRow = await sql`
+              SELECT id FROM writers
+              WHERE TRIM(LOWER(writer_name)) = TRIM(LOWER(${bkExists[0].author.trim()}))
+                 OR TRIM(LOWER(username)) = TRIM(LOWER(${bkExists[0].author.trim()}))
+              LIMIT 1
+            `;
+            if (wRow.length) targetWriterId = wRow[0].id;
+          }
+
+          // Only notify if author exists and author didn't post on their own story
+          if (targetWriterId && targetWriterId !== commentWriterId) {
+            const snippet = cbody.length > 50 ? cbody.slice(0, 50) + '...' : cbody;
+            const notifTitle = parentId ? 'আপনার গল্পে মন্তব্যের উত্তর' : 'নতুন মন্তব্য';
+            const notifBody = `${cname} আপনার "${storyTitle}" গল্পে মন্তব্য করেছেন: "${snippet}"`;
+            await sql`INSERT INTO writer_notifications (id, writer_id, title, body, type, story_id, story_title, story_cover, avatar_url, created_at)
+                      VALUES (${crypto.randomUUID()}, ${targetWriterId}, ${notifTitle}, ${notifBody}, 'comment', ${actualStoryId}, ${storyTitle}, ${storyCover}, ${cavatar}, datetime('now'))`;
+          }
+        } catch(e) {
+          console.error('comment notification error', e);
+        }
+
+        return json({
+          ok: true,
+          comment_id: cmtId,
+          needs_approval: false,
+          message: 'মন্তব্য সফলভাবে প্রকাশিত হয়েছে'
+        }, 201);
+      }
+
+      // Comment Reporting Endpoint
+      const pubComReportMatch = url.pathname.match(/^\/api\/public\/comments\/([^/]+)\/report$/);
+      if (pubComReportMatch && request.method === 'POST') {
+        const commentId = pubComReportMatch[1];
+        const b = await request.json().catch(() => ({})) as { reason?: string; details?: string; device_id?: string };
+        if (!b.reason || !b.reason.trim()) return json({ error: 'রিপোর্টের কারণ উল্লেখ করুন' }, 400);
+
+        let reporterWriterId: string | null = null;
+        const authH = request.headers.get('Authorization')?.match(/^Bearer (.+)$/);
+        if (authH) {
+          try {
+            const p = await verifyJWT(authH[1]);
+            if (p?.id) reporterWriterId = p.id;
+          } catch (_) {}
+        }
+
+        const reportId = crypto.randomUUID();
+        await sql`INSERT INTO comment_reports (id, comment_id, reporter_device_id, reporter_writer_id, reason, details, status, created_at)
+                  VALUES (${reportId}, ${commentId}, ${b.device_id || ''}, ${reporterWriterId}, ${b.reason.trim()}, ${b.details || ''}, 'pending', datetime('now'))`;
+        return json({ ok: true, message: 'রিপোর্ট সফলভাবে জমা হয়েছে' }, 201);
       }
 
       const pubLikeMatch = url.pathname.match(/^\/api\/public\/books\/([^/]+)\/like$/);
@@ -2264,18 +2739,23 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Push Token Registration ---
       if (url.pathname === '/api/public/devices/register' && request.method === 'POST') {
-        const b = await request.json() as { device_id?: string; push_token?: string };
+        const b = await request.json() as { device_id?: string; push_token?: string; writer_id?: string };
         if (!b.device_id || !b.push_token) return json({ error: 'device_id and push_token required' }, 400);
-        await sql`INSERT INTO devices (id, device_key, push_token, last_seen_at) VALUES (${crypto.randomUUID()}, ${b.device_id}, ${b.push_token}, datetime('now')) ON CONFLICT (device_key) DO UPDATE SET push_token = ${b.push_token}, last_seen_at = datetime('now')`;
+        try { await sql`ALTER TABLE devices ADD COLUMN IF NOT EXISTS writer_id UUID DEFAULT NULL`; } catch(_) {}
+        if (b.writer_id && uuid(b.writer_id)) {
+          await sql`INSERT INTO devices (id, device_key, push_token, writer_id, last_seen_at) VALUES (${crypto.randomUUID()}, ${b.device_id}, ${b.push_token}, ${b.writer_id}, datetime('now')) ON CONFLICT (device_key) DO UPDATE SET push_token = ${b.push_token}, writer_id = ${b.writer_id}, last_seen_at = datetime('now')`;
+        } else {
+          await sql`INSERT INTO devices (id, device_key, push_token, last_seen_at) VALUES (${crypto.randomUUID()}, ${b.device_id}, ${b.push_token}, datetime('now')) ON CONFLICT (device_key) DO UPDATE SET push_token = ${b.push_token}, last_seen_at = datetime('now')`;
+        }
         return json({ ok: true });
       }
 
       if (url.pathname === '/api/public/notifications' && request.method === 'GET') {
         const deviceId = url.searchParams.get('device_id') || '';
         if (deviceId) {
-          return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND (device_id='' OR device_id=${deviceId}) ORDER BY created_at DESC LIMIT 30`, 200, '*', 120);
+          return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND (((device_id='' OR device_id IS NULL) AND title NOT LIKE '%নতুন গল্প%' AND title NOT LIKE '%নতুন অধ্যায়%') OR device_id=${deviceId}) ORDER BY created_at DESC LIMIT 30`, 200, '*', 120);
         }
-        return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND device_id='' ORDER BY created_at DESC LIMIT 20`, 200, '*', 120);
+        return json(await sql`SELECT id,title,body,COALESCE(NULLIF(CASE WHEN icon IN ('bell','book-open','heart','star','zap','gift','message-circle','megaphone','sparkles','alert-circle','check-circle','info','trending-up','award','download') THEN icon ELSE '' END,''),'bell') AS icon,COALESCE(NULLIF(url,''),'') AS url,COALESCE(story_cover,'') AS story_cover,created_at FROM notifications WHERE status='sent' AND (device_id='' OR device_id IS NULL) AND title NOT LIKE '%নতুন গল্প%' AND title NOT LIKE '%নতুন অধ্যায়%' ORDER BY created_at DESC LIMIT 20`, 200, '*', 120);
       }
 
       // --- PBKDF2 Hashing ---
@@ -2747,8 +3227,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
 
       // --- Public Writers List ---
-      if (url.pathname === '/api/public/writers' && request.method === 'GET')
-        return json(await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE is_active=true ORDER BY follower_count DESC,created_at DESC`, 200, '*', 300);
+      if (url.pathname === '/api/public/writers' && request.method === 'GET') {
+        const cacheKey = 'writers:public';
+        const cached = getCached(cacheKey);
+        if (cached) return json(cached, 200, '*', 300);
+        const rows = await sql`SELECT id,username,writer_name,bio,avatar_url,follower_count,badge,created_at FROM writers WHERE is_active=true ORDER BY follower_count DESC,created_at DESC`;
+        setCached(cacheKey, rows, 60);
+        return json(rows, 200, '*', 300);
+      }
 
       const writerPubMatch = url.pathname.match(/^\/api\/public\/writers\/([^/]+)$/);
       if (writerPubMatch && request.method === 'GET') {
@@ -2778,12 +3264,30 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         const ins = await sql`INSERT INTO follows (id, device_id, writer_id, follower_writer_id, follower_user_id) VALUES (${crypto.randomUUID()}, ${dRow[0].id}, ${b.writer_id}, ${b.follower_writer_id||null}, ${b.follower_user_id||null}) ON CONFLICT (device_id,writer_id) DO NOTHING RETURNING id`;
         await sql`UPDATE writers SET follower_count = (SELECT COUNT(*) FROM follows WHERE writer_id = ${b.writer_id}) WHERE id = ${b.writer_id}`;
         if (ins.length > 0) {
+          let followerName = '';
           if (b.follower_writer_id && uuid(b.follower_writer_id)) {
             const fw = await sql`SELECT writer_name,avatar_url FROM writers WHERE id=${b.follower_writer_id} LIMIT 1`;
-            if (fw.length) await sql`INSERT INTO writer_notifications (id, writer_id, title, body, type, url, avatar_url) VALUES (${crypto.randomUUID()}, ${b.writer_id}, 'নতুন অনুসারক', ${fw[0].writer_name+' আপনাকে ফলো করেছেন'}, 'follow', ${b.follower_writer_id}, ${fw[0].avatar_url||''})`;
+            if (fw.length) {
+              followerName = fw[0].writer_name;
+              await sql`INSERT INTO writer_notifications (id, writer_id, title, body, type, url, avatar_url) VALUES (${crypto.randomUUID()}, ${b.writer_id}, 'নতুন অনুসারক', ${fw[0].writer_name+' আপনাকে ফলো করেছেন'}, 'follow', ${b.follower_writer_id}, ${fw[0].avatar_url||''})`;
+            }
           } else if (b.follower_user_id && uuid(b.follower_user_id)) {
             const fu = await sql`SELECT display_name,avatar_url FROM users WHERE id=${b.follower_user_id} LIMIT 1`;
-            if (fu.length) await sql`INSERT INTO writer_notifications (id, writer_id, title, body, type, url, avatar_url) VALUES (${crypto.randomUUID()}, ${b.writer_id}, 'নতুন অনুসারক', ${fu[0].display_name+' আপনাকে ফলো করেছেন'}, 'follow', ${b.follower_user_id}, ${fu[0].avatar_url||''})`;
+            if (fu.length) {
+              followerName = fu[0].display_name;
+              await sql`INSERT INTO writer_notifications (id, writer_id, title, body, type, url, avatar_url) VALUES (${crypto.randomUUID()}, ${b.writer_id}, 'নতুন অনুসারক', ${fu[0].display_name+' আপনাকে ফলো করেছেন'}, 'follow', ${b.follower_user_id}, ${fu[0].avatar_url||''})`;
+            }
+          }
+          if (followerName) {
+            try {
+              const targetDevs = await sql`SELECT push_token FROM devices WHERE writer_id=${b.writer_id} AND push_token IS NOT NULL`;
+              if (targetDevs.length > 0) {
+                const tokens = targetDevs.map((d: any) => d.push_token).filter(Boolean);
+                if (tokens.length > 0) {
+                  await sendUniversalPushNotifications(tokens, 'নতুন অনুসারী!', `${followerName} আপনাকে ফলো করেছেন`, { type: 'follow', writer_id: b.writer_id });
+                }
+              }
+            } catch (e) { console.error('follow push error', e); }
           }
         }
         return json({ ok: true }, 201);
@@ -2805,7 +3309,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         if (!nm) return json({ error: 'Unauthorized' }, 401);
         const payload = await verifyJWT(nm[1]);
         if (!payload?.id) return json({ error: 'Invalid token' }, 401);
-        const rows = await sql`SELECT id,title,body,type,story_id,url,avatar_url,story_title,story_cover,is_read,created_at FROM writer_notifications WHERE writer_id=${payload.id} ORDER BY created_at DESC LIMIT 30`;
+        const rows = await sql`SELECT id,title,body,type,story_id,url,avatar_url,story_title,story_cover,is_read,created_at FROM writer_notifications WHERE writer_id=${payload.id} ORDER BY created_at DESC LIMIT 60`;
         const unread = await sql`SELECT COUNT(*)::int AS n FROM writer_notifications WHERE writer_id=${payload.id} AND is_read=false`;
         return json({ notifications: rows, unread: unread[0]?.n || 0 });
       }
@@ -2978,7 +3482,14 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             const oldTitle = owned[0]?.title || '';
             const visU = ['app', 'website', 'both'].includes(b.visible_on || '') ? b.visible_on : null;
             const visType = b.story_type === 'complete' || b.story_type === 'episodes' ? b.story_type : null;
-            await sql`UPDATE stories SET title=COALESCE(${b.title},title),description=COALESCE(${b.description},description),status=COALESCE(${b.status},status),category=COALESCE(${b.category},category),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),cover_url=COALESCE(${b.cover_url},cover_url),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),visible_on=COALESCE(${visU},visible_on),hide_title_on_cover=COALESCE(${b.hide_title_on_cover},hide_title_on_cover),is_new=COALESCE(${b.is_new},is_new),story_type=COALESCE(${visType},story_type),updated_at=datetime('now') WHERE id=${storyId}`;
+
+            // If the story was rejected and author updates it, reset status to 'pending' for re-review!
+            const stCheck = await sql`SELECT status, title FROM stories WHERE id=${storyId} LIMIT 1`;
+            const wasRejected = stCheck.length > 0 && stCheck[0].status === 'rejected';
+            const willBePending = b.status === 'pending' || wasRejected;
+            const finalStatus = willBePending ? 'pending' : (b.status || null);
+
+            await sql`UPDATE stories SET title=COALESCE(${b.title},title),description=COALESCE(${b.description},description),status=COALESCE(${finalStatus},status),review_note=CASE WHEN ${willBePending} THEN '' ELSE review_note END,category=COALESCE(${b.category},category),display_status=COALESCE(${b.display_status},display_status),writer_status=COALESCE(${b.writer_status},writer_status),cover_url=COALESCE(${b.cover_url},cover_url),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),visible_on=COALESCE(${visU},visible_on),hide_title_on_cover=COALESCE(${b.hide_title_on_cover},hide_title_on_cover),is_new=COALESCE(${b.is_new},is_new),story_type=COALESCE(${visType},story_type),updated_at=datetime('now') WHERE id=${storyId}`;
             const newTitle = b.title || oldTitle;
             if (oldTitle) {
               const bkMatch = await sql`SELECT id FROM books WHERE title=${oldTitle} AND (author=${wName} OR author=${uName}) LIMIT 1`;
@@ -2986,10 +3497,18 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
                 await sql`UPDATE books SET title=${newTitle},description=COALESCE(${b.description},description),cover_url=COALESCE(${b.cover_url},cover_url),display_status=COALESCE(${b.display_status},display_status),dedication=COALESCE(${b.dedication},dedication),author_name=COALESCE(${b.author_name},author_name),pdf_url=COALESCE(${b.pdf_url},pdf_url),visible_on=(SELECT visible_on FROM stories WHERE id=${storyId}),hide_title_on_cover=(SELECT hide_title_on_cover FROM stories WHERE id=${storyId}),writer_status=(SELECT writer_status FROM stories WHERE id=${storyId}),is_new=(SELECT is_new FROM stories WHERE id=${storyId}),story_type=(SELECT story_type FROM stories WHERE id=${storyId}),updated_at=datetime('now') WHERE id=${bkMatch[0].id}`;
               }
             }
-            if (b.status === 'published') {
+            if (willBePending) {
+              try { await sql`INSERT INTO writer_activities (id,writer_id,type,data) VALUES (${crypto.randomUUID()},${writerId},'story_resubmitted',${JSON.stringify({ story_id: storyId, title: b.title || stCheck[0]?.title || '' })})`; } catch (_) {}
+            } else if (b.status === 'published') {
               try { await sql`INSERT INTO writer_activities (id,writer_id,type,data) VALUES (${crypto.randomUUID()},${writerId},'story_published',${JSON.stringify({ story_id: storyId, title: b.title || '' })})`; } catch (_) {}
             }
-            return json({ ok: true });
+            return json({ ok: true, status: willBePending ? 'pending' : (finalStatus || stCheck[0]?.status || 'pending') });
+          }
+
+          if (request.method === 'POST' && url.pathname.endsWith('/submit')) {
+            await sql`UPDATE stories SET status='pending', review_note='', updated_at=datetime('now') WHERE id=${storyId}`;
+            try { await sql`INSERT INTO writer_activities (id,writer_id,type,data) VALUES (${crypto.randomUUID()},${writerId},'story_resubmitted',${JSON.stringify({ story_id: storyId, title: owned[0]?.title || '' })})`; } catch (_) {}
+            return json({ ok: true, status: 'pending' });
           }
 
           if (request.method === 'DELETE') {
@@ -3251,6 +3770,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           const b = await request.json() as { ids?: string[] };
           if (b.ids?.length) await sql`UPDATE writer_notifications SET is_read=true WHERE writer_id=${writerId} AND id = ANY(${b.ids})`;
           else await sql`UPDATE writer_notifications SET is_read=true WHERE writer_id=${writerId}`;
+          return json({ ok: true });
+        }
+        if (url.pathname === '/api/writer/notifications' && request.method === 'DELETE') {
+          await sql`DELETE FROM writer_notifications WHERE writer_id=${writerId}`;
           return json({ ok: true });
         }
         const wnMatch = url.pathname.match(/^\/api\/writer\/notifications\/([^/]+)$/);

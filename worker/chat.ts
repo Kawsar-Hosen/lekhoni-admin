@@ -561,19 +561,27 @@ export async function handleChatApi(
     // 7. If recipient offline or background push notification needed
     if (socketsReached === 0) {
       try {
-        const deviceRows = await sql`SELECT push_token FROM writer_devices WHERE writer_id=${recipientId} AND push_token != ''`;
-        const tokens = deviceRows.map((d: any) => d.push_token);
+        // Check if recipient has muted this conversation
+        const recipientMember = await sql`
+          SELECT is_muted FROM conversation_members 
+          WHERE conversation_id = ${convId} AND writer_id = ${recipientId} LIMIT 1`;
+        const isMuted = recipientMember.length > 0 && (recipientMember[0].is_muted === 1 || recipientMember[0].is_muted === true);
 
-        if (tokens.length > 0) {
-          const pushTitle = senderName;
-          const pushBody = messageType === 'image' ? '📷 ছবি পাঠিয়েছেন' : content;
-          await sendPush(tokens, pushTitle, pushBody, {
-            type: 'chat_message',
-            conversation_id: convId,
-            sender_id: writerId,
-            sender_name: senderName,
-            sender_avatar: senderRow[0]?.avatar_url || '',
-          });
+        if (!isMuted) {
+          const deviceRows = await sql`SELECT push_token FROM writer_devices WHERE writer_id=${recipientId} AND push_token != ''`;
+          const tokens = deviceRows.map((d: any) => d.push_token);
+
+          if (tokens.length > 0) {
+            const pushTitle = senderName;
+            const pushBody = messageType === 'image' ? '📷 ছবি পাঠিয়েছেন' : content;
+            await sendPush(tokens, pushTitle, pushBody, {
+              type: 'chat_message',
+              conversation_id: convId,
+              sender_id: writerId,
+              sender_name: senderName,
+              sender_avatar: senderRow[0]?.avatar_url || '',
+            });
+          }
         }
       } catch (pushErr) {
         console.error('Chat push notification error:', pushErr);
@@ -619,6 +627,46 @@ export async function handleChatApi(
     }
 
     return json({ ok: true });
+  }
+
+  // ── F2. Mute / Unmute Conversation ────────────────────────────────────────
+  const muteMatch = path.match(/^\/api\/writer\/chat\/conversations\/([^/]+)\/mute$/);
+  if (muteMatch && request.method === 'POST') {
+    const convId = muteMatch[1];
+    const body = (await request.json().catch(() => ({}))) as { muted?: boolean };
+    const isMuted = body.muted !== false ? 1 : 0;
+    await sql`
+      UPDATE conversation_members 
+      SET is_muted = ${isMuted} 
+      WHERE conversation_id = ${convId} AND writer_id = ${writerId}`;
+    return json({ ok: true, is_muted: Boolean(isMuted) });
+  }
+
+  // ── F3. Delete Conversation for current writer ───────────────────────────
+  const deleteConvMatch = path.match(/^\/api\/writer\/chat\/conversations\/([^/]+)\/delete$/);
+  if (deleteConvMatch && request.method === 'POST') {
+    const convId = deleteConvMatch[1];
+    await sql`DELETE FROM conversation_members WHERE conversation_id = ${convId} AND writer_id = ${writerId}`;
+    return json({ ok: true });
+  }
+
+  // ── F4. Pin / Unpin Message in Conversation ─────────────────────────────
+  const pinMsgMatch = path.match(/^\/api\/writer\/chat\/conversations\/([^/]+)\/pin$/);
+  if (pinMsgMatch && request.method === 'POST') {
+    const convId = pinMsgMatch[1];
+    const body = (await request.json().catch(() => ({}))) as { message_id?: string | null };
+    const pinnedMessageId = body.message_id || null;
+
+    const members = await sql`SELECT writer_id FROM conversation_members WHERE conversation_id=${convId}`;
+    for (const m of members) {
+      broadcastToWriter(m.writer_id, {
+        type: 'message_pinned',
+        conversation_id: convId,
+        pinned_message_id: pinnedMessageId,
+      });
+    }
+
+    return json({ ok: true, pinned_message_id: pinnedMessageId });
   }
 
   // ── G. Delete Message ───────────────────────────────────────────────────

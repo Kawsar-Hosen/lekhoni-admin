@@ -14,3 +14,5 @@ bucket_name = "lekhoni-media"
 [vars]
 ALLOWED_ORIGIN = "https://admin.xyteee.com,https://lekhoni-admin.pages.dev"
 MEDIA_PUBLIC_URL = "https://pub-55f5f01908bd4e3094ea07f7deaa7978.r2.dev"
+TURSO_URL = "https://lekhoni-db-kawsar.turso.io"
+TURSO_AUTH_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3OTMzNzA5MzgsImlkIjoiMDFhMThkM2ItNTAwMS03NTlkLTg1NGEtMTA2ZDFjNmZkYjFkIiwia2lkIjoiN0FUYlh2QXlBRnVHRHJva0pnN1hkRnBXMkl2NWpVdzVsWnFaaEVkblFoYyIsInJpZCI6ImViMzA5YzI3LTg3NTAtNDBjOS05YmQ2LTNmNzYwMDY5YTkzNyJ9.LzPigATbN8xMsDvLQQJHpAxoh2jO9WwydQ9OKL7-GXhc3LSuppAt5gNqQK4WAgvZaiTDyju5uTgVBTGTpIyNCg"
