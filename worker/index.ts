@@ -73,15 +73,8 @@ export function createD1Sql(db: D1Database) {
   };
 }
 
-let cachedTursoClient: ReturnType<typeof createClient> | null = null;
-let cachedTursoUrl = '';
-
 export function createTursoSql(url: string, authToken: string) {
-  if (!cachedTursoClient || cachedTursoUrl !== url) {
-    cachedTursoClient = createClient({ url, authToken });
-    cachedTursoUrl = url;
-  }
-  const client = cachedTursoClient;
+  const client = createClient({ url, authToken });
 
   return async (strings: TemplateStringsArray, ...values: any[]) => {
     let rawQuery = '';
