@@ -3419,9 +3419,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           const validStoryTypes = ['complete', 'audio', 'episodes', 'single', 'poem', 'pdf'];
           const stype = validStoryTypes.includes((b.story_type || '').toLowerCase()) ? (b.story_type || '').toLowerCase() : 'episodes';
           const newStoryId = crypto.randomUUID();
-          const r = await sql`INSERT INTO stories (id,writer_id,title,description,category,cover_url,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,visible_on,story_type) VALUES (${newStoryId},${writerId},${b.title},${b.description||''},${b.category||''},${b.cover_url||null},${b.display_status||''},${b.writer_status||''},${b.hide_title_on_cover||false},${b.pdf_url||''},${b.dedication||''},${b.author_name||''},${vis},${stype}) RETURNING id,title,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,story_type,created_at`;
+          const r = await sql`INSERT INTO stories (id,writer_id,title,description,category,cover_url,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,visible_on,story_type) VALUES (${newStoryId},${writerId},${b.title},${b.description||''},${b.category||''},${b.cover_url||null},${b.display_status||''},${b.writer_status||''},${b.hide_title_on_cover||false},${b.pdf_url||''},${b.dedication||''},${b.author_name||''},${vis},${stype}) RETURNING id,title,description,category,cover_url,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,story_type,created_at`;
           try { await sql`INSERT INTO writer_activities (id,writer_id,type,data) VALUES (${crypto.randomUUID()},${writerId},'story_created',${JSON.stringify({ story_id: newStoryId, title: b.title })})`; } catch (_) {}
-          return json(r[0] || { id: newStoryId, title: b.title, status: 'pending', story_type: stype }, 201);
+          return json(r[0] || { id: newStoryId, title: b.title, description: b.description || '', category: b.category || '', cover_url: b.cover_url || null, status: 'pending', story_type: stype }, 201);
         }
 
         const storyMatch = url.pathname.match(/^\/api\/writer\/stories\/([^/]+)$/);
