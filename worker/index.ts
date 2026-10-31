@@ -1176,7 +1176,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Books CRUD ---
       if (url.pathname === '/api/admin/books' && request.method === 'GET')
-        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.home_section,b.views_visible,b.category_id,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,b.created_at,b.updated_at,COALESCE(c.name,'') AS category_name,(SELECT COUNT(*)::int FROM chapters ch WHERE ch.book_id=b.id) AS chapters_count FROM books b LEFT JOIN categories c ON b.category_id=c.id ORDER BY b.updated_at DESC`);
+        return json(await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.home_section,b.views_visible,b.category_id,b.show_ads,b.pdf_reward_ad,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,b.created_at,b.updated_at,COALESCE(c.name,'') AS category_name,(SELECT COUNT(*)::int FROM chapters ch WHERE ch.book_id=b.id) AS chapters_count FROM books b LEFT JOIN categories c ON b.category_id=c.id ORDER BY b.updated_at DESC`);
       if (url.pathname === '/api/admin/books' && request.method === 'POST') {
         const b = await request.json() as { title?: string; author?: string; category_id?: string; cover_url?: string; color?: string; accent?: string; description?: string; status?: string; is_new?: boolean; featured?: boolean; home_section?: string; pdf_url?: string; dedication?: string; author_name?: string; show_ads?: boolean };
         if (!b.title) return json({ error: 'title required' }, 400);
@@ -1188,7 +1188,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       const bookMatch = url.pathname.match(/^\/api\/admin\/books\/([^/]+)$/);
       if (bookMatch && request.method === 'GET') {
         if (!uuid(bookMatch[1])) return json({ error: 'Invalid ID' }, 400);
-        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.home_section,b.views_visible,b.category_id,b.created_at,b.updated_at,COALESCE(c.name,'') AS category_name,(SELECT COUNT(*)::int FROM chapters ch WHERE ch.book_id=b.id) AS chapters_count FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookMatch[1]}`;
+        const rows = await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,b.description,b.color,b.accent,b.is_new,b.featured,b.home_section,b.views_visible,b.category_id,COALESCE(b.story_type,'episodes') AS story_type,b.created_at,b.updated_at,COALESCE(c.name,'') AS category_name,(SELECT COUNT(*)::int FROM chapters ch WHERE ch.book_id=b.id) AS chapters_count FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.id=${bookMatch[1]}`;
         if (!rows.length) return json({ error: 'Not found' }, 404);
         const chs = await sql`SELECT id,title,body,position,status,views,created_at,reward_ad FROM chapters WHERE book_id=${bookMatch[1]} ORDER BY position`;
         return json({ ...rows[0], chapters: chs });
@@ -1295,7 +1295,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
       // --- Writer Story Review (approve -> publish as book) ---
       if (url.pathname === '/api/admin/writers' && request.method === 'GET')
-        return json(await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,s.chapters_count,s.review_note,s.created_at,s.updated_at,w.writer_name,w.avatar_url,
+        return json(await sql`SELECT s.id,s.title,s.description,s.status,s.cover_url,s.category,s.views,s.likes,s.chapters_count,s.review_note,COALESCE(s.story_type,'episodes') AS story_type,s.created_at,s.updated_at,w.writer_name,w.avatar_url,
         (SELECT COUNT(*)::int FROM story_chapters sc WHERE sc.story_id=s.id) AS chapter_count
         FROM stories s JOIN writers w ON s.writer_id=w.id
         ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'published' THEN 1 WHEN 'rejected' THEN 2 ELSE 3 END,s.updated_at DESC`);
@@ -3412,11 +3412,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           const b = await request.json() as { title?: string; description?: string; category?: string; cover_url?: string; display_status?: string; writer_status?: string; hide_title_on_cover?: boolean; pdf_url?: string; dedication?: string; author_name?: string; visible_on?: string; story_type?: string };
           if (!b.title) return json({ error: 'Title required' }, 400);
           const vis = ['app', 'website', 'both'].includes(b.visible_on || '') ? b.visible_on : 'both';
-          const stype = b.story_type === 'complete' ? 'complete' : 'episodes';
+          const validStoryTypes = ['complete', 'audio', 'episodes', 'single', 'poem', 'pdf'];
+          const stype = validStoryTypes.includes((b.story_type || '').toLowerCase()) ? (b.story_type || '').toLowerCase() : 'episodes';
           const newStoryId = crypto.randomUUID();
-          const r = await sql`INSERT INTO stories (id,writer_id,title,description,category,cover_url,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,visible_on,story_type) VALUES (${newStoryId},${writerId},${b.title},${b.description||''},${b.category||''},${b.cover_url||null},${b.display_status||''},${b.writer_status||''},${b.hide_title_on_cover||false},${b.pdf_url||''},${b.dedication||''},${b.author_name||''},${vis},${stype}) RETURNING id,title,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,created_at`;
+          const r = await sql`INSERT INTO stories (id,writer_id,title,description,category,cover_url,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,visible_on,story_type) VALUES (${newStoryId},${writerId},${b.title},${b.description||''},${b.category||''},${b.cover_url||null},${b.display_status||''},${b.writer_status||''},${b.hide_title_on_cover||false},${b.pdf_url||''},${b.dedication||''},${b.author_name||''},${vis},${stype}) RETURNING id,title,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,story_type,created_at`;
           try { await sql`INSERT INTO writer_activities (id,writer_id,type,data) VALUES (${crypto.randomUUID()},${writerId},'story_created',${JSON.stringify({ story_id: newStoryId, title: b.title })})`; } catch (_) {}
-          return json(r[0] || { id: newStoryId, title: b.title, status: 'pending' }, 201);
+          return json(r[0] || { id: newStoryId, title: b.title, status: 'pending', story_type: stype }, 201);
         }
 
         const storyMatch = url.pathname.match(/^\/api\/writer\/stories\/([^/]+)$/);
@@ -3474,7 +3475,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             const b = await request.json() as { title?: string; description?: string; status?: string; category?: string; display_status?: string; writer_status?: string; cover_url?: string; dedication?: string; author_name?: string; pdf_url?: string; visible_on?: string; hide_title_on_cover?: boolean; is_new?: boolean; story_type?: string };
             const oldTitle = owned[0]?.title || '';
             const visU = ['app', 'website', 'both'].includes(b.visible_on || '') ? b.visible_on : null;
-            const visType = b.story_type === 'complete' || b.story_type === 'episodes' ? b.story_type : null;
+            const validStoryTypes = ['complete', 'audio', 'episodes', 'single', 'poem', 'pdf'];
+            const visType = b.story_type && validStoryTypes.includes(b.story_type.toLowerCase()) ? b.story_type.toLowerCase() : null;
 
             // If the story was rejected and author updates it, reset status to 'pending' for re-review!
             const stCheck = await sql`SELECT status, title FROM stories WHERE id=${storyId} LIMIT 1`;
