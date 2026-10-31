@@ -1376,7 +1376,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         if (!uuid(writerMatch[1])) return json({ error: 'Invalid ID' }, 400);
         const b = await request.json() as { status?: string; note?: string };
         if (!b.status || !['published','rejected','pending'].includes(b.status)) return json({ error: 'Valid status required: published,rejected,pending' }, 400);
-        const story = await sql`SELECT s.id,s.title,s.description,s.category,s.cover_url,s.display_status,s.writer_status,s.writer_id,s.hide_title_on_cover,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${writerMatch[1]}`;
+        const story = await sql`SELECT s.id,s.title,s.description,s.category,s.cover_url,s.display_status,s.writer_status,s.writer_id,s.hide_title_on_cover,COALESCE(s.story_type,'episodes') AS story_type,w.writer_name FROM stories s JOIN writers w ON s.writer_id=w.id WHERE s.id=${writerMatch[1]}`;
         if (!story.length) return json({ error: 'Not found' }, 404);
         const s = story[0];
         if (b.status === 'published') {
@@ -1395,11 +1395,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           const existingBook = await sql`SELECT id FROM books WHERE title=${s.title} AND author=${s.writer_name} LIMIT 1`;
           if (existingBook.length) {
             bookId = existingBook[0].id;
-            await sql`UPDATE books SET display_status=${s.display_status||''},writer_status=${s.writer_status||''},hide_title_on_cover=${s.hide_title_on_cover?1:0},visible_on=(SELECT visible_on FROM stories WHERE id=${s.id}),story_type=(SELECT story_type FROM stories WHERE id=${s.id}) WHERE id=${bookId}`;
+            await sql`UPDATE books SET display_status=${s.display_status||''},writer_status=${s.writer_status||''},hide_title_on_cover=${s.hide_title_on_cover?1:0},visible_on=(SELECT visible_on FROM stories WHERE id=${s.id}),story_type=${s.story_type||'episodes'} WHERE id=${bookId}`;
           } else {
             const __sid2 = await mintShortId(sql);
             const newBookId = crypto.randomUUID();
-            await sql`INSERT INTO books (id,title,author,category_id,cover_url,description,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,visible_on,story_type,short_id) VALUES (${newBookId},${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published',${s.display_status||''},${s.writer_status||''},${s.hide_title_on_cover?1:0},${s.pdf_url||''},${s.dedication||''},${s.author_name||''},(SELECT visible_on FROM stories WHERE id=${s.id}),(SELECT story_type FROM stories WHERE id=${s.id}),${__sid2})`;
+            await sql`INSERT INTO books (id,title,author,category_id,cover_url,description,status,display_status,writer_status,hide_title_on_cover,pdf_url,dedication,author_name,visible_on,story_type,short_id) VALUES (${newBookId},${s.title},${s.writer_name},${catId},${s.cover_url||null},${s.description||''},'published',${s.display_status||''},${s.writer_status||''},${s.hide_title_on_cover?1:0},${s.pdf_url||''},${s.dedication||''},${s.author_name||''},(SELECT visible_on FROM stories WHERE id=${s.id}),${s.story_type||'episodes'},${__sid2})`;
             bookId = newBookId;
           }
           if (bookId) {
@@ -1434,6 +1434,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
               }
             }
           } catch(e) { console.error('admin approve follower notification error', e); }
+          invalidatePublicCache();
           return json({ ok: true, book_id: bookId });
         } else if (b.status === 'rejected') {
           await sql`UPDATE stories SET status='rejected',review_note=${b.note||''},updated_at=datetime('now') WHERE id=${s.id}`;
@@ -2255,13 +2256,13 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       if (url.pathname === '/api/public/books' && request.method === 'GET') {
         const cacheKey = `books:${scopeAll ? 'all' : 'app'}`;
         const cached = getCached(cacheKey);
-        if (cached) return json(cached, 200, '*', 180);
+        if (cached) return json(cached, 200, '*', 30);
 
         const rows = scopeAll
-          ? await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`
-          : await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,COALESCE(b.story_type,'episodes') AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website' ORDER BY b.updated_at DESC`;
-        setCached(cacheKey, rows, 60);
-        return json(rows, 200, '*', 180);
+          ? await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,CASE WHEN b.story_type='audio' THEN 'audio' WHEN EXISTS (SELECT 1 FROM chapters ch WHERE ch.book_id=b.id AND (ch.body LIKE 'http%' OR ch.body LIKE '%.mp3%' OR ch.body LIKE '%.m4a%')) THEN 'audio' ELSE COALESCE(b.story_type,'episodes') END AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' ORDER BY b.updated_at DESC`
+          : await sql`SELECT b.id,b.title,b.author,b.cover_url,b.status,b.views,b.likes,b.dislikes,COALESCE(b.description,'') AS description,COALESCE(c.name,'') AS category,COALESCE(b.color,'#123E39') AS color,COALESCE(b.accent,'#F5C660') AS accent,b.is_new,b.featured,b.home_section,b.views_visible,b.display_status,b.writer_status,b.hide_title_on_cover,b.show_ads,b.pdf_reward_ad,COALESCE(b.pdf_url,'') AS pdf_url,COALESCE(b.dedication,'') AS dedication,COALESCE(b.author_name,'') AS author_name,COALESCE(b.visible_on,'both') AS visible_on,CASE WHEN b.story_type='audio' THEN 'audio' WHEN EXISTS (SELECT 1 FROM chapters ch WHERE ch.book_id=b.id AND (ch.body LIKE 'http%' OR ch.body LIKE '%.mp3%' OR ch.body LIKE '%.m4a%')) THEN 'audio' ELSE COALESCE(b.story_type,'episodes') END AS story_type,COALESCE(b.short_id,'') AS short_id,b.updated_at FROM books b LEFT JOIN categories c ON b.category_id=c.id WHERE b.status='published' AND COALESCE(b.visible_on,'both')!='website' ORDER BY b.updated_at DESC`;
+        setCached(cacheKey, rows, 30);
+        return json(rows, 200, '*', 30);
       }
       if (url.pathname === '/api/public/chapters' && request.method === 'GET') {
         const bookId = url.searchParams.get('book_id');
@@ -3567,11 +3568,21 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             const pos = b.position ?? (await sql`SELECT COALESCE(MAX(position),0)+1 AS n FROM story_chapters WHERE story_id=${storyId}`)[0].n;
             const newChId = crypto.randomUUID();
             const r = await sql`INSERT INTO story_chapters (id,story_id,title,body,position) VALUES (${newChId},${storyId},${b.title},${b.body||''},${pos}) RETURNING id,title,position,created_at`;
-            await sql`UPDATE stories SET chapters_count = (SELECT COUNT(*)::int FROM story_chapters WHERE story_id=${storyId}), updated_at=datetime('now') WHERE id=${storyId}`;
+            const isAudioChapter = (b.body || '').trim().startsWith('http://') || (b.body || '').trim().startsWith('https://') || (b.body || '').includes('.mp3') || (b.body || '').includes('.m4a') || (b.body || '').includes('.wav');
+            if (isAudioChapter) {
+              await sql`UPDATE stories SET story_type='audio', chapters_count = (SELECT COUNT(*)::int FROM story_chapters WHERE story_id=${storyId}), updated_at=datetime('now') WHERE id=${storyId}`;
+            } else {
+              await sql`UPDATE stories SET chapters_count = (SELECT COUNT(*)::int FROM story_chapters WHERE story_id=${storyId}), updated_at=datetime('now') WHERE id=${storyId}`;
+            }
             const stRow = await sql`SELECT st.status,w.writer_name,st.title FROM stories st JOIN writers w ON st.writer_id=w.id WHERE st.id=${storyId}`;
             if (stRow.length && stRow[0].status === 'published') {
               const bkRow = await sql`SELECT id FROM books WHERE title=${stRow[0].title} AND author=${stRow[0].writer_name} LIMIT 1`;
-              if (bkRow.length) await sql`INSERT INTO chapters (id,book_id,title,body,position,status,minutes) VALUES (${crypto.randomUUID()},${bkRow[0].id},${b.title},${b.body||''},${pos},'published',5)`;
+              if (bkRow.length) {
+                await sql`INSERT INTO chapters (id,book_id,title,body,position,status,minutes) VALUES (${crypto.randomUUID()},${bkRow[0].id},${b.title},${b.body||''},${pos},'published',5)`;
+                if (isAudioChapter) {
+                  await sql`UPDATE books SET story_type='audio', updated_at=datetime('now') WHERE id=${bkRow[0].id}`;
+                }
+              }
               // Notify all followers about new chapter
               try {
                 const storyInfo = await sql`SELECT s.title,s.cover_url FROM stories s WHERE s.id=${storyId} LIMIT 1`;
@@ -3595,6 +3606,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
                 }
               } catch(e) { console.error('chapter add follower notification error', e); }
             }
+            invalidatePublicCache();
             return json(r[0], 201);
           }
         }
